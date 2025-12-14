@@ -1,0 +1,50 @@
+# Data paths
+train_pet_path: "Data/subset_A/part_PET/ImageSet/PNG"
+train_ct_path: "Data/subset_A/part_CT/train_data/ImageSet/PNG"
+val_pet_path: "Data/subset_B/part_PET/ImageSet/PNG"
+val_ct_path: "Data/subset_B/part_CT/train_data/ImageSet/PNG"
+
+# Training parameters
+image_size: 128
+batch_size: 8
+val_batch_size: 8
+num_epochs: 150
+learning_rate: 1e-4
+weight_decay: 0.01
+lr_min: 1e-6
+grad_clip_norm: 1.0
+
+# Model parameters
+latent_channels: 4
+
+# Data augmentation
+augment: true
+normalize: true
+
+# Training settings
+num_workers: 4
+seed: 42
+save_interval: 10
+eval_interval: 10  # Evaluate model every N epochs
+
+# Logging
+use_wandb: false
+project_name: "pet-ct-diffusion"
+
+# UNet configuration (optional, uses defaults if not specified)
+unet_config:
+  in_channels: 8
+  out_channels: 4
+  sample_size: 16  # 128 // 8 = 16 for latent dimensions
+  layers_per_block: 2
+  block_out_channels: [64, 128, 256, 512]  # Simplified architecture
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "AttnDownBlock2D"
+    - "DownBlock2D"
+  up_block_types:
+    - "UpBlock2D"
+    - "AttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
