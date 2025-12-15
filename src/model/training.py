@@ -63,9 +63,9 @@ class DiffusionTrainer:
             pet = pet.to(self.device)
             ct = ct.to(self.device)
 
-        # Use CT as target, PET as condition (for now)
-        condition = pet
-        target = ct
+        # Use PET as target, CT as condition (CT -> PET translation)
+        condition = ct
+        target = pet
 
         # Forward pass
         noise_pred, noise = self.model(target, condition)
@@ -137,7 +137,7 @@ class DiffusionTrainer:
 
         # Generate samples
         with torch.no_grad():
-            generated = self.model.sample(condition=pet, num_inference_steps=50)
+            generated = self.model.sample(condition=ct, num_inference_steps=50)
 
         return {
             'pet': pet.cpu(),

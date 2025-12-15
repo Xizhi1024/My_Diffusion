@@ -1,3 +1,12 @@
+# train-1:Evaluation Metrics:
+#   MAE: 0.3067
+#   MSE: 0.1147
+#   RMSE: 0.3387
+#   NRMSE: 0.1694
+#   PSNR: 9.4172
+#   SSIM: 0.4780
+# Epoch 150: Train Loss = 0.0388, Val Loss = 0.0428, LR = 1.00e-06
+
 # Data paths
 train_pet_path: "Data/subset_A/part_PET/ImageSet/PNG"
 train_ct_path: "Data/subset_A/part_CT/train_data/ImageSet/PNG"
