@@ -1,4 +1,4 @@
-# CT -> PET diffusion training config (diffusers U-Net)
+# CT -> PET diffusion training config (Karras U-Net)
 
 # Data paths
 train_pet_path: "Data/subset_A/part_PET/ImageSet/PNG"
@@ -8,14 +8,14 @@ val_ct_path: "Data/subset_B/part_CT/train_data/ImageSet/PNG"
 
 # Training
 image_size: 128
-batch_size: 4
+batch_size: 8
 val_batch_size: 8
-num_epochs: 1000
+num_epochs: 100
 learning_rate: 1e-4
 weight_decay: 0.01
 lr_min: 1e-6
 grad_clip_norm: 1.0
-gradient_accumulate_every: 2
+gradient_accumulate_every: 1
 
 # Diffusion objective
 objective: "pred_noise"
@@ -30,8 +30,8 @@ use_medical_preprocessing: false
 # Runtime
 num_workers: 4
 seed: 42
-save_interval: 50
-eval_interval: 50
+save_interval: 10
+eval_interval: 10
 num_inference_steps_eval: 1000
 num_inference_steps_sample: 1000
 
@@ -47,28 +47,25 @@ use_amp: true
 
 # Logging
 use_wandb: false
-project_name: "pet-ct-diffusion"
+project_name: "pet-ct-diffusion-karras"
 
 # Model
-unet_type: "diffusers"
-unet_config:
-  in_channels: 2
-  out_channels: 1
-  sample_size: 128
-  layers_per_block: 2
-  block_out_channels: [64, 128, 256, 256, 512]
-  down_block_types:
-    - "DownBlock2D"
-    - "DownBlock2D"
-    - "DownBlock2D"
-    - "AttnDownBlock2D"
-    - "DownBlock2D"
-  up_block_types:
-    - "UpBlock2D"
-    - "AttnUpBlock2D"
-    - "UpBlock2D"
-    - "UpBlock2D"
-    - "UpBlock2D"
+unet_type: "karras"
+karras_unet_config:
+  dim: 128
+  dim_max: 768
+  num_downsamples: 4
+  num_blocks_per_stage: 2
+  attn_res: [16, 8]
+  fourier_dim: 16
+  attn_dim_head: 64
+  attn_flash: true
+  mp_cat_t: 0.5
+  mp_add_emb_t: 0.5
+  attn_res_mp_add_t: 0.3
+  resnet_mp_add_t: 0.3
+  dropout: 0.1
 
-# Backward-compatible key (not used in pixel-space pipeline)
+# Backward-compatible keys
 latent_channels: 4
+unet_config: null

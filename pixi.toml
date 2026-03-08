@@ -12,9 +12,9 @@ channels = [
 platforms = ["linux-64"]
 
 [tasks]
-train = "python scripts/train.py"
+train = "python scripts/train_v2.py --config configs/config_karras.yaml"
 test = "python scripts/test.py"
-evaluate = "python scripts/test.py --eval --notebook 1 --checkpoint checkpoints/train-1/checkpoint_epoch_150.pth"
+evaluate = "python scripts/test.py --eval --notebook 1 --checkpoint checkpoints/checkpoint_epoch_600.pth"
 
 [dependencies]
 # 核心依赖，特别是需要从特定渠道（如pytorch, nvidia）获取的
