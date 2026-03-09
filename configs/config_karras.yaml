@@ -10,12 +10,12 @@ val_ct_path: "Data/subset_B/part_CT/train_data/ImageSet/PNG"
 image_size: 128
 batch_size: 8
 val_batch_size: 8
-num_epochs: 100
+num_epochs: 400
 learning_rate: 1e-4
 weight_decay: 0.01
 lr_min: 1e-6
 grad_clip_norm: 1.0
-gradient_accumulate_every: 1
+gradient_accumulate_every: 2
 
 # Diffusion objective
 objective: "pred_noise"
@@ -30,14 +30,14 @@ use_medical_preprocessing: false
 # Runtime
 num_workers: 4
 seed: 42
-save_interval: 10
-eval_interval: 10
-num_inference_steps_eval: 1000
-num_inference_steps_sample: 1000
+save_interval: 25
+eval_interval: 25
+num_inference_steps_eval: 100
+num_inference_steps_sample: 100
 
 # EMA
 use_ema: true
-ema_decay: 0.995
+ema_decay: 0.999
 ema_update_every: 10
 ema_update_after_step: 0
 ema_use_warmup: false

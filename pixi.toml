@@ -12,7 +12,7 @@ channels = [
 platforms = ["linux-64"]
 
 [tasks]
-train = "python scripts/train_v2.py --config configs/config_karras.yaml"
+train = "python scripts/train_v2.py --config configs/config_karras.yaml --resume checkpoint_epoch_25.pth"
 test = "python scripts/test.py"
 evaluate = "python scripts/test.py --eval --notebook 1 --checkpoint checkpoints/checkpoint_epoch_600.pth"
 
