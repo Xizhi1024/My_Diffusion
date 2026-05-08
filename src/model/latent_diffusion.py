@@ -2,12 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Literal, Union
+from typing import Optional, Literal, Tuple
 from diffusers import UNet2DModel, DDPMScheduler
 from diffusers.schedulers import DDIMScheduler
 
 # 导入新迁移的 KarrasUnet
 from .karras_unet import KarrasUnetWrapper
+from .encoder import TrueDualStreamAttentionEncoder
 
 
 def sigmoid_beta_schedule(timesteps, start=-3, end=3, tau=1, clamp_min=1e-5):
@@ -46,8 +47,14 @@ class LatentDiffusionModel(nn.Module):
         unet_type: Literal['diffusers', 'karras'] = 'diffusers',
         karras_unet_config: Optional[dict] = None,
         objective: Literal['pred_noise', 'pred_x0', 'pred_v'] = 'pred_noise',
+        sample_scheduler: Literal['ddpm', 'ddim'] = 'ddpm',
+        model_variant: Literal['standard_diffusion1', 'dual_stream_attention'] = 'standard_diffusion1',
+        dual_stream_config: Optional[dict] = None,
         min_snr_loss_weight: bool = False,
         min_snr_gamma: float = 5.0,
+        enable_heteroscedastic: bool = False,
+        heteroscedastic_logvar_min: float = -6.0,
+        heteroscedastic_logvar_max: float = 2.0,
     ):
         """
         Latent Diffusion Model 支持多种 U-Net 架构
@@ -63,6 +70,28 @@ class LatentDiffusionModel(nn.Module):
         self.image_size = image_size
         self.objective = objective
         self.unet_type = unet_type
+        self.model_variant = model_variant
+        self.prediction_channels = int(out_channels)
+        if self.prediction_channels <= 0:
+            raise ValueError("out_channels must be > 0")
+        self.enable_heteroscedastic = bool(enable_heteroscedastic)
+        self.heteroscedastic_logvar_min = float(heteroscedastic_logvar_min)
+        self.heteroscedastic_logvar_max = float(heteroscedastic_logvar_max)
+        if self.heteroscedastic_logvar_min >= self.heteroscedastic_logvar_max:
+            raise ValueError("heteroscedastic_logvar_min must be < heteroscedastic_logvar_max")
+        self.model_out_channels = (
+            self.prediction_channels * 2 if self.enable_heteroscedastic else self.prediction_channels
+        )
+        self.sample_scheduler = sample_scheduler.lower()
+        if self.sample_scheduler not in ('ddpm', 'ddim'):
+            raise ValueError(
+                f"Unknown sample_scheduler: {sample_scheduler}. Must be 'ddpm' or 'ddim'"
+            )
+        if self.model_variant not in ('standard_diffusion1', 'dual_stream_attention'):
+            raise ValueError(
+                f"Unknown model_variant: {self.model_variant}. "
+                "Must be 'standard_diffusion1' or 'dual_stream_attention'"
+            )
         # Note: latent_channels parameter is kept for backward compatibility but not used in pixel space
 
         # 根据 unet_type 选择不同的 U-Net 架构
@@ -70,7 +99,7 @@ class LatentDiffusionModel(nn.Module):
             # 使用 diffusers 库的 UNet2DModel (默认，稳定)
             unet_config = unet_config or {
                 "in_channels": 2,  # noisy PET (1) + CT condition (1)
-                "out_channels": 1,  # predict PET noise
+                "out_channels": self.model_out_channels,  # predict PET noise or mean/logvar
                 "sample_size": image_size,  # Direct pixel space processing
                 "layers_per_block": 2,
                 "block_out_channels": (64, 128, 256, 256, 512),  # Slightly deeper for pixel space
@@ -89,6 +118,9 @@ class LatentDiffusionModel(nn.Module):
                     "UpBlock2D",         # 64 -> 128
                 ),
             }
+            unet_config = dict(unet_config)
+            unet_config["out_channels"] = self.model_out_channels
+            self.model_in_channels = int(unet_config["in_channels"])
             self.unet = UNet2DModel(**unet_config)
 
         elif unet_type == 'karras':
@@ -112,11 +144,34 @@ class LatentDiffusionModel(nn.Module):
             self.unet = KarrasUnetWrapper(
                 image_size=image_size,
                 in_channels=2,  # noisy PET (1) + CT condition (1)
-                out_channels=1,  # predict PET noise
+                out_channels=self.model_out_channels,  # predict PET noise or mean/logvar
                 **karras_unet_config
             )
+            self.model_in_channels = int(getattr(self.unet, "in_channels", 2))
         else:
             raise ValueError(f"Unknown unet_type: {unet_type}. Must be 'diffusers' or 'karras'")
+
+        # Optional condition encoder branch:
+        # - standard_diffusion1: raw CT directly concatenated to noisy PET
+        # - dual_stream_attention: CT -> dual-stream local/global attention encoder -> 1-channel map
+        self.condition_encoder = None
+        self.condition_proj = None
+        if self.model_variant == 'dual_stream_attention':
+            dual_stream_config = dual_stream_config or {}
+            cond_out_channels = int(dual_stream_config.get('out_channels', 64))
+            self.condition_encoder = TrueDualStreamAttentionEncoder(
+                in_channels=in_channels,
+                base_channels=int(dual_stream_config.get('base_channels', 64)),
+                out_channels=cond_out_channels,
+                num_heads=int(dual_stream_config.get('num_heads', 4)),
+                groups=int(dual_stream_config.get('groups', 8)),
+                local_window_size=int(dual_stream_config.get('local_window_size', 8)),
+                global_pool_size=int(dual_stream_config.get('global_pool_size', 16)),
+            )
+            self.condition_proj = nn.Sequential(
+                nn.Conv2d(cond_out_channels, 1, kernel_size=1),
+                nn.Tanh(),
+            )
 
         # 【修复】使用 sigmoid schedule - 对 128x128 图像更稳定
         # 参考 diffusion 项目的工作实现
@@ -234,41 +289,111 @@ class LatentDiffusionModel(nn.Module):
 
         return sqrt_alphas_cumprod_t * x_t - sqrt_one_minus_alphas_cumprod_t * v
 
-    def predict_noise(self, noisy_x, timesteps, condition=None):
-        """Predict noise directly in pixel space"""
-        if condition is not None:
-            # Ensure condition and noisy_x have same dimensions
-            if condition.shape[2:] != noisy_x.shape[2:]:
-                condition = torch.nn.functional.interpolate(
-                    condition,
-                    size=noisy_x.shape[2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-            # Concatenate noisy PET and CT condition
-            model_input = torch.cat([noisy_x, condition], dim=1)
-        else:
-            # If no condition, UNet expects single channel input
-            # So we need to handle this case
-            model_input = noisy_x
-            if model_input.shape[1] == 1:
-                # Pad with zeros to match expected 2 channels
-                zeros = torch.zeros_like(model_input)
-                model_input = torch.cat([model_input, zeros], dim=1)
+    def _prepare_condition(self, condition: Optional[torch.Tensor], target_size=None):
+        """Prepare condition map according to selected model variant."""
+        if condition is None:
+            return None
 
-        return self.unet(model_input, timesteps).sample
+        condition_out = condition
+        if self.condition_encoder is not None and self.condition_proj is not None:
+            condition_out = self.condition_encoder(condition_out)
+            condition_out = self.condition_proj(condition_out)
+
+        if target_size is not None and condition_out.shape[2:] != target_size:
+            condition_out = F.interpolate(
+                condition_out,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        return condition_out
+
+    def _build_model_input(
+        self,
+        noisy_x: torch.Tensor,
+        condition_map: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Build U-Net input consistently for both training and sampling.
+
+        When condition is missing, pad with zero channels so unconditional sampling
+        still matches the configured model input channels.
+        """
+        if condition_map is not None:
+            model_input = torch.cat([noisy_x, condition_map], dim=1)
+        else:
+            model_input = noisy_x
+
+        input_channels = model_input.shape[1]
+        if input_channels == self.model_in_channels:
+            return model_input
+
+        if input_channels < self.model_in_channels:
+            pad_channels = self.model_in_channels - input_channels
+            zeros = torch.zeros(
+                model_input.shape[0],
+                pad_channels,
+                model_input.shape[2],
+                model_input.shape[3],
+                device=model_input.device,
+                dtype=model_input.dtype,
+            )
+            return torch.cat([model_input, zeros], dim=1)
+
+        raise ValueError(
+            f"Model input channels mismatch: got {input_channels}, expected <= {self.model_in_channels}"
+        )
+
+    def _split_prediction(
+        self,
+        raw_output: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self.enable_heteroscedastic:
+            return raw_output, None
+
+        expected = self.prediction_channels * 2
+        if raw_output.shape[1] == self.prediction_channels:
+            # 兼容旧权重：启用异方差但模型仍输出单通道，退化为均值预测。
+            return raw_output, None
+
+        if raw_output.shape[1] != expected:
+            raise ValueError(
+                f"Unexpected model output channels: got {raw_output.shape[1]}, expected {expected}"
+            )
+
+        pred_mean, pred_logvar = torch.chunk(raw_output, 2, dim=1)
+        pred_logvar = torch.clamp(
+            pred_logvar,
+            min=self.heteroscedastic_logvar_min,
+            max=self.heteroscedastic_logvar_max,
+        )
+        return pred_mean, pred_logvar
+
+    def predict_noise(self, noisy_x, timesteps, condition=None, return_logvar: bool = False):
+        """Predict diffusion target (and optional log-variance) in pixel space."""
+        condition_map = self._prepare_condition(condition, target_size=noisy_x.shape[2:])
+        model_input = self._build_model_input(noisy_x, condition_map)
+        raw_output = self.unet(model_input, timesteps).sample
+        pred_mean, pred_logvar = self._split_prediction(raw_output)
+        if return_logvar:
+            return pred_mean, pred_logvar
+        return pred_mean
 
     @torch.no_grad()
     def sample(self, condition=None, num_inference_steps=50, generator=None):
         """
-        使用 diffusers 库的 DDIMScheduler 采样方法
-        修复了手动实现时的数值不稳定性问题（除以极小值导致NaN）
+        使用 diffusers scheduler 采样。
+        - ddpm: 与原始 DDPM 训练目标一致（更接近 baseline 参考实现）
+        - ddim: 更快的确定性采样
+        - condition=None: 自动补零条件通道，确保无条件采样与模型输入通道一致
         """
         device = next(self.unet.parameters()).device
         batch_size = condition.shape[0] if condition is not None else 1
 
-        # 1. 设置步数
-        self.ddim_scheduler.set_timesteps(num_inference_steps)
+        # 1. 选择采样调度器并设置步数
+        scheduler = self.noise_scheduler if self.sample_scheduler == 'ddpm' else self.ddim_scheduler
+        scheduler.set_timesteps(num_inference_steps)
 
         # 2. 初始化噪声
         img = torch.randn(
@@ -276,35 +401,83 @@ class LatentDiffusionModel(nn.Module):
             device=device,
             generator=generator,
         )
+        condition_map = self._prepare_condition(condition, target_size=img.shape[2:])
 
         # 3. 使用 diffusers 标准调度器循环
-        for t in self.ddim_scheduler.timesteps:
-            # 构造输入（拼接条件）
-            model_input = img
-
-            # 手动拼接条件（这部分保持原有逻辑）
-            if condition is not None:
-                if condition.shape[2:] != img.shape[2:]:
-                    condition = F.interpolate(condition, size=img.shape[2:], mode='bilinear')
-                # 拼接 noisy_x (img) 和 condition
-                unet_input = torch.cat([img, condition], dim=1)
+        for t in scheduler.timesteps:
+            # 拼接 noisy PET 和 CT 条件
+            if condition_map is not None:
+                if condition_map.shape[2:] != img.shape[2:]:
+                    cond_for_step = F.interpolate(
+                        condition_map,
+                        size=img.shape[2:],
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                else:
+                    cond_for_step = condition_map
+                unet_input = self._build_model_input(img, cond_for_step)
             else:
-                unet_input = img
+                unet_input = self._build_model_input(img, None)
 
-            # 预测
-            # 注意：传入 scalar 类型的 t 批次
+            # 预测噪声 / x0 / v（由 prediction_type 控制）
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            model_output = self.unet(unet_input, t_batch).sample
+            raw_output = self.unet(unet_input, t_batch).sample
+            model_output, _ = self._split_prediction(raw_output)
 
-            # 使用 Scheduler 计算下一步 (自动处理 pred_noise / pred_x0 / pred_v)
-            # step 返回的是一个对象，.prev_sample 是去噪后的图
-            img = self.ddim_scheduler.step(model_output, t, img, eta=0.0).prev_sample
+            # 使用 scheduler 计算下一步
+            step_kwargs = {'eta': 0.0} if self.sample_scheduler == 'ddim' else {}
+            img = scheduler.step(model_output, t, img, **step_kwargs).prev_sample
 
         # 4. 后处理 [-1, 1] -> [0, 1]
         img = (img + 1.0) * 0.5
         img = torch.clamp(img, 0.0, 1.0)
 
         return img
+
+    @torch.no_grad()
+    def sample_multiple(
+        self,
+        condition=None,
+        num_inference_steps: int = 50,
+        num_samples: int = 4,
+        generator=None,
+        return_stats: bool = True,
+    ):
+        """
+        Monte Carlo diffusion sampling.
+
+        Returns:
+            if return_stats:
+                {'samples': [S, B, C, H, W], 'mean': [B, C, H, W], 'std': [B, C, H, W]}
+            else:
+                samples tensor [S, B, C, H, W]
+        """
+        num_samples = int(num_samples)
+        if num_samples <= 0:
+            raise ValueError("num_samples must be >= 1")
+
+        samples = []
+        for _ in range(num_samples):
+            samples.append(
+                self.sample(
+                    condition=condition,
+                    num_inference_steps=num_inference_steps,
+                    generator=generator,
+                )
+            )
+
+        stacked = torch.stack(samples, dim=0)
+        if not return_stats:
+            return stacked
+
+        mean = stacked.mean(dim=0)
+        std = stacked.std(dim=0, unbiased=False)
+        return {
+            'samples': stacked,
+            'mean': mean,
+            'std': std,
+        }
 
     def forward(self, x, condition=None):
         """
@@ -333,23 +506,31 @@ class LatentDiffusionModel(nn.Module):
         noisy_x = self.add_noise(x, noise, timesteps)
 
         # Predict using UNet
-        model_output = self.predict_noise(noisy_x, timesteps, condition)
+        model_output = self.predict_noise(
+            noisy_x,
+            timesteps,
+            condition,
+            return_logvar=self.enable_heteroscedastic,
+        )
+        if isinstance(model_output, tuple):
+            model_pred, pred_logvar = model_output
+        else:
+            model_pred, pred_logvar = model_output, None
 
         # 根据目标类型确定预测值和目标值
         if self.objective == 'pred_noise':
             # 预测噪声，目标是真实噪声
-            model_pred = model_output
             target = noise
         elif self.objective == 'pred_x0':
             # 预测 x0 (原始图像)，目标是真实图像
-            model_pred = model_output
             target = x
         elif self.objective == 'pred_v':
             # 预测 v-parameterization
-            model_pred = model_output
             # v = sqrt(alpha_bar) * noise - sqrt(1 - alpha_bar) * x0
             target = self.predict_v(x, timesteps, noise)
         else:
             raise ValueError(f"unknown objective {self.objective}")
 
+        if pred_logvar is not None:
+            return model_pred, target, timesteps, pred_logvar
         return model_pred, target, timesteps

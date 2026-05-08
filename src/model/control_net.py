@@ -11,8 +11,8 @@ Reference:
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Tuple, Union
-from copy import deepcopy
+import inspect
+from typing import List, Optional, Tuple
 
 
 def zero_module(module: nn.Module) -> nn.Module:
@@ -227,11 +227,44 @@ class ControlledUNet(nn.Module):
         
         self.unet = unet
         self.controlnet = controlnet
+        self._control_forward_mode = self._resolve_control_forward_mode()
         
         # Freeze U-Net if specified
         if freeze_unet:
             for param in self.unet.parameters():
                 param.requires_grad = False
+
+    def _resolve_control_forward_mode(self) -> str:
+        """
+        Detect a valid control-injection forward path on the wrapped U-Net.
+
+        Supported modes:
+        - forward_with_control(..., control_outputs=...)
+        - diffusers-style forward(..., down_block_additional_residuals=..., mid_block_additional_residual=...)
+        - forward(..., control_residuals=...)
+        """
+        if hasattr(self.unet, 'forward_with_control') and callable(getattr(self.unet, 'forward_with_control')):
+            return 'forward_with_control'
+
+        forward_fn = getattr(self.unet, 'forward', None)
+        if forward_fn is None or not callable(forward_fn):
+            raise NotImplementedError(
+                "ControlledUNet requires a callable forward on the wrapped U-Net."
+            )
+
+        forward_params = set(inspect.signature(forward_fn).parameters.keys())
+        if 'down_block_additional_residuals' in forward_params:
+            return 'diffusers_residuals'
+        if 'control_residuals' in forward_params:
+            return 'control_residuals'
+
+        raise NotImplementedError(
+            "Wrapped U-Net does not expose a control-injection interface. "
+            "Expected one of: "
+            "forward_with_control(..., control_outputs=...), "
+            "forward(..., down_block_additional_residuals=..., mid_block_additional_residual=...), "
+            "or forward(..., control_residuals=...)."
+        )
     
     def forward(
         self,
@@ -259,14 +292,37 @@ class ControlledUNet(nn.Module):
             ct_image=ct_image,
             encoder_hidden_states=encoder_hidden_states,
         )
-        
-        # Pass through U-Net with control injection
-        # This requires modifying the U-Net forward to accept control signals
-        # For diffusers, you would do:
-        # return self.unet(noisy_latents, timesteps, encoder_hidden_states, down_block_additional_residuals=control_outputs)
-        
-        # Simplified version for now (just U-Net forward)
-        return self.unet(noisy_latents, timesteps, encoder_hidden_states)
+        if len(control_outputs) == 0:
+            raise RuntimeError("ControlNet produced no residual outputs; cannot inject control.")
+
+        if self._control_forward_mode == 'forward_with_control':
+            return self.unet.forward_with_control(
+                noisy_latents=noisy_latents,
+                timesteps=timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                control_outputs=control_outputs,
+            )
+
+        if self._control_forward_mode == 'diffusers_residuals':
+            down_residuals = tuple(control_outputs[:-1]) if len(control_outputs) > 1 else tuple(control_outputs)
+            mid_residual = control_outputs[-1]
+            return self.unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=down_residuals,
+                mid_block_additional_residual=mid_residual,
+            )
+
+        if self._control_forward_mode == 'control_residuals':
+            return self.unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                control_residuals=tuple(control_outputs),
+            )
+
+        raise RuntimeError(f"Unknown control forward mode: {self._control_forward_mode}")
 
 
 # =============================================================================

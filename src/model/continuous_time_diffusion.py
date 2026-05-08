@@ -190,7 +190,11 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
 
     @property
     def device(self):
-        return next(self.model.parameters()).device
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            # Some lightweight test doubles may not have parameters.
+            return torch.device('cpu')
 
     def p_mean_variance(self, x, time, time_next):
         """
@@ -208,7 +212,10 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
 
         alpha, sigma, alpha_next = map(sqrt, (squared_alpha, squared_sigma, squared_alpha_next))
 
-        batch_log_snr = repeat(log_snr, ' -> b', b = x.shape[0])
+        if log_snr.ndim == 0:
+            batch_log_snr = repeat(log_snr, ' -> b', b = x.shape[0])
+        else:
+            batch_log_snr = log_snr
         pred_noise = self.model(x, batch_log_snr)
 
         if self.clip_sample_denoised:
@@ -306,7 +313,7 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
 
         if self.min_snr_loss_weight:
             snr = log_snr.exp()
-            loss_weight = snr.clamp(min = self.min_snr_gamma) / snr
+            loss_weight = snr.clamp(max = self.min_snr_gamma) / snr
             losses = losses * loss_weight
 
         return losses.mean()
@@ -396,16 +403,14 @@ class ContinuousTimeGaussianDiffusionConditional(nn.Module):
 
         # 拼接噪声图像和条件图像
         model_input = torch.cat([x, cond_img], dim = 1)
-        batch_log_snr = repeat(log_snr, ' -> b', b = x.shape[0])
-
-        model_out = self.base_diffusion.model(model_input, batch_log_snr)
+        model_out = self.base_diffusion.model(model_input, log_snr)
 
         losses = F.mse_loss(model_out, noise, reduction = 'none')
         losses = reduce(losses, 'b ... -> b', 'mean')
 
         if self.base_diffusion.min_snr_loss_weight:
             snr = log_snr.exp()
-            loss_weight = snr.clamp(min = self.base_diffusion.min_snr_gamma) / snr
+            loss_weight = snr.clamp(max = self.base_diffusion.min_snr_gamma) / snr
             losses = losses * loss_weight
 
         return losses.mean()

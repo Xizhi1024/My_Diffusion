@@ -1,135 +1,114 @@
-"""
-验证脚本：测试 ControlNet Injection 模块
-
-运行方式:
-    cd My_diffusion
-    python tests/test_control_net.py
-"""
-
-import sys
-from pathlib import Path
-
-# 添加项目根目录到路径 (跨平台兼容)
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
-
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytest
+
 from src.model.encoder import DualStreamCTEncoder
-from src.model.control_net import ZeroConv2d, ControlNetInjection
+from src.model.control_net import ZeroConv2d, ControlNetInjection, ControlledUNet
 
 
-def test_zero_conv():
-    """测试 ZeroConv2d 初始化为零"""
-    print("=" * 50)
-    print("测试 ZeroConv2d")
-    print("=" * 50)
-    
+class _ResidualInjectableUNet(nn.Module):
+    """Tiny adapter that exposes control_residuals interface."""
+
+    def forward(self, noisy_latents, timesteps, encoder_hidden_states=None, control_residuals=None):
+        out = noisy_latents.clone()
+        if control_residuals:
+            for residual in control_residuals:
+                resized = F.interpolate(residual, size=noisy_latents.shape[-2:], mode='nearest')
+                reduced = resized.mean(dim=1, keepdim=True).expand_as(noisy_latents)
+                out = out + 0.01 * reduced
+        return out
+
+
+class _UnsupportedUNet(nn.Module):
+    def forward(self, noisy_latents, timesteps, encoder_hidden_states=None):
+        return noisy_latents
+
+
+class _FakeControlNet(nn.Module):
+    """Test double that emits CT-dependent residuals."""
+
+    def forward(self, noisy_latents, timesteps, ct_image, encoder_hidden_states=None):
+        residual = F.interpolate(ct_image, size=noisy_latents.shape[-2:], mode='bilinear', align_corners=False)
+        residual = residual.repeat(1, noisy_latents.shape[1], 1, 1)
+        return [residual]
+
+
+def _build_small_controlnet():
+    encoder = DualStreamCTEncoder(
+        in_channels=1,
+        base_channels=8,
+        out_channels=16,
+        num_heads=2,
+        num_res_blocks=1,
+        groups=4,
+    )
+    return ControlNetInjection(
+        condition_encoder=encoder,
+        control_model=None,
+        block_out_channels=(8, 16),
+        latent_channels=4,
+        condition_channels=16,
+    )
+
+
+def test_zero_conv_outputs_zeros():
+    """ZeroConv2d should output zeros at initialization."""
     zc = ZeroConv2d(64, 128)
     x = torch.randn(2, 64, 32, 32)
     out = zc(x)
-    
-    # 输出应该全是零（因为权重初始化为0）
-    assert torch.allclose(out, torch.zeros_like(out)), "ZeroConv 输出不为零!"
-    print(f"输入形状:  {x.shape}")
-    print(f"输出形状:  {out.shape}")
-    print(f"输出范数:  {out.norm().item():.6f} (应该接近0)")
-    print("✅ ZeroConv2d 测试通过!")
-    print()
+
+    assert torch.allclose(out, torch.zeros_like(out))
 
 
-def test_controlnet_injection():
-    """测试 ControlNetInjection 模块"""
-    print("=" * 50)
-    print("测试 ControlNetInjection")
-    print("=" * 50)
-    
-    # 创建条件编码器
-    condition_encoder = DualStreamCTEncoder(
-        in_channels=1,
-        base_channels=64,
-        out_channels=320,
-    )
-    
-    # 创建 ControlNet (使用简化版控制模型)
-    controlnet = ControlNetInjection(
-        condition_encoder=condition_encoder,
-        control_model=None,  # 使用简化版本
-        block_out_channels=(320, 640, 1280, 1280),
-    )
-    
-    # 测试输入
-    batch_size = 2
-    noisy_latents = torch.randn(batch_size, 4, 32, 32)  # 256/8 = 32
-    timesteps = torch.randint(0, 1000, (batch_size,))
-    ct_image = torch.randn(batch_size, 1, 256, 256)
-    
-    # 前向传播
+def test_controlnet_injection_outputs():
+    """ControlNetInjection should return residual feature maps."""
+    controlnet = _build_small_controlnet()
+    noisy_latents = torch.randn(2, 4, 16, 16)
+    timesteps = torch.randint(0, 1000, (2,))
+    ct_image = torch.randn(2, 1, 64, 64)
+
     control_outputs = controlnet(noisy_latents, timesteps, ct_image)
-    
-    print(f"CT 图像形状:      {ct_image.shape}")
-    print(f"噪声潜变量形状:    {noisy_latents.shape}")
-    print(f"控制输出数量:      {len(control_outputs)}")
-    
-    for i, out in enumerate(control_outputs):
-        print(f"  控制输出 {i}: {out.shape}")
-    
-    # 验证至少有输出
-    assert len(control_outputs) > 0, "没有控制输出!"
-    print("✅ ControlNetInjection 测试通过!")
-    print()
-    
-    # 打印模型统计
-    total_params = sum(p.numel() for p in controlnet.parameters())
-    trainable_params = sum(p.numel() for p in controlnet.parameters() if p.requires_grad)
-    print(f"模型总参数量:   {total_params:,}")
-    print(f"可训练参数量:   {trainable_params:,}")
-    print()
+
+    assert len(control_outputs) > 0
+    assert all(out.ndim == 4 for out in control_outputs)
 
 
-def test_gradient_flow():
-    """测试梯度是否能正常反向传播"""
-    print("=" * 50)
-    print("测试梯度流动")
-    print("=" * 50)
-    
-    condition_encoder = DualStreamCTEncoder()
-    controlnet = ControlNetInjection(
-        condition_encoder=condition_encoder,
-        block_out_channels=(320, 640, 1280, 1280),
-    )
-    
+def test_controlled_unet_requires_injection_interface():
+    """ControlledUNet should reject U-Nets without residual injection interface."""
+    controlnet = _build_small_controlnet()
+    with pytest.raises(NotImplementedError):
+        ControlledUNet(unet=_UnsupportedUNet(), controlnet=controlnet)
+
+
+def test_controlled_unet_uses_control_signal():
+    """Changing CT input should change output when control residuals are wired."""
+    model = ControlledUNet(unet=_ResidualInjectableUNet(), controlnet=_FakeControlNet(), freeze_unet=False)
+
+    noisy_latents = torch.randn(2, 4, 16, 16)
+    timesteps = torch.randint(0, 1000, (2,))
+    ct_image_1 = torch.randn(2, 1, 64, 64)
+    ct_image_2 = torch.randn(2, 1, 64, 64)
+
+    out1 = model(noisy_latents, timesteps, ct_image_1)
+    out2 = model(noisy_latents, timesteps, ct_image_2)
+    max_abs_diff = (out1 - out2).abs().max().item()
+    assert max_abs_diff > 0.0
+
+
+def test_controlnet_gradient_flow():
+    """ControlNet branch should propagate gradients back to CT input."""
+    controlnet = _build_small_controlnet()
+
     noisy_latents = torch.randn(1, 4, 16, 16, requires_grad=True)
     timesteps = torch.randint(0, 1000, (1,))
-    ct_image = torch.randn(1, 1, 128, 128, requires_grad=True)
-    
+    ct_image = torch.randn(1, 1, 64, 64, requires_grad=True)
+
     control_outputs = controlnet(noisy_latents, timesteps, ct_image)
-    
-    # 对所有输出求和作为 loss
-    loss = sum(o.mean() for o in control_outputs)
+    loss = sum(out.mean() for out in control_outputs)
     loss.backward()
-    
-    # 检查 CT 图像是否有梯度
-    assert ct_image.grad is not None, "CT 图像没有梯度!"
-    print(f"CT 图像梯度形状: {ct_image.grad.shape}")
-    print("✅ 梯度流动测试通过!")
-    print()
+    assert ct_image.grad is not None
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print("开始验证 ControlNet Injection")
-    print("=" * 50 + "\n")
-    
-    try:
-        test_zero_conv()
-        test_controlnet_injection()
-        test_gradient_flow()
-        
-        print("=" * 50)
-        print("🎉 所有测试通过!")
-        print("=" * 50)
-        
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+    raise SystemExit(pytest.main([__file__, "-q"]))

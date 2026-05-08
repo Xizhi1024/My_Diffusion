@@ -8,6 +8,45 @@ from typing import Dict, Any, Optional, Tuple, List
 from tqdm import tqdm
 
 
+def pet_to_zero_one(pet_tensor: torch.Tensor) -> torch.Tensor:
+    """Map PET tensor from [-1, 1] to [0, 1]."""
+    return torch.clamp((pet_tensor + 1.0) * 0.5, 0.0, 1.0)
+
+
+def map_pet_to_output_domain(
+    pet_tensor_01: torch.Tensor,
+    invert_pet: bool = False,
+    invert_pet_on_output: bool = True,
+) -> torch.Tensor:
+    """
+    Optionally map PET tensor in [0, 1] back to the original display domain.
+    """
+    if invert_pet and invert_pet_on_output:
+        return 1.0 - pet_tensor_01
+    return pet_tensor_01
+
+
+def prepare_pet_eval_tensors(
+    pred_pet_01: torch.Tensor,
+    target_pet_raw: torch.Tensor,
+    invert_pet: bool = False,
+    invert_pet_on_output: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Normalize prediction / target tensors to a consistent [0, 1] evaluation domain.
+    """
+    pred_01 = torch.clamp(pred_pet_01, 0.0, 1.0)
+    target_01 = pet_to_zero_one(target_pet_raw)
+
+    pred_eval = map_pet_to_output_domain(
+        pred_01, invert_pet=invert_pet, invert_pet_on_output=invert_pet_on_output
+    )
+    target_eval = map_pet_to_output_domain(
+        target_01, invert_pet=invert_pet, invert_pet_on_output=invert_pet_on_output
+    )
+    return pred_eval, target_eval
+
+
 class DiffusionMetrics:
     def __init__(self, device: Optional[torch.device] = None):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -102,14 +141,14 @@ class DiffusionMetrics:
 
                 # 使用CT作为条件生成PET（与训练保持一致）
                 generated = model.sample(condition=ct, num_inference_steps=1000)
+                pred_eval, target_eval = prepare_pet_eval_tensors(
+                    pred_pet_01=generated,
+                    target_pet_raw=pet,
+                    invert_pet=False,
+                    invert_pet_on_output=False,
+                )
 
-                # 【关键修复】将真实图像从 [-1, 1] 转换到 [0, 1]
-                # 因为 Dataset 使用 Normalize(mean=[0.5], std=[0.5]) 将数据转换到 [-1, 1]
-                # 而 sample() 返回的是 [0, 1] 范围的图像
-                pet_denorm = (pet + 1.0) * 0.5
-                pet_denorm = torch.clamp(pet_denorm, 0.0, 1.0)
-
-                batch_metrics = self.evaluate_batch(generated, pet_denorm)
+                batch_metrics = self.evaluate_batch(pred_eval, target_eval)
                 all_metrics.append(batch_metrics)
 
                 total_samples += pet.shape[0]
@@ -133,18 +172,30 @@ class CTStandardizer:
     3. 线性映射到 [-1, 1]
     """
 
-    def __init__(self, window_width: float = 400, window_center: float = 50):
+    def __init__(
+        self,
+        window_width: float = 400,
+        window_center: float = 50,
+        hu_min: Optional[float] = None,
+        hu_max: Optional[float] = None,
+    ):
         """
         Args:
             window_width: 窗宽（默认 400）
             window_center: 窗位（默认 50）
         """
-        self.window_width = window_width
-        self.window_center = window_center
+        self.window_width = float(window_width)
+        self.window_center = float(window_center)
 
-        # 计算窗的范围
-        self.window_min = window_center - window_width / 2
-        self.window_max = window_center + window_width / 2
+        if hu_min is not None and hu_max is not None:
+            self.window_min = float(hu_min)
+            self.window_max = float(hu_max)
+        else:
+            self.window_min = self.window_center - self.window_width / 2
+            self.window_max = self.window_center + self.window_width / 2
+
+        if self.window_min >= self.window_max:
+            raise ValueError("CTStandardizer requires window_min < window_max")
 
     def apply_window(self, ct_image: np.ndarray) -> np.ndarray:
         """
@@ -161,6 +212,11 @@ class CTStandardizer:
         # 线性映射
         normalized = 2.0 * (windowed_image - self.window_min) / (self.window_max - self.window_min) - 1.0
         return normalized
+
+    def denormalize_from_minus1_1(self, normalized_image: np.ndarray) -> np.ndarray:
+        """Map [-1, 1] back to HU range."""
+        denorm = (normalized_image + 1.0) * 0.5
+        return denorm * (self.window_max - self.window_min) + self.window_min
 
     def __call__(self, ct_image: np.ndarray) -> np.ndarray:
         """
@@ -202,7 +258,12 @@ class PETStandardizer:
     2. 将数值除以该最大值归一化到 [0, 1] 或 [-1, 1]
     """
 
-    def __init__(self, max_suv: Optional[float] = None, target_range: str = "[-1,1]"):
+    def __init__(
+        self,
+        max_suv: Optional[float] = None,
+        target_range: str = "[-1,1]",
+        clip_min_suv: float = 0.0,
+    ):
         """
         Args:
             max_suv: 数据集的最大 SUV 值。如果为 None，需要在调用 fit 或手动设置
@@ -210,6 +271,7 @@ class PETStandardizer:
         """
         self.max_suv = max_suv
         self.target_range = target_range
+        self.clip_min_suv = float(clip_min_suv)
 
         if self.target_range not in ["[-1,1]", "[0,1]"]:
             raise ValueError("target_range must be '[-1,1]' or '[0,1]'")
@@ -247,14 +309,28 @@ class PETStandardizer:
         if self.max_suv == 0:
             return np.zeros_like(pet_image)
 
-        # 基本归一化到 [0, 1]
-        normalized = pet_image / self.max_suv
+        # 严格 SUV 归一化：先裁剪到 [clip_min_suv, max_suv]
+        clipped = np.clip(pet_image, self.clip_min_suv, self.max_suv)
+        normalized = (clipped - self.clip_min_suv) / (self.max_suv - self.clip_min_suv + 1e-8)
+        normalized = np.clip(normalized, 0.0, 1.0)
 
         # 如果目标范围是 [-1, 1]，进行转换
         if self.target_range == "[-1,1]":
             normalized = 2.0 * normalized - 1.0
 
         return normalized
+
+    def denormalize(self, pet_image: np.ndarray) -> np.ndarray:
+        """Inverse mapping from normalized domain back to SUV."""
+        if self.max_suv is None:
+            raise ValueError("max_suv is not set. Call fit() or set_max_suv() first.")
+
+        if self.target_range == "[-1,1]":
+            pet_01 = (pet_image + 1.0) * 0.5
+        else:
+            pet_01 = pet_image
+        pet_01 = np.clip(pet_01, 0.0, 1.0)
+        return pet_01 * (self.max_suv - self.clip_min_suv) + self.clip_min_suv
 
     def __call__(self, pet_image: np.ndarray) -> np.ndarray:
         """

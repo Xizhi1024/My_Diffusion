@@ -191,6 +191,96 @@ class FocalFrequencyLoss(nn.Module):
         return loss
 
 
+class QuantitativeConstraintLoss(nn.Module):
+    """
+    Quantitative PET consistency loss in normalized domain [0, 1].
+
+    Constrains:
+    1. Global uptake mean
+    2. Total uptake integral
+    3. Hotspot uptake (masked/thresholded region)
+    4. Peak uptake (top-k voxels)
+    """
+
+    def __init__(
+        self,
+        hotspot_threshold: float = 0.3,
+        topk_percent: float = 0.01,
+        mean_weight: float = 1.0,
+        integral_weight: float = 1.0,
+        hotspot_weight: float = 1.0,
+        peak_weight: float = 1.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.hotspot_threshold = float(hotspot_threshold)
+        self.topk_percent = float(topk_percent)
+        self.mean_weight = float(mean_weight)
+        self.integral_weight = float(integral_weight)
+        self.hotspot_weight = float(hotspot_weight)
+        self.peak_weight = float(peak_weight)
+        self.eps = float(eps)
+
+    @staticmethod
+    def _reduce_sum(x: torch.Tensor) -> torch.Tensor:
+        return x.flatten(start_dim=1).sum(dim=1)
+
+    @staticmethod
+    def _reduce_mean(x: torch.Tensor) -> torch.Tensor:
+        return x.flatten(start_dim=1).mean(dim=1)
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        pred_mean = self._reduce_mean(pred)
+        target_mean = self._reduce_mean(target)
+        mean_loss = torch.abs(pred_mean - target_mean).mean()
+
+        pred_integral = self._reduce_sum(pred)
+        target_integral = self._reduce_sum(target)
+        integral_loss = (
+            torch.abs(pred_integral - target_integral) /
+            torch.clamp(target_integral.abs(), min=self.eps)
+        ).mean()
+
+        if mask is None:
+            hotspot_mask = (target >= self.hotspot_threshold).float()
+        else:
+            hotspot_mask = (mask > 0.5).float()
+        hotspot_mask = hotspot_mask.expand_as(target)
+        hotspot_count = self._reduce_sum(hotspot_mask).clamp(min=1.0)
+        hotspot_pred = self._reduce_sum(pred * hotspot_mask) / hotspot_count
+        hotspot_target = self._reduce_sum(target * hotspot_mask) / hotspot_count
+        hotspot_loss = torch.abs(hotspot_pred - hotspot_target).mean()
+
+        flat_pred = pred.flatten(start_dim=1)
+        flat_target = target.flatten(start_dim=1)
+        topk = max(1, int(self.topk_percent * flat_pred.shape[1]))
+        pred_topk = torch.topk(flat_pred, k=topk, dim=1).values.mean(dim=1)
+        target_topk = torch.topk(flat_target, k=topk, dim=1).values.mean(dim=1)
+        peak_loss = torch.abs(pred_topk - target_topk).mean()
+
+        total = (
+            self.mean_weight * mean_loss
+            + self.integral_weight * integral_loss
+            + self.hotspot_weight * hotspot_loss
+            + self.peak_weight * peak_loss
+        )
+        items = {
+            'mean': mean_loss,
+            'integral': integral_loss,
+            'hotspot': hotspot_loss,
+            'peak': peak_loss,
+        }
+        return total, items
+
+
 class CombinedDiffusionLoss(nn.Module):
     """
     Combined loss function for CT-to-PET Diffusion training.
@@ -217,6 +307,13 @@ class CombinedDiffusionLoss(nn.Module):
         frequency_weight: float = 0.1,
         pet_threshold: float = 0.3,
         pet_high_weight: float = 10.0,
+        quantitative_weight: float = 0.0,
+        quant_hotspot_threshold: float = 0.3,
+        quant_topk_percent: float = 0.01,
+        quant_mean_weight: float = 1.0,
+        quant_integral_weight: float = 1.0,
+        quant_hotspot_weight: float = 1.0,
+        quant_peak_weight: float = 1.0,
     ):
         super().__init__()
         
@@ -224,6 +321,7 @@ class CombinedDiffusionLoss(nn.Module):
         self.pet_weight = pet_weight
         self.gradient_weight = gradient_weight
         self.frequency_weight = frequency_weight
+        self.quantitative_weight = quantitative_weight
         
         # Sub-losses
         self.noise_loss = nn.MSELoss()
@@ -234,6 +332,14 @@ class CombinedDiffusionLoss(nn.Module):
         )
         self.gradient_loss = GradientLoss()
         self.frequency_loss = FocalFrequencyLoss()
+        self.quantitative_loss = QuantitativeConstraintLoss(
+            hotspot_threshold=quant_hotspot_threshold,
+            topk_percent=quant_topk_percent,
+            mean_weight=quant_mean_weight,
+            integral_weight=quant_integral_weight,
+            hotspot_weight=quant_hotspot_weight,
+            peak_weight=quant_peak_weight,
+        )
     
     def forward(
         self,
@@ -283,6 +389,14 @@ class CombinedDiffusionLoss(nn.Module):
                 freq_loss = self.frequency_loss(pred_x0, target_x0)
                 loss_dict['frequency_loss'] = freq_loss.item()
                 total_loss += self.frequency_weight * freq_loss
+
+            # Quantitative constraints in normalized [0, 1] domain.
+            if self.quantitative_weight > 0:
+                quant_loss, quant_items = self.quantitative_loss(pred_x0, target_x0, mask=tumor_mask)
+                loss_dict['quantitative_loss'] = quant_loss.item()
+                for key, value in quant_items.items():
+                    loss_dict[f'quant_{key}_loss'] = value.item()
+                total_loss += self.quantitative_weight * quant_loss
         
         loss_dict['total_loss'] = total_loss.item()
         

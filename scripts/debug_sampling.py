@@ -24,6 +24,7 @@ def main():
         out_channels=1,
         image_size=config['image_size'],
         objective=config.get('objective', 'pred_noise'),
+        sample_scheduler=config.get('sample_scheduler', 'ddpm'),
     )
     model.eval()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -33,6 +34,7 @@ def main():
     print(f"   - objective: {model.objective}")
     print(f"   - image_size: {model.image_size}")
     print(f"   - unet_type: {model.unet_type}")
+    print(f"   - sample_scheduler: {model.sample_scheduler}")
     
     print(f"\n2. DDIM Scheduler 配置:")
     print(f"   - prediction_type: {model.ddim_scheduler.config.prediction_type}")
@@ -46,11 +48,12 @@ def main():
     print(f"   - alphas_cumprod[-1]: {model.alphas_cumprod[-1].item():.6f}")
     
     # 测试采样时的 timesteps
+    active_scheduler = model.noise_scheduler if model.sample_scheduler == 'ddpm' else model.ddim_scheduler
     print(f"\n4. 测试采样 timesteps:")
-    model.ddim_scheduler.set_timesteps(50)
-    print(f"   - num_inference_steps=50: timesteps[:10] = {model.ddim_scheduler.timesteps[:10].tolist()}")
-    model.ddim_scheduler.set_timesteps(1000)
-    print(f"   - num_inference_steps=1000: timesteps[:10] = {model.ddim_scheduler.timesteps[:10].tolist()}")
+    active_scheduler.set_timesteps(50)
+    print(f"   - num_inference_steps=50: timesteps[:10] = {active_scheduler.timesteps[:10].tolist()}")
+    active_scheduler.set_timesteps(1000)
+    print(f"   - num_inference_steps=1000: timesteps[:10] = {active_scheduler.timesteps[:10].tolist()}")
     
     # 测试一次前向传播
     print(f"\n5. 测试模型前向传播:")

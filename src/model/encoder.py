@@ -18,6 +18,14 @@ from einops import rearrange
 # Helper Modules
 # =============================================================================
 
+def _resolve_group_count(channels: int, preferred_groups: int = 8) -> int:
+    """Find a valid GroupNorm group count that divides channels."""
+    preferred_groups = max(1, min(preferred_groups, channels))
+    for g in range(preferred_groups, 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
 class ResnetBlock2D(nn.Module):
     """
     Standard ResNet-style block with skip connection.
@@ -26,9 +34,12 @@ class ResnetBlock2D(nn.Module):
     """
     def __init__(self, in_channels: int, out_channels: int, groups: int = 8):
         super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups=groups, num_channels=in_channels)
+        groups_in = _resolve_group_count(in_channels, groups)
+        groups_out = _resolve_group_count(out_channels, groups)
+
+        self.norm1 = nn.GroupNorm(num_groups=groups_in, num_channels=in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+        self.norm2 = nn.GroupNorm(num_groups=groups_out, num_channels=out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.act = nn.SiLU()
         
@@ -113,6 +124,135 @@ class EfficientChannelAttention(nn.Module):
         return out
 
 
+class LocalWindowAttention2D(nn.Module):
+    """
+    Local window self-attention.
+
+    Each non-overlapping window attends only within itself, emphasizing local texture
+    and boundaries while keeping memory usage bounded.
+    """
+    def __init__(self, dim: int, num_heads: int = 4, window_size: int = 8):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.scale = self.head_dim ** -0.5
+
+        groups = _resolve_group_count(dim, 8)
+        self.norm = nn.GroupNorm(num_groups=groups, num_channels=dim)
+        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=True)
+        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        ws = self.window_size
+
+        pad_h = (ws - (h % ws)) % ws
+        pad_w = (ws - (w % ws)) % ws
+        residual = x
+
+        x_norm = self.norm(x)
+        if pad_h > 0 or pad_w > 0:
+            x_norm = F.pad(x_norm, (0, pad_w, 0, pad_h), mode='replicate')
+
+        _, _, hp, wp = x_norm.shape
+        q, k, v = self.qkv(x_norm).chunk(3, dim=1)
+
+        q = rearrange(
+            q,
+            'b (heads d) (nh ws1) (nw ws2) -> (b nh nw) heads (ws1 ws2) d',
+            heads=self.num_heads,
+            ws1=ws,
+            ws2=ws
+        )
+        k = rearrange(
+            k,
+            'b (heads d) (nh ws1) (nw ws2) -> (b nh nw) heads (ws1 ws2) d',
+            heads=self.num_heads,
+            ws1=ws,
+            ws2=ws
+        )
+        v = rearrange(
+            v,
+            'b (heads d) (nh ws1) (nw ws2) -> (b nh nw) heads (ws1 ws2) d',
+            heads=self.num_heads,
+            ws1=ws,
+            ws2=ws
+        )
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = rearrange(
+            out,
+            '(b nh nw) heads (ws1 ws2) d -> b (heads d) (nh ws1) (nw ws2)',
+            b=b,
+            nh=hp // ws,
+            nw=wp // ws,
+            ws1=ws,
+            ws2=ws
+        )
+        out = self.proj(out)
+
+        if pad_h > 0 or pad_w > 0:
+            out = out[:, :, :h, :w]
+
+        return out + residual
+
+
+class GlobalContextAttention2D(nn.Module):
+    """
+    Global attention with pooled keys/values.
+
+    Full-resolution queries attend to globally pooled context tokens, modeling
+    long-range dependencies with controlled cost.
+    """
+    def __init__(self, dim: int, num_heads: int = 4, pool_size: int = 16):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.pool_size = pool_size
+        self.scale = self.head_dim ** -0.5
+
+        groups = _resolve_group_count(dim, 8)
+        self.norm = nn.GroupNorm(num_groups=groups, num_channels=dim)
+        self.to_q = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+        self.to_kv = nn.Conv2d(dim, dim * 2, kernel_size=1, bias=True)
+        self.proj = nn.Conv2d(dim, dim, kernel_size=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        residual = x
+
+        x_norm = self.norm(x)
+        pooled = F.adaptive_avg_pool2d(x_norm, (self.pool_size, self.pool_size))
+
+        q = self.to_q(x_norm)
+        k, v = self.to_kv(pooled).chunk(2, dim=1)
+
+        q = rearrange(q, 'b (heads d) h w -> b heads (h w) d', heads=self.num_heads)
+        k = rearrange(k, 'b (heads d) hp wp -> b heads (hp wp) d', heads=self.num_heads)
+        v = rearrange(v, 'b (heads d) hp wp -> b heads (hp wp) d', heads=self.num_heads)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = rearrange(out, 'b heads (h w) d -> b (heads d) h w', h=h, w=w)
+        out = self.proj(out)
+
+        return out + residual
+
+
 # =============================================================================
 # Main Modules
 # =============================================================================
@@ -144,7 +284,8 @@ class MultiScaleStem(nn.Module):
         
         # Fusion: Project and normalize
         self.fusion_conv = nn.Conv2d(base_channels, base_channels, kernel_size=1)
-        self.norm = nn.GroupNorm(num_groups=groups, num_channels=base_channels)
+        norm_groups = _resolve_group_count(base_channels, groups)
+        self.norm = nn.GroupNorm(num_groups=norm_groups, num_channels=base_channels)
         self.act = nn.SiLU()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -246,6 +387,69 @@ class DualStreamCTEncoder(nn.Module):
         out = self.fusion_act(out)
         
         return out
+
+
+class TrueDualStreamAttentionEncoder(nn.Module):
+    """
+    True dual-stream condition encoder with parallel local/global attention.
+
+    Stream A (local): CNN + local-window attention for lesion-level details.
+    Stream B (global): CNN + global-context attention for anatomy consistency.
+    """
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_channels: int = 64,
+        out_channels: int = 64,
+        num_heads: int = 4,
+        groups: int = 8,
+        local_window_size: int = 8,
+        global_pool_size: int = 16,
+    ):
+        super().__init__()
+
+        self.stem = MultiScaleStem(
+            in_channels=in_channels,
+            base_channels=base_channels,
+            groups=groups
+        )
+
+        self.local_stream = nn.Sequential(
+            ResnetBlock2D(base_channels, base_channels, groups=groups),
+            LocalWindowAttention2D(
+                dim=base_channels,
+                num_heads=num_heads,
+                window_size=local_window_size,
+            ),
+            ResnetBlock2D(base_channels, base_channels, groups=groups),
+        )
+
+        self.global_stream = nn.Sequential(
+            ResnetBlock2D(base_channels, base_channels, groups=groups),
+            GlobalContextAttention2D(
+                dim=base_channels,
+                num_heads=num_heads,
+                pool_size=global_pool_size,
+            ),
+            ResnetBlock2D(base_channels, base_channels, groups=groups),
+        )
+
+        norm_groups = _resolve_group_count(out_channels, groups)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(base_channels * 2, out_channels, kernel_size=1),
+            nn.GroupNorm(num_groups=norm_groups, num_channels=out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=norm_groups, num_channels=out_channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        stem = self.stem(x)
+        local_feat = self.local_stream(stem)
+        global_feat = self.global_stream(stem)
+        fused = torch.cat([local_feat, global_feat], dim=1)
+        return self.fusion(fused)
 
 
 # =============================================================================

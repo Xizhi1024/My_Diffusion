@@ -163,3 +163,89 @@
 *   **频率一致性 (FMD):** 使用 Fréchet Medical Distance 替代传统的 FID，更准确评估医学图像质量。
 
 ---
+可以，而且你的落脚点比“单纯 CT→PET 好看”更强：**生成一张对分割有用、在病灶/label 区域置信度高的 synthetic PET**。这时生成模型不必在全图每个像素都完美，重点是 ROI 热点、边界附近、假阳性控制。
+
+**我的推荐主线**
+做一个三分支系统：
+
+`CT -> PET generator -> synthetic PET + hotspot/confidence map -> segmentation network`
+
+生成器不只输出 PET，还输出：
+- `PET/BQML_pred`
+- `hotspot_prior`：疑似高摄取区域概率图
+- `uncertainty/confidence`：哪里可信，哪里别太信
+
+然后分割网络输入：
+
+`[CT, synthetic PET, hotspot_prior, confidence]`
+
+最后用真实 label 评估：生成 PET 是否让 Dice、Recall、HD95、病灶检出率提升。
+
+**除了潜空间和桥扩散，还能做这些改进**
+1. **ROI-aware / lesion-aware loss**
+   不要只用全图 MSE/L1。你的任务是小目标，应该加：
+   - mask 区域加权 L1/MSE
+   - hotspot focal loss
+   - top-k uptake loss：只管 PET 最亮的前 1% 或 5% 区域
+   - background suppression：压低非病灶区假热点
+   - segmentation-guided loss：把生成 PET 喂给冻结分割器，要求分割结果接近真实 label
+
+2. **不确定性建模**
+   生成器输出 `mean + logvar`，或者 MC sampling 多次生成 PET，得到 variance map。分割时让网络学会：高不确定区域少信，低不确定热点多信。你之前代码里已经有 heteroscedastic 相关雏形，这条很适合接上。
+
+3. **2.5D 上下文**
+   你的 PET 是 192×192，CT 是 512×512，单 slice 容易丢层间信息。比起直接 3D，大概率更稳的是：
+   `CT_{z-2:z+2} -> PET_z`
+   或者 `CT/PET 5-slice stack -> segmentation_z`。这对小病灶很有用，成本也比 3D 小。
+
+4. **候选区域先验**
+   先训练一个轻量 `CT -> ROI/hotspot prior` 网络。这个 prior 不必很准，只要给 diffusion 一个“多看这里”的软提示。可以监督它去拟合：
+   - label mask
+   - PET 高摄取阈值图
+   - label 的 distance transform
+   - label 边界图
+
+**ControlNet 条件注入可以做，而且很适合**
+但建议叫 **ControlNet-style medical control branch**，不要直接照搬 Stable Diffusion 的大模型设定。
+
+可注入条件分三类：
+
+**推理时可用条件**
+- CT HU 图像，最好多窗：软组织窗、骨窗、宽窗
+- CT edge / gradient / Canny-like 边缘图
+- body mask / pelvic ROI / uterus-region coarse prior
+- z 位置编码、spacing、slice thickness、FOV 等 metadata
+- CT 邻近切片 2.5D stack
+
+**训练时监督，但推理时不能直接输入**
+- 真实 label mask
+- 真实 PET hotspot mask
+- 真实 PET/BQML top-k 区域
+这些可以做 loss 或训练一个 prior predictor，但不能直接喂给生成器作为推理条件，否则任务泄漏。
+
+**分割阶段可用条件**
+- synthetic PET
+- generated hotspot prior
+- uncertainty/confidence map
+- CT 原图
+
+注入方式我推荐从轻到重：
+- `concat`：最简单，CT/PET/noise 拼通道，作为 baseline。
+- `FiLM/AdaGN`：把 z、spacing、slice thickness、病人级 metadata 注入归一化层。
+- `ControlNet residual`：CT encoder 输出多尺度特征，经 zero conv 注入 diffusion U-Net 每个尺度。
+- `cross-attention`：把 ROI token / hotspot token / CT global token 注入低分辨率层。
+
+**TransUNet 要不要上？**
+我的判断：**不要先把 diffusion U-Net 整体换成 TransUNet**。TransUNet强在分割，能补 U-Net 长程依赖，但 diffusion denoiser 还要处理 timestep/noise conditioning，直接换主干风险大。
+
+更稳的用法：
+- 分割网络可以用 `TransUNet / SwinUNETR / nnU-Net` 做 baseline 和最终 head。
+- diffusion 主干保留 U-Net，只在 bottleneck 或低分辨率层加 transformer/self-attention。
+- CT 条件 encoder 可以做成小型 TransUNet/Swin encoder，但不要把整个生成器一口气 transformer 化。
+
+一句话设计：**生成器用 ControlNet-style 条件扩散，分割器用强医学分割网络，二者通过 synthetic PET + confidence map 连接。**
+
+参考方向：CPDM 用 Attention/Attenuation maps 做 CT→PET 条件；ControlNet 用 zero-conv 注入空间条件；LDM 降低生成成本；BBDM 适合 image-to-image 桥接；TransUNet/SwinUNETR/nnU-Net 更适合作为分割侧强基线。  
+来源：[CPDM](https://arxiv.org/abs/2410.21932)、[ControlNet](https://arxiv.org/abs/2302.05543)、[LDM](https://arxiv.org/abs/2112.10752)、[BBDM](https://arxiv.org/abs/2205.07680)、[TransUNet](https://arxiv.org/abs/2102.04306)、[Swin UNETR](https://arxiv.org/abs/2111.14791)、[nnU-Net](https://www.nature.com/articles/s41592-020-01008-z)。
+
+我建议你先选一条实验主线：**A. ControlNet-style PET 生成 + 分割辅助**，还是 **B. 先做 PET/hotspot prior 轻量生成，再接 nnU-Net/TransUNet 分割**？

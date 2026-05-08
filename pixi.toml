@@ -1,8 +1,5 @@
-[project]
+[workspace]
 name = "pet-ct-diffusion"
-version = "0.1.0"
-description = "PET to CT translation using dual-stream diffusion model inspired by MSRD-Net"
-authors = ["xizhi <2960944913@qq.com>"]
 channels = [
     "https://prefix.dev/conda-forge",      # 最高优先级
     "pytorch",          # 第二优先级
@@ -12,9 +9,11 @@ channels = [
 platforms = ["linux-64"]
 
 [tasks]
-train = "python scripts/train_v2.py --config configs/config_karras.yaml --resume checkpoint_epoch_25.pth"
+train = "python scripts/train_v2.py --config configs/config_precision_hu_suv.yaml "#--resume checkpoints/checkpoint_epoch_500.pth
 test = "python scripts/test.py"
 evaluate = "python scripts/test.py --eval --notebook 1 --checkpoint checkpoints/checkpoint_epoch_600.pth"
+unit-test = "python -m pytest -q tests"
+smoke-test = "python -m pytest -q tests/test_smoke_pipeline.py"
 
 [dependencies]
 # 核心依赖，特别是需要从特定渠道（如pytorch, nvidia）获取的
@@ -43,3 +42,5 @@ opencv-python = "*"
 matplotlib = "*"
 tensorboard = "*"
 wandb = "*"
+pytest = "*"
+pydicom = ">=3.0.2, <4"
