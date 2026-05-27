@@ -1,0 +1,92 @@
+# SLMF-BBDM: Baseline configuration (all modules disabled — pure BBDM + CT concat)
+
+experiment:
+  name: slmf_bbdm_baseline
+  seed: 42
+
+data:
+  cache_dir: cache/tensors
+  split_manifest: cache/split_manifest.csv
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys:
+    - ct
+    - pet
+    - mask
+
+runtime:
+  device: auto
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  eval_interval: 50
+  eval_num_samples: 16
+  eval_sampling_steps: 20
+  sample_interval: 50
+  save_interval: 50
+
+training:
+  num_epochs: 1000
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  lr_min: 1e-6
+  ema:
+    decay: 0.999
+    update_every: 10
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  gabor:
+    enabled: false
+  organ_prior:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  semantic_prior:
+    enabled: false
+  zero_adapter:
+    enabled: false
+  condition_dropout:
+    enabled: false
+  scale_adaptive_noise:
+    enabled: false
+    name: bbdm_bridge
+
+losses:
+  topk_lesion:
+    enabled: false
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false
+  roi_suv:
+    enabled: false
+  false_hotspot:
+    enabled: false
+  heteroscedastic_nll:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+
+metadata:
+  enabled: false

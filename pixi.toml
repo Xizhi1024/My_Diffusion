@@ -9,11 +9,16 @@ channels = [
 platforms = ["linux-64"]
 
 [tasks]
-train = "python scripts/train_v2.py --config configs/config_precision_hu_suv.yaml "#--resume checkpoints/checkpoint_epoch_500.pth
-test = "python scripts/test.py"
-evaluate = "python scripts/test.py --eval --notebook 1 --checkpoint checkpoints/checkpoint_epoch_600.pth"
+train = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml"
+test = "python -m pytest -q tests"
+evaluate = "python -m pytest -q tests/test_smoke.py -k sample"
 unit-test = "python -m pytest -q tests"
-smoke-test = "python -m pytest -q tests/test_smoke_pipeline.py"
+smoke-test = "python -m pytest -q tests/test_smoke.py"
+eval-full = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --split test"
+preprocess = "python -m src.data.dataset --manifest cache/manifest.csv --out-dir cache/tensors"
+organ-prior = "python -m src.data.organ_preprocess --cache-dir cache/tensors --gpu"
+semantic-tokens = "python -m src.data.semantic_builder --cache-dir cache/tensors --backend radimagenet --gpu"
+split-manifest = "python -m src.data.split_manifest --cache-dir cache/tensors --output cache/split_manifest.csv"
 
 [dependencies]
 # 核心依赖，特别是需要从特定渠道（如pytorch, nvidia）获取的
