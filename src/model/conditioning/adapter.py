@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from ..interfaces import ConditionBundle, ConditionAdapter
-from .beta_schedule import local_beta, spatial_beta
+from .beta_schedule import multi_level_betas, global_beta
 
 
 def _zero_module(module: nn.Module) -> nn.Module:
@@ -147,18 +147,19 @@ class ZeroConvAdapter(ConditionAdapter):
         conds = self._build_cond_per_level(ct_feats, organ_feats, gabor_feat, hotspot_prior, hw_list)
         outputs = [zc(c) for zc, c in zip(self.zero_convs, conds)]
 
-        # Apply time-varying beta modulation
+        # Apply per-level time-varying beta from the full 5-level matrix.
+        # Reversed: adapter outputs [L3→L0], decoder consumes [L0→L3].
         if tau is not None:
-            beta_local = local_beta(tau)   # [B],  rises at late steps
-            beta_spatial = spatial_beta(tau)  # [B],  nearly constant, slight late rise
-            while beta_local.dim() < 4:
-                beta_local = beta_local.unsqueeze(-1)
-                beta_spatial = beta_spatial.unsqueeze(-1)
-            # L0 (finest): modulated by local beta (Gabor details)
-            outputs[0] = outputs[0] * beta_local
-            # L1-L3: modulated by spatial beta
-            for i in range(1, 4):
-                outputs[i] = outputs[i] * beta_spatial
+            betas = multi_level_betas(tau, levels=5)  # [B, 5]: L4(bn)→L0
+            # betas columns: [bottleneck, L3, L2, L1, L0]
+            # adapter outputs 4 levels [L3, L2, L1, L0] (reversed to [L0, L1, L2, L3])
+            # Match: betas[:, 1:] = [L3, L2, L1, L0] → reverse → [L0, L1, L2, L3]
+            level_betas = betas[:, 1:].flip(1)  # [B, 4], L0→L3
+            for i in range(len(outputs)):
+                b = level_betas[:, i]  # [B]
+                while b.dim() < outputs[i].dim():
+                    b = b.unsqueeze(-1)
+                outputs[i] = outputs[i] * b
 
         return outputs
 

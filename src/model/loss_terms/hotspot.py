@@ -88,8 +88,14 @@ class HotspotPriorLoss(LossTerm):
         union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
         dice_loss = 1.0 - ((2.0 * intersection + 1.0) / (union + 1.0)).mean()
 
-        bce = F.binary_cross_entropy(pred, target, reduction="none")
-        pt = torch.where(target > 0.5, pred, 1.0 - pred)
+        # BCE is unsafe while CUDA autocast is enabled, even if inputs are
+        # explicitly cast to float32.
+        autocast_device = pred.device.type if pred.device.type in {"cuda", "cpu"} else "cpu"
+        with torch.amp.autocast(autocast_device, enabled=False):
+            pred_f = pred.float()
+            target_f = target.float()
+            bce = F.binary_cross_entropy(pred_f, target_f, reduction="none")
+            pt = torch.where(target_f > 0.5, pred_f, 1.0 - pred_f)
         focal_loss = ((1.0 - pt).pow(self.focal_gamma) * bce).mean()
 
         distance_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)

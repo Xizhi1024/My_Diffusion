@@ -46,10 +46,18 @@ class TopKLesionLoss(LossTerm):
         pred = ctx.pred_x0 if ctx.pred_x0 is not None else ctx.model_pred
         target = ctx.target_pet
 
-        k = max(1, int(target[0].numel() * self.topk_percent))
-        flat_target = target.reshape(target.shape[0], -1)
-        threshold = torch.topk(flat_target, k, dim=1).values[:, -1].view(-1, 1, 1, 1)
-        mask = (target >= threshold).float()
+        # Prefer the lesion mask when present. Selecting the top-k% brightest
+        # target pixels picks large high-uptake organs (bladder/heart/brain),
+        # not sparse lesions — so the model satisfied this loss by predicting
+        # organs and the lesion signal vanished (observed loss ≈ 0.008).
+        lesion = ctx.batch.get("mask")
+        if lesion is not None and lesion.sum() > 0:
+            mask = lesion.to(device=target.device, dtype=target.dtype)
+        else:
+            k = max(1, int(target[0].numel() * self.topk_percent))
+            flat_target = target.reshape(target.shape[0], -1)
+            threshold = torch.topk(flat_target, k, dim=1).values[:, -1].view(-1, 1, 1, 1)
+            mask = (target >= threshold).float()
 
         abs_error = (pred - target).abs()
         focal_weight = (1.0 - torch.exp(-abs_error)).pow(self.focal_gamma)

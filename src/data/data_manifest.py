@@ -1,3 +1,4 @@
+import argparse
 import csv
 import hashlib
 import json
@@ -1020,3 +1021,81 @@ def _fmt_list(items: list, max_show: int = 20) -> str:
         return ", ".join(f"`{x}`" for x in items)
     shown = ", ".join(f"`{x}`" for x in items[:max_show])
     return f"{shown}, ... ({len(items)} total)"
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────
+
+
+def _cli(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Build cache/manifest.csv by matching CT/PET image and label PNG/DICOM files."
+    )
+    ap.add_argument("--raw-root", type=Path, default=Path("Data"))
+    ap.add_argument("--dicom-root", type=Path, default=None)
+    ap.add_argument("--test-png-root", type=Path, default=None)
+    ap.add_argument("--output", type=Path, default=Path("cache/manifest.csv"))
+    ap.add_argument("--jsonl", type=Path, default=None)
+    ap.add_argument("--splits-dir", type=Path, default=None)
+    ap.add_argument("--report-dir", type=Path, default=None)
+    ap.add_argument("--sample-id-regex", default=DEFAULT_SAMPLE_ID_REGEX)
+    ap.add_argument(
+        "--dicom-slice-order",
+        default="z_desc",
+        choices=["z_desc", "z_asc", "instance_asc", "filename"],
+    )
+    ap.add_argument("--dicom-index-offset", type=int, default=0)
+    ap.add_argument("--val-ratio", type=float, default=0.15)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--test-sample-ids", nargs="*", default=None)
+    ap.add_argument("--print-stats", action="store_true")
+    args = ap.parse_args(argv)
+
+    dicom_root = args.dicom_root if args.dicom_root is not None else args.raw_root
+    records = build_sample_records(
+        raw_root=args.raw_root,
+        dicom_root=dicom_root,
+        test_png_root=args.test_png_root,
+        sample_id_regex=args.sample_id_regex,
+        dicom_slice_order=args.dicom_slice_order,
+        dicom_index_offset=args.dicom_index_offset,
+    )
+    assign_splits(
+        records,
+        test_sample_ids=set(args.test_sample_ids) if args.test_sample_ids else None,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+    )
+
+    write_csv(records, args.output)
+    if args.jsonl is not None:
+        write_jsonl(records, args.jsonl)
+    if args.splits_dir is not None:
+        write_split_csvs(records, args.splits_dir)
+
+    report_dir = args.report_dir if args.report_dir is not None else args.output.parent / "manifest_report"
+    write_report(records, report_dir)
+
+    stats = {
+        "records": len(records),
+        "patients": len({r.patient_id for r in records}),
+        "train": sum(1 for r in records if r.split == "train"),
+        "val": sum(1 for r in records if r.split == "val"),
+        "test": sum(1 for r in records if r.split == "test"),
+        "mapping_issues": sum(1 for r in records if r.mapping_status not in ("", "ok")),
+        "fingerprint": compute_dataset_fingerprint(records),
+    }
+    if args.print_stats:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    print(
+        f"[data_manifest] {stats['records']} records, {stats['patients']} patients "
+        f"(train={stats['train']}, val={stats['val']}, test={stats['test']})"
+    )
+    print(f"  mapping issues: {stats['mapping_issues']}")
+    print(f"  fingerprint: {stats['fingerprint']}")
+    print(f"  written to: {args.output}")
+    print(f"  report: {report_dir / 'report.md'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

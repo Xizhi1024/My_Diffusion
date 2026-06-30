@@ -1,10 +1,12 @@
 [workspace]
 name = "pet-ct-diffusion"
 channels = [
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
-    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda",
-]
-platforms = ["win-64"]
+    "https://prefix.dev/conda-forge",      # 最高优先级
+    "pytorch",          # 第二优先级
+    "nvidia",           # 第三优先级
+    "bioconda",         # 最低优先级
+    ]
+platforms = ["linux-64"]
 
 [tasks]
 # ===========================================================================
@@ -100,9 +102,6 @@ gpu-info = "python scripts/gpu_info.py"
 # 核心依赖，特别是需要从特定渠道（如pytorch, nvidia）获取的
 python = ">=3.11,<3.14"  # PyTorch 2.0+ 需要 Python 3.8 或更高版本
 scikit-image = ">=0.25.2,<0.26"
-
-[pypi-options]
-index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 [pypi-dependencies]
 # 其他可以通过 PyPI 安装的依赖

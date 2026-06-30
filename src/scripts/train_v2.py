@@ -98,6 +98,18 @@ def main():
     model = SLMFBBDM.from_config(config)
     _save_run_metadata(model, config, ckpt_dir, args.ablation)
 
+    # 4.5 Optionally initialise weights from a checkpoint (fine-tuning).
+    #     Only model weights are loaded; optimizer / scheduler / EMA start fresh
+    #     so the new loss landscape isn't dragged by stale momentum.
+    init_from = config.get("training", {}).get("init_from")
+    if init_from:
+        if not os.path.exists(init_from):
+            raise FileNotFoundError(f"training.init_from checkpoint not found: {init_from}")
+        print(f"Loading model weights from {init_from} (optimizer/EMA fresh)...")
+        ckpt = torch.load(init_from, map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        print("  loaded.")
+
     enabled_priors = [n for n, p in model.priors.items() if p.enabled]
     enabled_losses = [n for n, loss in model.loss_terms.items() if loss.enabled]
 

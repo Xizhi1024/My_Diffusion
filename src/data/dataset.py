@@ -198,7 +198,7 @@ class PreprocessConfig:
     ct_hu_max: float = 500.0
     pet_suv_max: float = 50.0
     image_size: int = 192
-    strict_suv: bool = False
+    strict_suv: bool = True
 
 
 class CacheBuilder:
@@ -251,6 +251,7 @@ class CacheBuilder:
             ds_ct, ct_hu = _read_dicom_pixels(ct_dcm)
             mu_map = 0.096 * (ct_hu / 1000.0) + 0.096
             mu_tensor = _resize_to_tensor(mu_map, self.cfg.image_size)
+            ct_hu_tensor = _resize_to_tensor(ct_hu, self.cfg.image_size)
             ct_hu_clip = np.clip(ct_hu, self.cfg.ct_hu_min, self.cfg.ct_hu_max)
             ct_norm = (ct_hu_clip - self.cfg.ct_hu_min) / (self.cfg.ct_hu_max - self.cfg.ct_hu_min)
             ct_tensor = _resize_to_tensor(ct_norm, self.cfg.image_size)
@@ -258,13 +259,17 @@ class CacheBuilder:
 
             ds_pet, activity = _read_dicom_pixels(pet_dcm)
             suv, suv_ok, suv_meta = compute_suv(ds_pet, activity)
+            pet_activity_tensor = None
+            pet_suv_tensor = None
             if not suv_ok:
                 if self.cfg.strict_suv:
                     raise RuntimeError(f"Cannot compute SUV for {pet_dcm}")
                 suv = activity
             if suv_ok:
+                pet_suv_tensor = _resize_to_tensor(suv, self.cfg.image_size)
                 pet_norm = np.clip(suv / self.cfg.pet_suv_max, 0.0, 1.0)
             else:
+                pet_activity_tensor = _resize_to_tensor(suv, self.cfg.image_size)
                 v_min, v_max = float(suv.min()), float(suv.max())
                 pet_norm = (suv - v_min) / max(v_max - v_min, 1e-8)
             pet_tensor = _resize_to_tensor(pet_norm, self.cfg.image_size)
@@ -302,6 +307,10 @@ class CacheBuilder:
             "pet_raw_max": float(suv.max()),
             "ct_hu_min": float(self.cfg.ct_hu_min),
             "ct_hu_max": float(self.cfg.ct_hu_max),
+            "ct_physical_key": "ct_hu",
+            "pet_physical_key": "pet_suv" if suv_ok else "pet_activity",
+            "pet_physical_kind": "suv" if suv_ok else "activity",
+            "pet_suv_available": bool(suv_ok),
             "patient_id": pid or sid,
             "slice_id": slc or 0,
         }
@@ -322,10 +331,15 @@ class CacheBuilder:
 
         payload = {
             "ct": ct_tensor.numpy().astype(np.float32),
+            "ct_hu": ct_hu_tensor.numpy().astype(np.float32),
             "pet": pet_tensor.numpy().astype(np.float32),
             "mu_map": mu_tensor.numpy().astype(np.float32),
-            "scale_meta_json": np.array([ord(c) for c in scale_meta_json], dtype=np.uint8),
+            "scale_meta_json": np.frombuffer(scale_meta_json.encode("utf-8"), dtype=np.uint8),
         }
+        if pet_suv_tensor is not None:
+            payload["pet_suv"] = pet_suv_tensor.numpy().astype(np.float32)
+        if pet_activity_tensor is not None:
+            payload["pet_activity"] = pet_activity_tensor.numpy().astype(np.float32)
         has_mask = False
         if mask_tensor is not None:
             payload["mask"] = mask_tensor.numpy().astype(np.float32)
@@ -462,12 +476,18 @@ class CachedDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         entry = self.entries[idx]
         with np.load(entry.cache_path) as data:
+            missing_required = [k for k in self.required_keys if k not in data]
+            if missing_required:
+                raise KeyError(
+                    f"Cached sample {entry.sample_id} is missing required key(s): "
+                    f"{missing_required}. Rebuild the cache or remove them from data.required_keys."
+                )
             ct = torch.from_numpy(data["ct"].copy()).float()
             pet = torch.from_numpy(data["pet"].copy()).float()
             H, W = ct.shape[1], ct.shape[2]
 
             mask = torch.zeros(1, H, W)
-            if entry.has_mask and "mask" in data:
+            if "mask" in data:
                 mask = torch.from_numpy(data["mask"].copy()).float()
 
             # Read optional fields from .npz if present, else zero
@@ -486,6 +506,24 @@ class CachedDataset(Dataset):
                 if "mu_map" in data
                 else torch.zeros(1, H, W)
             )
+            has_ct_hu = "ct_hu" in data
+            has_pet_suv = "pet_suv" in data
+            has_pet_activity = "pet_activity" in data
+            ct_hu = (
+                torch.from_numpy(data["ct_hu"].copy()).float()
+                if has_ct_hu
+                else torch.zeros(1, H, W)
+            )
+            pet_suv = (
+                torch.from_numpy(data["pet_suv"].copy()).float()
+                if has_pet_suv
+                else torch.zeros(1, H, W)
+            )
+            pet_activity = (
+                torch.from_numpy(data["pet_activity"].copy()).float()
+                if has_pet_activity
+                else torch.zeros(1, H, W)
+            )
             semantic_tokens = (
                 torch.from_numpy(data["semantic_tokens"].copy()).float()
                 if "semantic_tokens" in data
@@ -502,13 +540,21 @@ class CachedDataset(Dataset):
                 except (UnicodeDecodeError, _json.JSONDecodeError):
                     pass
 
+            scale_meta = dict(scale_meta)
+            scale_meta.setdefault("ct_physical_key", "ct_hu" if has_ct_hu else "")
+            scale_meta.setdefault("pet_physical_key", "pet_suv" if has_pet_suv else ("pet_activity" if has_pet_activity else ""))
+            scale_meta.setdefault("pet_suv_available", bool(has_pet_suv))
+
         if self._aug_fn is not None:
-            stacked = torch.cat([ct, pet, mask, organ_mask, organ_distance, mu_map], dim=0)
+            stacked = torch.cat([ct, pet, mask, organ_mask, organ_distance, mu_map, ct_hu, pet_suv, pet_activity], dim=0)
             stacked = self._aug_fn(stacked)
             ct, pet, mask = stacked[0:1], stacked[1:2], stacked[2:3]
             organ_mask = stacked[3:9]
             organ_distance = stacked[9:15]
             mu_map = stacked[15:16]
+            ct_hu = stacked[16:17]
+            pet_suv = stacked[17:18]
+            pet_activity = stacked[18:19]
 
         sample = {
             "ct": ct,
@@ -517,6 +563,9 @@ class CachedDataset(Dataset):
             "organ_mask": organ_mask,
             "organ_distance": organ_distance,
             "mu_map": mu_map,
+            "ct_hu": ct_hu,
+            "pet_suv": pet_suv,
+            "pet_activity": pet_activity,
             "meta": scale_meta,
         }
         if semantic_tokens is not None:
@@ -543,8 +592,12 @@ class FakeDataset(Dataset):
             "organ_mask": torch.zeros(6, H, W),
             "organ_distance": torch.zeros(6, H, W),
             "mu_map": torch.zeros(1, H, W),
+            "ct_hu": torch.zeros(1, H, W),
+            "pet_suv": torch.zeros(1, H, W),
+            "pet_activity": torch.zeros(1, H, W),
             "meta": {"pet_suv_max": 20.0, "suv_ok": False, "pet_raw_min": -1.0, "pet_raw_max": 1.0,
                      "ct_hu_min": -150.0, "ct_hu_max": 250.0, "patient_id": f"fake_{idx}", "slice_id": 0,
+                     "ct_physical_key": "", "pet_physical_key": "", "pet_suv_available": False,
                      "uptake_min": 60.0, "weight_kg": 65.0, "age_years": 52.0,
                      "thickness_mm": 2.0, "z_mm": 0.0},
         }
@@ -621,8 +674,19 @@ def _cli_preprocess(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--image-size", type=int, default=192)
     ap.add_argument("--no-spatial-check", action="store_true")
     ap.add_argument("--z-tolerance-mm", type=float, default=2.0)
+    ap.add_argument(
+        "--allow-non-suv",
+        action="store_true",
+        help="Allow PET slices without valid SUV metadata; clinical SUV losses/metrics will ignore them.",
+    )
     args = ap.parse_args(argv)
-    cfg = PreprocessConfig(ct_hu_min=args.ct_hu_min, ct_hu_max=args.ct_hu_max, pet_suv_max=args.pet_suv_max, image_size=args.image_size)
+    cfg = PreprocessConfig(
+        ct_hu_min=args.ct_hu_min,
+        ct_hu_max=args.ct_hu_max,
+        pet_suv_max=args.pet_suv_max,
+        image_size=args.image_size,
+        strict_suv=not args.allow_non_suv,
+    )
     builder = CacheBuilder(cfg)
     print(f"[preprocess] Building cache from {args.manifest} → {args.out_dir} ...")
     stats = builder.build(args.manifest, args.out_dir, validate_spatial=not args.no_spatial_check, z_tolerance_mm=args.z_tolerance_mm)

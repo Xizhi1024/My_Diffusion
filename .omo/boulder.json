@@ -1,0 +1,133 @@
+{
+  "schema_version": 2,
+  "active_work_id": "igear-net-optimization-1ccdeb91",
+  "works": {
+    "igear-net-optimization-1ccdeb91": {
+      "work_id": "igear-net-optimization-1ccdeb91",
+      "active_plan": "D:\\e_Project\\子宫内膜+小目标分割\\Model\\My_diffusion\\.omo\\plans\\igear-net-optimization.md",
+      "plan_name": "igear-net-optimization",
+      "status": "completed",
+      "started_at": "2026-06-21T07:17:16.352Z",
+      "updated_at": "2026-06-21T07:33:32.927Z",
+      "session_ids": [
+        "opencode:ses_1172ffcbaffeU448LEQ5XOT1dO",
+        "opencode:ses_116e97a95ffe5IIlKazVYUjbxF",
+        "opencode:ses_116e95fffffeiyzipoEJ7Fy3xj",
+        "opencode:ses_116e94a75ffeNjHOjiE19Ib9Wg",
+        "opencode:ses_116e92a1cffef91A2Nry0nFa0W"
+      ],
+      "session_origins": {
+        "opencode:ses_1172ffcbaffeU448LEQ5XOT1dO": "direct",
+        "opencode:ses_116e97a95ffe5IIlKazVYUjbxF": "appended",
+        "opencode:ses_116e95fffffeiyzipoEJ7Fy3xj": "appended",
+        "opencode:ses_116e94a75ffeNjHOjiE19Ib9Wg": "appended",
+        "opencode:ses_116e92a1cffef91A2Nry0nFa0W": "appended"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "一次性应用全部参数改动（边界加权BCE + 梯度门控 + EdgeBank）",
+          "session_id": "opencode:ses_116f09485ffeC9MJJAYmwayugg",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-21T07:28:43.414Z",
+          "started_at": "2026-06-21T07:25:52.053Z",
+          "status": "completed",
+          "ended_at": "2026-06-21T07:28:43.414Z",
+          "elapsed_ms": 171361
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "**Plan Compliance Audit** — `oracle`",
+          "session_id": "opencode:ses_116e97a95ffe5IIlKazVYUjbxF",
+          "agent": "oracle",
+          "updated_at": "2026-06-21T07:31:20.407Z",
+          "started_at": "2026-06-21T07:31:15.094Z",
+          "status": "completed",
+          "ended_at": "2026-06-21T07:31:20.407Z",
+          "elapsed_ms": 5313
+        },
+        "final-wave:f2": {
+          "task_key": "final-wave:f2",
+          "task_label": "F2",
+          "task_title": "**Code Quality Review** — `unspecified-high`",
+          "session_id": "opencode:ses_116e92a1cffef91A2Nry0nFa0W",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "started_at": "2026-06-21T07:31:28.603Z",
+          "status": "completed",
+          "updated_at": "2026-06-21T07:32:17.205Z",
+          "ended_at": "2026-06-21T07:32:17.205Z",
+          "elapsed_ms": 48602
+        }
+      },
+      "ended_at": "2026-06-21T07:33:32.927Z",
+      "elapsed_ms": 976575
+    }
+  },
+  "active_plan": "D:\\e_Project\\子宫内膜+小目标分割\\Model\\My_diffusion\\.omo\\plans\\igear-net-optimization.md",
+  "started_at": "2026-06-21T07:17:16.352Z",
+  "status": "completed",
+  "updated_at": "2026-06-21T07:33:32.927Z",
+  "session_ids": [
+    "opencode:ses_1172ffcbaffeU448LEQ5XOT1dO",
+    "opencode:ses_116e97a95ffe5IIlKazVYUjbxF",
+    "opencode:ses_116e95fffffeiyzipoEJ7Fy3xj",
+    "opencode:ses_116e94a75ffeNjHOjiE19Ib9Wg",
+    "opencode:ses_116e92a1cffef91A2Nry0nFa0W"
+  ],
+  "session_origins": {
+    "opencode:ses_1172ffcbaffeU448LEQ5XOT1dO": "direct",
+    "opencode:ses_116e97a95ffe5IIlKazVYUjbxF": "appended",
+    "opencode:ses_116e95fffffeiyzipoEJ7Fy3xj": "appended",
+    "opencode:ses_116e94a75ffeNjHOjiE19Ib9Wg": "appended",
+    "opencode:ses_116e92a1cffef91A2Nry0nFa0W": "appended"
+  },
+  "plan_name": "igear-net-optimization",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "一次性应用全部参数改动（边界加权BCE + 梯度门控 + EdgeBank）",
+      "session_id": "opencode:ses_116f09485ffeC9MJJAYmwayugg",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-21T07:28:43.414Z",
+      "started_at": "2026-06-21T07:25:52.053Z",
+      "status": "completed",
+      "ended_at": "2026-06-21T07:28:43.414Z",
+      "elapsed_ms": 171361
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "**Plan Compliance Audit** — `oracle`",
+      "session_id": "opencode:ses_116e97a95ffe5IIlKazVYUjbxF",
+      "agent": "oracle",
+      "updated_at": "2026-06-21T07:31:20.407Z",
+      "started_at": "2026-06-21T07:31:15.094Z",
+      "status": "completed",
+      "ended_at": "2026-06-21T07:31:20.407Z",
+      "elapsed_ms": 5313
+    },
+    "final-wave:f2": {
+      "task_key": "final-wave:f2",
+      "task_label": "F2",
+      "task_title": "**Code Quality Review** — `unspecified-high`",
+      "session_id": "opencode:ses_116e92a1cffef91A2Nry0nFa0W",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "started_at": "2026-06-21T07:31:28.603Z",
+      "status": "completed",
+      "updated_at": "2026-06-21T07:32:17.205Z",
+      "ended_at": "2026-06-21T07:32:17.205Z",
+      "elapsed_ms": 48602
+    }
+  },
+  "agent": "atlas",
+  "ended_at": "2026-06-21T07:33:32.927Z",
+  "elapsed_ms": 976575
+}

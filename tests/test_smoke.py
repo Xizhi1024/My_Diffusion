@@ -111,8 +111,12 @@ def _toy_config(**overrides):
             "patch_nce": {"enabled": False},
             "roi_suv": {"enabled": False},
             "false_hotspot": {"enabled": False},
+            "lesion_roi_l1": {"enabled": False},
+            "outside_peak_ranking": {"enabled": False},
             "heteroscedastic_nll": {"enabled": False},
             "hotspot_prior": {"enabled": False},
+            "organ_consistency": {"enabled": False},
+            "segmenter_consistency": {"enabled": False},
         },
     }
     for k, v in overrides.items():
@@ -531,6 +535,198 @@ class TestLossTerms:
         assert torch.isfinite(loss)
         assert "hotspot_prior/dice" in logs
 
+    def test_organ_consistency_no_crash(self):
+        from src.model.loss_terms.organ_consistency import OrganConsistencyLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        B, H, W = 2, 16, 16
+        pred = torch.rand(B, 1, H, W) * 2 - 1
+        target = torch.rand(B, 1, H, W) * 2 - 1
+        organ_mask = torch.zeros(B, 6, H, W)
+        organ_mask[:, 3, 2:8, 2:8] = 1.0   # bone (cold)
+        organ_mask[:, 4, 8:12, 8:12] = 1.0 # fat (cold)
+        organ_mask[:, 1, 12:14, 12:14] = 1.0  # bladder (warm, not penalised)
+
+        term = OrganConsistencyLoss(enabled=True, active_tau_min=0.25, cold_weight=0.02)
+        ctx = LossContext(
+            model_pred=pred, loss_target=target, target_pet=target, pred_x0=pred,
+            timesteps=torch.tensor([300, 500]), tau=torch.tensor([0.5, 0.3]),
+            batch={"organ_mask": organ_mask},
+            condition=ConditionBundle.empty(),
+        )
+        loss, logs = term(ctx)
+        assert torch.isfinite(loss)
+        assert "organ_consistency/bone_loss" in logs
+        assert "organ_consistency/fat_loss" in logs
+        assert "organ_consistency/gate_mean" in logs
+
+    def test_organ_consistency_disabled_returns_zero(self):
+        from src.model.loss_terms.organ_consistency import OrganConsistencyLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        term = OrganConsistencyLoss(enabled=False)
+        ctx = LossContext(
+            model_pred=torch.zeros(1, 1, 8, 8), loss_target=torch.zeros(1, 1, 8, 8),
+            target_pet=torch.zeros(1, 1, 8, 8), pred_x0=torch.zeros(1, 1, 8, 8),
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.5]),
+            batch={}, condition=ConditionBundle.empty(),
+        )
+        loss, logs = term(ctx)
+        assert loss.item() == 0.0
+
+    def test_lesion_roi_l1_ignores_far_outside_mask_error(self):
+        from src.model.loss_terms.lesion_roi import LesionROIL1Loss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        target = torch.zeros(1, 1, 16, 16)
+        pred = target.clone()
+        pred[:, :, 0, 0] = 10.0  # far outside lesion ROI; should not matter
+        mask = torch.zeros(1, 1, 16, 16)
+        mask[:, :, 8, 8] = 1.0
+
+        term = LesionROIL1Loss(enabled=True, weight=1.0, dilate_radius=1, active_tau_max=1.0)
+        ctx = LossContext(
+            model_pred=pred, loss_target=target, target_pet=target, pred_x0=pred,
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.0]),
+            batch={"mask": mask}, condition=ConditionBundle.empty(),
+        )
+        loss, logs = term(ctx)
+        assert loss.item() == 0.0
+        assert logs["lesion_roi_l1/roi_pixels"].item() == 9
+
+    def test_outside_peak_ranking_penalizes_outside_peak_above_inside(self):
+        from src.model.loss_terms.lesion_roi import OutsidePeakRankingLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        target = torch.zeros(1, 1, 16, 16)
+        pred_bad = target.clone()
+        pred_good = target.clone()
+        mask = torch.zeros(1, 1, 16, 16)
+        mask[:, :, 8, 8] = 1.0
+
+        pred_bad[:, :, 8, 8] = 0.4
+        pred_bad[:, :, 0, 0] = 0.8
+        pred_good[:, :, 8, 8] = 0.8
+        pred_good[:, :, 0, 0] = 0.2
+
+        term = OutsidePeakRankingLoss(
+            enabled=True, weight=1.0, margin=0.05,
+            inside_radius=1, outside_radius=2, topk_percent=0.0,
+            active_tau_max=1.0,
+        )
+        ctx_bad = LossContext(
+            model_pred=pred_bad, loss_target=target, target_pet=target, pred_x0=pred_bad,
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.0]),
+            batch={"mask": mask}, condition=ConditionBundle.empty(),
+        )
+        ctx_good = LossContext(
+            model_pred=pred_good, loss_target=target, target_pet=target, pred_x0=pred_good,
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.0]),
+            batch={"mask": mask}, condition=ConditionBundle.empty(),
+        )
+        loss_bad, logs_bad = term(ctx_bad)
+        loss_good, logs_good = term(ctx_good)
+        assert loss_bad.item() > 0.0
+        assert loss_good.item() == 0.0
+        assert logs_bad["outside_peak_ranking/outside_peak"].item() > logs_bad["outside_peak_ranking/inside_peak"].item()
+        assert logs_good["outside_peak_ranking/inside_peak"].item() > logs_good["outside_peak_ranking/outside_peak"].item()
+
+
+# ---------------------------------------------------------------------------
+# TinySegmenter tests
+# ---------------------------------------------------------------------------
+
+class TestTinySegmenter:
+    def test_segmenter_forward_shape(self):
+        from src.model.segmenter import TinySegmenter
+
+        seg = TinySegmenter(in_channels=1, base_channels=16, stage=2)
+        pet = torch.randn(2, 1, 32, 32)
+        out = seg(pet)
+        assert out.shape == (2, 1, 32, 32)
+        # Stage 2 (tanh) output in [-1, 1]
+        assert out.min() >= -1.01 and out.max() <= 1.01
+
+    def test_segmenter_disabled_returns_zero(self):
+        from src.model.segmenter import TinySegmenter
+
+        seg = TinySegmenter(enabled=False)
+        pet = torch.randn(2, 1, 32, 32)
+        out = seg(pet)
+        assert (out == 0).all()
+
+    def test_segmenter_stage1_sigmoid(self):
+        from src.model.segmenter import TinySegmenter
+
+        seg = TinySegmenter(stage=1)
+        pet = torch.randn(2, 1, 32, 32)
+        out = seg(pet)
+        assert out.min() >= -0.01 and out.max() <= 1.01  # sigmoid → [0, 1]
+
+    def test_segmenter_param_budget(self):
+        from src.model.segmenter import TinySegmenter
+
+        seg = TinySegmenter(base_channels=16)
+        params = seg.get_total_params()
+        assert params < 500_000, f"Segmenter has {params:,} params, budget is 500K"
+
+    def test_build_target_heatmap(self):
+        from src.model.segmenter import TinySegmenter
+
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[:, :, 14:18, 14:18] = 1.0
+        target = TinySegmenter.build_target(mask, stage=1, gaussian_sigma=6.0)
+        assert target.shape == mask.shape
+        assert target.max() > 0.5  # centre should be bright
+        assert target[:, :, 0, 0] < 0.1  # far away should be dim
+
+    def test_build_target_relaxed(self):
+        from src.model.segmenter import TinySegmenter
+
+        mask = torch.zeros(1, 1, 32, 32)
+        mask[:, :, 14:18, 14:18] = 1.0
+        target = TinySegmenter.build_target(mask, stage=2)
+        assert target.shape == mask.shape
+        assert target[:, :, 14:18, 14:18].mean() > 0  # lesion interior positive
+
+
+class TestSegmenterConsistencyLoss:
+    def test_disabled_returns_zero(self):
+        from src.model.loss_terms.segmenter_consistency import SegmenterConsistencyLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        term = SegmenterConsistencyLoss(enabled=False)
+        ctx = LossContext(
+            model_pred=torch.zeros(1, 1, 8, 8), loss_target=torch.zeros(1, 1, 8, 8),
+            target_pet=torch.zeros(1, 1, 8, 8), pred_x0=torch.zeros(1, 1, 8, 8),
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.1]),
+            batch={}, condition=ConditionBundle.empty(),
+        )
+        loss, logs = term(ctx)
+        assert loss.item() == 0.0
+
+    def test_with_segmenter_no_crash(self):
+        from src.model.segmenter import TinySegmenter
+        from src.model.loss_terms.segmenter_consistency import SegmenterConsistencyLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        seg = TinySegmenter(stage=2, base_channels=8)
+        seg.eval()
+        for p in seg.parameters():
+            p.requires_grad = False
+
+        term = SegmenterConsistencyLoss(segmenter=seg, enabled=True)
+        pred = torch.randn(2, 1, 16, 16)
+        target = torch.randn(2, 1, 16, 16)
+        ctx = LossContext(
+            model_pred=pred, loss_target=target, target_pet=target, pred_x0=pred,
+            timesteps=torch.tensor([5, 5]), tau=torch.tensor([0.1, 0.1]),
+            batch={}, condition=ConditionBundle.empty(),
+        )
+        loss, logs = term(ctx)
+        assert torch.isfinite(loss)
+        assert "segmenter_consistency/loss" in logs
+
 
 # ---------------------------------------------------------------------------
 # Full model integration tests
@@ -654,6 +850,27 @@ class TestModelIntegration:
         loss, logs = model(batch)
         assert torch.isfinite(loss)
         assert logs["module/self_conditioning"].item() == 1.0
+
+    def test_model_sample_with_cfg(self):
+        """Weak CFG sampling produces valid output with cfg_scale > 1."""
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _toy_config()
+        model = SLMFBBDM.from_config(cfg)
+        batch = _fake_batch()
+        result = model.sample(batch, num_steps=3, cfg_scale=1.2)
+        assert result["synthetic_pet"].shape == (2, 1, 32, 32)
+        assert torch.isfinite(result["synthetic_pet"]).all()
+
+    def test_model_sample_cfg_1_is_noop(self):
+        """cfg_scale=1.0 should match no-CFG output (no blending)."""
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _toy_config()
+        model = SLMFBBDM.from_config(cfg)
+        batch = _fake_batch()
+        result = model.sample(batch, num_steps=3, cfg_scale=1.0)
+        assert result["synthetic_pet"].shape == (2, 1, 32, 32)
 
     def test_model_sample_with_self_conditioning(self):
         from src.model.slmf_bbdm import SLMFBBDM
@@ -928,6 +1145,8 @@ class TestDataset:
         assert sample["organ_mask"].shape == (6, 32, 32)
         assert sample["organ_distance"].shape == (6, 32, 32)
         assert sample["mu_map"].shape == (1, 32, 32)
+        assert sample["ct_hu"].shape == (1, 32, 32)
+        assert sample["pet_suv"].shape == (1, 32, 32)
 
     def test_build_dataloaders_fake(self):
         from src.data.dataset import build_dataloaders
@@ -993,6 +1212,33 @@ class TestDataset:
         sample = ds[0]
         assert torch.allclose(sample["organ_distance"], torch.ones(6, 4, 4))
 
+    def test_cached_dataset_returns_physical_maps(self, tmp_path):
+        from src.data.dataset import CachedDataset
+
+        sample_id = "001001"
+        ct_hu = np.full((1, 4, 4), 123.0, dtype=np.float32)
+        pet_suv = np.full((1, 4, 4), 7.5, dtype=np.float32)
+        np.savez_compressed(
+            tmp_path / f"{sample_id}.npz",
+            ct=np.zeros((1, 4, 4), dtype=np.float32),
+            pet=np.zeros((1, 4, 4), dtype=np.float32),
+            ct_hu=ct_hu,
+            pet_suv=pet_suv,
+            scale_meta_json=np.frombuffer(
+                json.dumps({"suv_ok": True, "pet_suv_max": 20.0}).encode(), dtype=np.uint8
+            ),
+        )
+        (tmp_path / f"{sample_id}_meta.json").write_text(
+            json.dumps({"sample_id": sample_id, "split": "train", "has_label": False}),
+            encoding="utf-8",
+        )
+
+        ds = CachedDataset(tmp_path, split="train", augment=False)
+        sample = ds[0]
+        assert torch.allclose(sample["ct_hu"], torch.full((1, 4, 4), 123.0))
+        assert torch.allclose(sample["pet_suv"], torch.full((1, 4, 4), 7.5))
+        assert sample["meta"]["pet_suv_available"] is True
+
 
 class TestScaleMeta:
     """Verify scale_meta propagation through data pipeline and loss terms."""
@@ -1020,7 +1266,6 @@ class TestScaleMeta:
 
         loss_fn = ROISUVLoss(active_tau_max=0.25, enabled=True, weight=0.2)
 
-        # Without meta: should still work (fallback to default scale)
         ctx = LossContext(
             model_pred=pred, loss_target=target, target_pet=target,
             pred_x0=pred, timesteps=torch.tensor([0, 0]), tau=tau,
@@ -1033,6 +1278,47 @@ class TestScaleMeta:
         assert loss.item() >= 0.0
         assert "roi_suv/suv_max_error" in logs
         assert "roi_suv/tbr_error" in logs
+        assert torch.isclose(logs["roi_suv/valid_fraction"], torch.tensor(0.5))
+
+    def test_roi_suv_loss_uses_physical_target_tensor(self):
+        from src.model.loss_terms.roi_suv import ROISUVLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        pred = torch.zeros(1, 1, 4, 4)
+        target = torch.zeros(1, 1, 4, 4)
+        mask = torch.ones(1, 1, 4, 4)
+        pet_suv = torch.full((1, 1, 4, 4), 30.0)
+        loss_fn = ROISUVLoss(active_tau_max=0.25, enabled=True, weight=1.0)
+
+        ctx = LossContext(
+            model_pred=pred, loss_target=target, target_pet=target,
+            pred_x0=pred, timesteps=torch.tensor([0]), tau=torch.tensor([0.1]),
+            batch={
+                "mask": mask,
+                "pet_suv": pet_suv,
+                "meta": [{"suv_ok": True, "pet_suv_max": 20.0, "pet_suv_available": True}],
+            },
+            condition=ConditionBundle.empty(),
+        )
+        loss, logs = loss_fn(ctx)
+        assert loss.item() > 0.0
+        assert torch.isclose(logs["roi_suv/target_suv_mean"], torch.tensor(30.0))
+
+    def test_roi_suv_loss_skips_invalid_suv_samples(self):
+        from src.model.loss_terms.roi_suv import ROISUVLoss
+        from src.model.interfaces import LossContext, ConditionBundle
+
+        loss_fn = ROISUVLoss(enabled=True)
+        ctx = LossContext(
+            model_pred=torch.ones(1, 1, 8, 8), loss_target=torch.zeros(1, 1, 8, 8),
+            target_pet=torch.zeros(1, 1, 8, 8), pred_x0=torch.ones(1, 1, 8, 8),
+            timesteps=torch.tensor([0]), tau=torch.tensor([0.1]),
+            batch={"mask": torch.ones(1, 1, 8, 8), "meta": [{"suv_ok": False, "pet_raw_min": 0.0, "pet_raw_max": 99.0}]},
+            condition=ConditionBundle.empty(),
+        )
+        loss, logs = loss_fn(ctx)
+        assert loss.item() == 0.0
+        assert logs["roi_suv/valid_fraction"].item() == 0.0
 
     def test_roi_suv_disabled_returns_zero(self):
         from src.model.loss_terms.roi_suv import ROISUVLoss

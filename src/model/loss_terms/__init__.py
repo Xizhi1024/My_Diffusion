@@ -8,3 +8,4 @@ from .false_hotspot import FalseHotspotLoss
 from .heteroscedastic import HeteroscedasticNLLLoss
 from .hotspot import HotspotPriorLoss
 from .patch_nce import PatchNCELoss
+from .lesion_roi import LesionROIL1Loss, OutsidePeakRankingLoss

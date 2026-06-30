@@ -277,15 +277,6 @@ class SemanticTokenBuilder:
             for i, npz_path in enumerate(batch_paths):
                 try:
                     data = np.load(npz_path)
-                    # Handle ct shape: [H,W], [1,H,W], or [1,1,H,W]
-                    ct_raw = data["ct"]
-                    ct_norm = np.squeeze(ct_raw)  # removes all singleton dims
-                    if ct_norm.ndim != 2:
-                        stats.setdefault("errors", []).append(
-                            f"{npz_path.name}: unexpected ct shape {ct_raw.shape}")
-                        stats["skipped"] += 1
-                        continue
-
                     # Extract scale_meta for HU range
                     scale_meta = {}
                     if "scale_meta_json" in data:
@@ -298,7 +289,24 @@ class SemanticTokenBuilder:
                     ct_hu_min = scale_meta.get("ct_hu_min", -150.0)
                     ct_hu_max = scale_meta.get("ct_hu_max", 250.0)
 
-                    rgb = ct_norm_to_3win_rgb(ct_norm, ct_hu_min, ct_hu_max)
+                    if "ct_hu" in data:
+                        ct_hu = np.squeeze(data["ct_hu"])
+                        if ct_hu.ndim != 2:
+                            stats.setdefault("errors", []).append(
+                                f"{npz_path.name}: unexpected ct_hu shape {data['ct_hu'].shape}")
+                            stats["skipped"] += 1
+                            continue
+                        rgb = ct_hu_to_3win_rgb(ct_hu)
+                    else:
+                        # Legacy cache fallback: only the configured HU window can be recovered.
+                        ct_raw = data["ct"]
+                        ct_norm = np.squeeze(ct_raw)  # [H,W], [1,H,W], or [1,1,H,W]
+                        if ct_norm.ndim != 2:
+                            stats.setdefault("errors", []).append(
+                                f"{npz_path.name}: unexpected ct shape {ct_raw.shape}")
+                            stats["skipped"] += 1
+                            continue
+                        rgb = ct_norm_to_3win_rgb(ct_norm, ct_hu_min, ct_hu_max)
                     rgb = torch.from_numpy(rgb).permute(2, 0, 1).float()  # [3, H, W]
                     rgb = F.interpolate(
                         rgb.unsqueeze(0), size=(224, 224), mode="bilinear", align_corners=False

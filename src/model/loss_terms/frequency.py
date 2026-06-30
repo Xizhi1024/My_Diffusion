@@ -42,9 +42,9 @@ class FocalFrequencyLoss(LossTerm):
         pred = ctx.pred_x0 if ctx.pred_x0 is not None else ctx.model_pred
         target = ctx.target_pet
 
-        # 2D RFFT (real input → ~2× faster, half memory)
-        pred_fft = torch.fft.rfft2(pred, norm="ortho")
-        target_fft = torch.fft.rfft2(target, norm="ortho")
+        # rfft2 does not support bf16; cast to float32
+        pred_fft = torch.fft.rfft2(pred.float(), norm="ortho")
+        target_fft = torch.fft.rfft2(target.float(), norm="ortho")
 
         # Frequency distance (real + imag)
         freq_error = torch.abs(pred_fft - target_fft)

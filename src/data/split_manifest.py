@@ -48,6 +48,7 @@ def generate_split_manifest(
     val_ratio: float = 0.15,
     seed: int = 42,
     test_patient_ids: Optional[Set[str]] = None,
+    no_test: bool = False,
 ) -> Dict[str, Any]:
     """Scan .npz cache, group by patient, assign splits, write manifest.
 
@@ -71,10 +72,11 @@ def generate_split_manifest(
     rng = random.Random(seed)
 
     # Determine test patients
-    if test_patient_ids:
+    if no_test:
+        test_pids: Set[str] = set()
+    elif test_patient_ids:
         test_pids = set(test_patient_ids)
     else:
-        # Default: last 15% of patients by sorted order as test (configurable)
         n_test = max(1, int(len(patient_ids) * 0.10))
         test_pids = set(patient_ids[-n_test:])
 
@@ -220,6 +222,8 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--test-patients", type=str, nargs="*", default=None,
                     help="Explicit test patient IDs (space-separated)")
+    ap.add_argument("--no-test", action="store_true",
+                    help="Do not reserve any patients for test; all patients go to train/val")
     ap.add_argument("--print-stats", action="store_true")
     args = ap.parse_args(argv)
 
@@ -231,6 +235,7 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
         val_ratio=args.val_ratio,
         seed=args.seed,
         test_patient_ids=test_pids,
+        no_test=args.no_test,
     )
 
     if args.print_stats:

@@ -49,7 +49,7 @@ def multi_level_betas(
 
     τ=1.0  τ=0.6  τ=0.25  τ=0
     Bottleneck (L4):  1.0    0.5    0.1     0
-    L3:               0.5    1.0    0.8     0.3
+    L3:               0.6    1.0    0.8     0.3
     L2:               0.2    0.8    1.0     0.5
     L1:               0      0.3    0.8     1.0
     L0:               0      0      0.6     1.0
@@ -58,7 +58,7 @@ def multi_level_betas(
     t_anchors = torch.tensor([1.0, 0.6, 0.25, 0.0], device=tau.device, dtype=tau.dtype)
     anchor_vals = torch.tensor([
         [1.0, 0.5, 0.1, 0.0],
-        [0.5, 1.0, 0.8, 0.3],
+        [0.6, 1.0, 0.8, 0.3],
         [0.2, 0.8, 1.0, 0.5],
         [0.0, 0.3, 0.8, 1.0],
         [0.0, 0.0, 0.6, 1.0],
@@ -75,8 +75,8 @@ def multi_level_betas(
     denom = (t_left - t_right).clamp_min(1e-8)
     frac = ((tau_clamped - t_right) / denom).unsqueeze(1)  # [B, 1]
 
-    val_left = anchor_vals[:, left_idx]    # [levels, B]
-    val_right = anchor_vals[:, right_idx]  # [levels, B]
-    betas = (frac * val_left + (1 - frac) * val_right).T  # [B, levels]
+    val_left = anchor_vals[:, left_idx].T    # [B, levels]
+    val_right = anchor_vals[:, right_idx].T  # [B, levels]
+    betas = frac * val_left + (1 - frac) * val_right  # [B, levels]
 
     return betas

@@ -154,6 +154,7 @@ class BBDMUNet(nn.Module):
         context_tokens: Optional[torch.Tensor] = None,
         skip_injections: Optional[List[torch.Tensor]] = None,
         meta: Optional[torch.Tensor] = None,
+        ca_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         t_emb = self.time_emb(timesteps)
         if meta is not None and self.meta_proj is not None:
@@ -174,7 +175,13 @@ class BBDMUNet(nn.Module):
         h = self.bn_block1(h, t_emb)
         h = self.bn_block2(h, t_emb)
         if context_tokens is not None:
-            h = self.cross_attn(h, context_tokens)
+            h_ca = self.cross_attn(h, context_tokens)
+            if ca_beta is not None:
+                while ca_beta.dim() < h.dim():
+                    ca_beta = ca_beta.unsqueeze(-1)
+                h = h + ca_beta * (h_ca - h)
+            else:
+                h = h_ca
 
         # ---- Decoder ----
         for i, blocks in enumerate(self.up_blocks):

@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from .interfaces import ConditionBundle, LossContext
 from .conditioning.adapter import ZeroConvAdapter, RawConcatAdapter
+from .conditioning.beta_schedule import multi_level_betas
 from .conditioning.dropout import ConditionDropout
 from .bbdm_unet import BBDMUNet
 
@@ -205,6 +206,7 @@ class SLMFBBDM(nn.Module):
         base_loss_config: Optional[Dict[str, Any]] = None,
         self_conditioning_config: Optional[Dict[str, Any]] = None,
         meta_config: Optional[Dict[str, Any]] = None,
+        segmenter_config: Optional[Dict[str, Any]] = None,
         # Inference
         sample_scheduler: str = "ddim",
         eval_sampling_steps: int = 20,
@@ -267,6 +269,30 @@ class SLMFBBDM(nn.Module):
         self.meta_enabled = meta_cfg.get("enabled", False)
         self.meta_keys = meta_cfg.get("keys", list(_META_KEYS))
         meta_dim = len(self.meta_keys) if self.meta_enabled else 0
+
+        # ---- Tiny PET Segmenter (frozen, for L_seg) ----
+        seg_cfg = segmenter_config or {}
+        self.segmenter_enabled = seg_cfg.get("enabled", False)
+        self.segmenter: Optional[nn.Module] = None
+        if self.segmenter_enabled:
+            from .segmenter import TinySegmenter
+            self.segmenter = TinySegmenter(
+                in_channels=seg_cfg.get("in_channels", 1),
+                base_channels=seg_cfg.get("base_channels", 16),
+                stage=seg_cfg.get("stage", 2),
+                gaussian_sigma=seg_cfg.get("gaussian_sigma", 6.0),
+                enabled=True,
+            )
+            # Load pretrained weights if provided
+            ckpt_path = seg_cfg.get("checkpoint")
+            if ckpt_path is not None:
+                state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                self.segmenter.load_state_dict(state)
+                print(f"[SLMF-BBDM] Loaded frozen segmenter from {ckpt_path}")
+            # Freeze — segmenter is an oracle, not a trainable part of BBDM
+            for p in self.segmenter.parameters():
+                p.requires_grad = False
+            self.segmenter.eval()
 
         # ---- UNet ----
         # Input is [noisy_x, ct] plus optional previous x0 estimate.
@@ -401,6 +427,24 @@ class SLMFBBDM(nn.Module):
                 active_tau_max=cfg.get("active_tau_max", 0.3),
                 enabled=enabled, weight=weight,
             )
+        elif name == "lesion_roi_l1":
+            from .loss_terms.lesion_roi import LesionROIL1Loss
+            return LesionROIL1Loss(
+                dilate_radius=cfg.get("dilate_radius", 3),
+                beta=cfg.get("beta", 0.05),
+                active_tau_max=cfg.get("active_tau_max", 0.7),
+                enabled=enabled, weight=weight,
+            )
+        elif name == "outside_peak_ranking":
+            from .loss_terms.lesion_roi import OutsidePeakRankingLoss
+            return OutsidePeakRankingLoss(
+                margin=cfg.get("margin", 0.05),
+                inside_radius=cfg.get("inside_radius", 3),
+                outside_radius=cfg.get("outside_radius", 8),
+                topk_percent=cfg.get("topk_percent", 0.01),
+                active_tau_max=cfg.get("active_tau_max", 0.65),
+                enabled=enabled, weight=weight,
+            )
         elif name == "heteroscedastic_nll":
             from .loss_terms.heteroscedastic import HeteroscedasticNLLLoss
             return HeteroscedasticNLLLoss(
@@ -418,6 +462,20 @@ class SLMFBBDM(nn.Module):
                 focal_weight=cfg.get("focal_weight", 1.0),
                 distance_weight=cfg.get("distance_weight", 0.25),
                 pet_threshold_quantile=cfg.get("pet_threshold_quantile", 0.95),
+                enabled=enabled, weight=weight,
+            )
+        elif name == "organ_consistency":
+            from .loss_terms.organ_consistency import OrganConsistencyLoss
+            return OrganConsistencyLoss(
+                active_tau_min=cfg.get("active_tau_min", 0.25),
+                cold_weight=cfg.get("cold_weight", 0.02),
+                enabled=enabled, weight=weight,
+            )
+        elif name == "segmenter_consistency":
+            from .loss_terms.segmenter_consistency import SegmenterConsistencyLoss
+            return SegmenterConsistencyLoss(
+                segmenter=self.segmenter,
+                active_tau_max=cfg.get("active_tau_max", 0.3),
                 enabled=enabled, weight=weight,
             )
         elif name == "patch_nce":
@@ -467,15 +525,25 @@ class SLMFBBDM(nn.Module):
         pred_x0: torch.Tensor,
         target: torch.Tensor,
         timesteps: torch.Tensor,
+        tau: torch.Tensor,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         reduce_dims = tuple(range(1, pred_x0.dim()))
+
+        # ---- τ-dependent stage weights ----
+        # early (τ→1): focus on global intensity → high MSE, low gradient
+        # late  (τ→0): focus on fine edges       → low MSE, high gradient
+        # Smooth transitions via sigmoid gates.
+        tau_f = tau.float()
+        w_mse  = 0.5 + 1.5 * torch.sigmoid(10.0 * (tau_f - 0.43))    # 2.0→0.5
+        w_l1   = torch.ones_like(tau_f)                                 # 1.0 constant
+        w_grad = 0.2 * torch.sigmoid(10.0 * (0.25 - tau_f))            # 0→0.2
         mse = (pred_x0 - target).square().mean(dim=reduce_dims)
         l1 = (pred_x0 - target).abs().mean(dim=reduce_dims)
         grad = _image_gradient_l1_per_sample(pred_x0, target)
         per_sample = (
-            self.base_mse_weight * mse
-            + self.base_l1_weight * l1
-            + self.base_gradient_weight * grad
+            self.base_mse_weight * w_mse * mse
+            + self.base_l1_weight * w_l1 * l1
+            + self.base_gradient_weight * w_grad * grad
         )
         min_snr = self._min_snr_weight(timesteps, pred_x0)
         loss = (per_sample * min_snr).mean()
@@ -484,6 +552,8 @@ class SLMFBBDM(nn.Module):
             "loss/base_l1": l1.mean().detach(),
             "loss/base_gradient": grad.mean().detach(),
             "loss/min_snr_weight": min_snr.mean().detach(),
+            "loss/tau_mse_weight": w_mse.mean().detach(),
+            "loss/tau_grad_weight": w_grad.mean().detach(),
         }
 
     # ------------------------------------------------------------------
@@ -584,10 +654,14 @@ class SLMFBBDM(nn.Module):
         #    Dropout already applied → adapter sees zeroed-out conditions for dropped modules
         skip_injections = self._build_skip_injections(condition, timesteps=timesteps)
 
-        # 4.5 Build metadata tensor for FiLM injection
+        # 4.5 Build metadata tensor + Cross-Attn beta
         meta_tensor = None
         if self.meta_enabled:
             meta_tensor = _meta_to_tensor(batch.get("meta"), B, device, x0.dtype)
+
+        # Cross-Attention time-varying beta: strongest early (τ→1), fades late (τ→0)
+        tau = self.noise_schedule.get_tau(timesteps)
+        ca_beta = multi_level_betas(tau, levels=5)[:, 0]  # bottleneck column
 
         semantic_tokens = condition.tokens.get("semantic")
         self_cond = None
@@ -603,6 +677,7 @@ class SLMFBBDM(nn.Module):
                         context_tokens=semantic_tokens,
                         skip_injections=skip_injections if skip_injections else None,
                         meta=meta_tensor,
+                        ca_beta=ca_beta,
                     )
                     self_cond = sc_output[:, :1].detach()
 
@@ -610,7 +685,8 @@ class SLMFBBDM(nn.Module):
         model_input = self._model_input(noisy_x, x_source, self_cond)
         output = self.unet(model_input, timesteps, context_tokens=semantic_tokens,
                           skip_injections=skip_injections if skip_injections else None,
-                          meta=meta_tensor)
+                          meta=meta_tensor,
+                          ca_beta=ca_beta)
 
         # 5. Split output
         if self.enable_heteroscedastic:
@@ -637,7 +713,7 @@ class SLMFBBDM(nn.Module):
         logs: Dict[str, torch.Tensor] = {}
 
         # Base diffusion/reconstruction loss (always on)
-        base_loss, base_logs = self._base_reconstruction_loss(pred_x0, x0, timesteps)
+        base_loss, base_logs = self._base_reconstruction_loss(pred_x0, x0, timesteps, tau)
         total_loss = total_loss + base_loss
         logs["loss/base_diffusion"] = base_loss.detach()
         logs.update(base_logs)
@@ -662,6 +738,7 @@ class SLMFBBDM(nn.Module):
         )
         logs["module/self_conditioning"] = torch.tensor(1.0 if self.self_conditioning else 0.0, device=device)
         logs["module/metadata_film"] = torch.tensor(1.0 if self.meta_enabled else 0.0, device=device)
+        logs["module/segmenter"] = torch.tensor(1.0 if self.segmenter_enabled else 0.0, device=device)
         logs["module/scale_adaptive_noise"] = torch.tensor(
             1.0 if getattr(self.noise_schedule, "name", "") == "scale_adaptive_noise"
             and self.noise_schedule.enabled else 0.0,
@@ -680,8 +757,15 @@ class SLMFBBDM(nn.Module):
         batch: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
         progress: bool = False,
+        cfg_scale: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
-        """DDIM-style sampling (default). Supports DDIM only."""
+        """DDIM-style sampling with optional weak Classifier-Free Guidance.
+
+        Args:
+            cfg_scale: CFG scale [1.0, 1.5].  1.0 = no CFG.
+                       Higher = stronger condition influence.
+                       Keep ≤1.5 to avoid hallucinating lesions.
+        """
         if self.sample_scheduler != "ddim":
             import warnings
             warnings.warn(
@@ -734,11 +818,26 @@ class SLMFBBDM(nn.Module):
             skip_inj = self._build_skip_injections(condition, timesteps=t_batch)
             semantic_tokens = condition.tokens.get("semantic")
             model_input = self._model_input(x_t, x_source, self_cond)
+            ca_beta_step = multi_level_betas(t_batch.float() / self.noise_schedule.num_train_timesteps, levels=5)[:, 0]
             output = self.unet(model_input, t_batch, context_tokens=semantic_tokens,
                               skip_injections=skip_inj if skip_inj else None,
-                              meta=meta_tensor)
+                              meta=meta_tensor,
+                              ca_beta=ca_beta_step)
 
             pred_x0 = output[:, :1]
+
+            # ---- Weak CFG: blend cond + uncond predictions ----
+            if cfg_scale > 1.0:
+                # Build null conditions (all zero)
+                skip_inj_null = [torch.zeros_like(s) for s in skip_inj] if skip_inj else None
+                null_output = self.unet(model_input, t_batch,
+                                       context_tokens=None,
+                                       skip_injections=skip_inj_null,
+                                       meta=torch.zeros_like(meta_tensor) if meta_tensor is not None else None,
+                                       ca_beta=torch.zeros_like(ca_beta_step))
+                pred_x0_uncond = null_output[:, :1]
+                pred_x0 = pred_x0_uncond + cfg_scale * (pred_x0 - pred_x0_uncond)
+
             if self.self_conditioning:
                 self_cond = pred_x0.detach()
 
@@ -867,7 +966,8 @@ class SLMFBBDM(nn.Module):
             loss_configs=loss_cfg,
             condition_dropout_config=modules_cfg.get("condition_dropout", {}),
             base_loss_config=model_cfg.get("base_loss", {}),
-            meta_config=model_cfg.get("metadata", {}),
+            meta_config=model_cfg.get("metadata", config.get("metadata", {})),
+            segmenter_config=model_cfg.get("segmenter", config.get("segmenter", {})),
             self_conditioning_config=model_cfg.get("self_conditioning", {}),
             sample_scheduler=model_cfg.get("sample_scheduler", "ddim"),
             eval_sampling_steps=config.get("runtime", {}).get("eval_sampling_steps", 20),

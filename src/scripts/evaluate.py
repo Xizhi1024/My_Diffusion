@@ -17,6 +17,7 @@ Usage:
     python scripts/evaluate.py --config configs/experiments/slmf_baseline.yaml --fake-data
 """
 
+from __future__ import annotations
 
 import argparse
 import json

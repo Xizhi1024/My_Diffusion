@@ -120,10 +120,10 @@ def _distance_transform_2d(mask: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _try_import_totalsegmentator():
-    """Attempt to import TotalSegmentator. Returns the class or None."""
+    """Attempt to import TotalSegmentator. Returns the Python API function or None."""
     try:
-        from totalsegmentator.python_api import Totalsegmentator
-        return Totalsegmentator
+        from totalsegmentator.python_api import totalsegmentator
+        return totalsegmentator
     except ImportError:
         return None
 
@@ -199,15 +199,20 @@ def _build_ct_volume_from_cache(cache_dir: Path, patient_id: str) -> Optional[Tu
                 pass
         slice_meta = scale_meta
 
-        # Reverse CT normalisation: [-1,1] -> [0,1] -> HU
-        ct_raw = data["ct"]
-        ct_norm = np.squeeze(ct_raw)
-        if ct_norm.ndim != 2:
-            continue  # skip malformed entries
-        ct_01 = (ct_norm + 1.0) / 2.0
-        hu_min = scale_meta.get("ct_hu_min", -150.0)
-        hu_max = scale_meta.get("ct_hu_max", 250.0)
-        ct_hu = ct_01 * (hu_max - hu_min) + hu_min
+        if "ct_hu" in data:
+            ct_hu = np.squeeze(data["ct_hu"])
+            if ct_hu.ndim != 2:
+                continue
+        else:
+            # Legacy cache fallback: recover only the configured HU window.
+            ct_raw = data["ct"]
+            ct_norm = np.squeeze(ct_raw)
+            if ct_norm.ndim != 2:
+                continue  # skip malformed entries
+            ct_01 = (ct_norm + 1.0) / 2.0
+            hu_min = scale_meta.get("ct_hu_min", -150.0)
+            hu_max = scale_meta.get("ct_hu_max", 250.0)
+            ct_hu = ct_01 * (hu_max - hu_min) + hu_min
         slices_hu.append(ct_hu.astype(np.float32))
 
     if not slices_hu:
@@ -308,13 +313,23 @@ def process_cache_with_organ_prior(
         if TS is not None and nib is not None:
             try:
                 nii = nib.Nifti1Image(ct_volume, affine)
-                ts = TS(task="total", device="gpu" if gpu else "cpu", fast=True, verbose=False)
-                # Save to temp file (TS API requires file path or Nifti)
+                # Save to temp file. The TotalSegmentator v2 Python API returns
+                # a multilabel NIfTI when ml=True, which matches our label-id
+                # mapping below.
                 import tempfile
                 with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as tmp:
                     nib.save(nii, tmp.name)
                     tmp_path = tmp.name
-                ts_seg_result = ts.segment(tmp_path)
+                ts_seg_result = TS(
+                    tmp_path,
+                    output=None,
+                    task="total",
+                    device="gpu" if gpu else "cpu",
+                    fast=True,
+                    ml=True,
+                    quiet=True,
+                    verbose=False,
+                )
                 ts_seg_3d = ts_seg_result.get_fdata().astype(np.int32)  # [D, H, W]
                 os.unlink(tmp_path)
                 print(f"  TotalSegmentator OK. Unique labels: {np.unique(ts_seg_3d)}")
