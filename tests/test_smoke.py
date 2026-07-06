@@ -1239,6 +1239,32 @@ class TestDataset:
         assert torch.allclose(sample["pet_suv"], torch.full((1, 4, 4), 7.5))
         assert sample["meta"]["pet_suv_available"] is True
 
+    def test_cached_dataset_augment_horizontal_flip_keeps_fields_aligned(self, tmp_path, monkeypatch):
+        from src.data.dataset import CachedDataset
+
+        sample_id = "001001"
+        ct = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+        pet = ct + 100.0
+        mask = np.zeros((1, 4, 4), dtype=np.float32)
+        mask[:, :, 0] = 1.0
+        np.savez_compressed(
+            tmp_path / f"{sample_id}.npz",
+            ct=ct,
+            pet=pet,
+            mask=mask,
+        )
+        (tmp_path / f"{sample_id}_meta.json").write_text(
+            json.dumps({"sample_id": sample_id, "split": "train", "has_label": True}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(torch, "rand", lambda *args, **kwargs: torch.tensor(0.0))
+
+        ds = CachedDataset(tmp_path, split="train", augment=True)
+        sample = ds[0]
+        assert torch.allclose(sample["ct"], torch.from_numpy(np.flip(ct, axis=-1).copy()))
+        assert torch.allclose(sample["pet"], torch.from_numpy(np.flip(pet, axis=-1).copy()))
+        assert torch.allclose(sample["mask"], torch.from_numpy(np.flip(mask, axis=-1).copy()))
+
 
 class TestScaleMeta:
     """Verify scale_meta propagation through data pipeline and loss terms."""

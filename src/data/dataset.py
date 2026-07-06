@@ -29,7 +29,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms as T
 
 _CACHE_EXT = ".npz"
 _SAMPLE_ID_PATTERN: re.Pattern = re.compile(r"^(\d{3})(\d{3})$")
@@ -437,7 +436,6 @@ class CachedDataset(Dataset):
             ))
         if not self.entries:
             raise ValueError(f"No cached samples for split={split!r} in {cache_dir}")
-        self._aug_fn = T.RandomHorizontalFlip(p=0.5) if augment else None
         patient_count = len(set(e.patient_id for e in self.entries))
 
         # ---- Key-presence scan (sample every Nth file to avoid I/O storm) ----
@@ -545,9 +543,9 @@ class CachedDataset(Dataset):
             scale_meta.setdefault("pet_physical_key", "pet_suv" if has_pet_suv else ("pet_activity" if has_pet_activity else ""))
             scale_meta.setdefault("pet_suv_available", bool(has_pet_suv))
 
-        if self._aug_fn is not None:
+        if self.augment and torch.rand((), device=ct.device) < 0.5:
             stacked = torch.cat([ct, pet, mask, organ_mask, organ_distance, mu_map, ct_hu, pet_suv, pet_activity], dim=0)
-            stacked = self._aug_fn(stacked)
+            stacked = torch.flip(stacked, dims=(-1,))
             ct, pet, mask = stacked[0:1], stacked[1:2], stacked[2:3]
             organ_mask = stacked[3:9]
             organ_distance = stacked[9:15]
