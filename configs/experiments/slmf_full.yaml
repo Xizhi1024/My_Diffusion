@@ -43,6 +43,10 @@ runtime:
   mc_samples_eval: 20
 
 training:
+  stage: lesion_posttrain
+  lesion_posttrain:
+    enabled: true
+    description: ROI dense reconstruction plus outside-peak ranking for small-lesion PET fidelity
   num_epochs: 1000
   learning_rate: 1e-4
   weight_decay: 0.01
@@ -182,6 +186,13 @@ losses:
   heteroscedastic_nll:
     enabled: true
     weight: 0.1              # avoid NLL dominating / variance-cheating
+
+evaluation:
+  mc_samples: 8
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0
 
 # ---- Metadata FiLM injection (patient/scan metadata → UNet ResBlocks) ----
 # When enabled, extracts per-sample DICOM metadata (uptake time, weight, age,

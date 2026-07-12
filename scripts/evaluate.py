@@ -119,6 +119,158 @@ def _valid_suv_meta(meta: dict) -> bool:
     return _meta_bool(meta.get("suv_ok", False)) and meta.get("pet_suv_max") is not None
 
 
+def _finite_pair_arrays(pred_values: np.ndarray, target_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    pred = np.asarray(pred_values, dtype=np.float64).reshape(-1)
+    target = np.asarray(target_values, dtype=np.float64).reshape(-1)
+    keep = np.isfinite(pred) & np.isfinite(target)
+    return pred[keep], target[keep]
+
+
+def compute_calibration_metrics(
+    pred_values: np.ndarray,
+    target_values: np.ndarray,
+    prefix: str = "suv_calib",
+) -> Dict[str, float]:
+    """Fit predicted SUV against target SUV and return calibration diagnostics."""
+    pred, target = _finite_pair_arrays(pred_values, target_values)
+    n = int(pred.size)
+    metrics: Dict[str, float] = {f"{prefix}_n": float(n)}
+    if n == 0:
+        metrics.update({
+            f"{prefix}_slope": float("nan"),
+            f"{prefix}_intercept": float("nan"),
+            f"{prefix}_r2": float("nan"),
+            f"{prefix}_mae": float("nan"),
+            f"{prefix}_bias": float("nan"),
+            f"{prefix}_limits_of_agreement_low": float("nan"),
+            f"{prefix}_limits_of_agreement_high": float("nan"),
+        })
+        return metrics
+
+    diff = pred - target
+    metrics[f"{prefix}_mae"] = float(np.mean(np.abs(diff)))
+    metrics[f"{prefix}_bias"] = float(np.mean(diff))
+    diff_std = float(np.std(diff, ddof=1)) if n > 1 else 0.0
+    metrics[f"{prefix}_limits_of_agreement_low"] = metrics[f"{prefix}_bias"] - 1.96 * diff_std
+    metrics[f"{prefix}_limits_of_agreement_high"] = metrics[f"{prefix}_bias"] + 1.96 * diff_std
+
+    if n < 2 or float(np.var(target)) < 1e-12:
+        metrics[f"{prefix}_slope"] = float("nan")
+        metrics[f"{prefix}_intercept"] = float("nan")
+        metrics[f"{prefix}_r2"] = float("nan")
+        return metrics
+
+    slope, intercept = np.polyfit(target, pred, deg=1)
+    fitted = slope * target + intercept
+    ss_res = float(np.sum((pred - fitted) ** 2))
+    ss_tot = float(np.sum((pred - pred.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
+    metrics[f"{prefix}_slope"] = float(slope)
+    metrics[f"{prefix}_intercept"] = float(intercept)
+    metrics[f"{prefix}_r2"] = float(r2)
+    return metrics
+
+
+def _positive_pet_for_detection(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if np.nanmin(x) < 0.0:
+        return np.clip((x + 1.0) * 0.5, 0.0, None)
+    return np.clip(x, 0.0, None)
+
+
+def _masked_mean_np(values: np.ndarray, mask: np.ndarray) -> float:
+    selected = values[mask]
+    if selected.size == 0:
+        return float("nan")
+    return float(np.mean(selected))
+
+
+def compute_uncertainty_metrics(
+    uncertainty: np.ndarray,
+    lesion_mask: np.ndarray,
+    confidence: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Summarise MC/variance maps inside and outside the lesion mask."""
+    unc = np.asarray(uncertainty, dtype=np.float32)
+    lesion = np.asarray(lesion_mask > 0.5)
+    outside = ~lesion
+
+    lesion_unc = _masked_mean_np(unc, lesion)
+    outside_unc = _masked_mean_np(unc, outside)
+    ratio = lesion_unc / max(outside_unc, 1e-8) if np.isfinite(lesion_unc) and np.isfinite(outside_unc) else float("nan")
+    metrics = {
+        "lesion_uncertainty_mean": lesion_unc,
+        "outside_uncertainty_mean": outside_unc,
+        "uncertainty_ratio": float(ratio),
+    }
+    if confidence is not None:
+        conf = np.asarray(confidence, dtype=np.float32)
+        metrics["confidence_lesion_mean"] = _masked_mean_np(conf, lesion)
+    return metrics
+
+
+def compute_failure_detection_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    lesion_mask: np.ndarray,
+    uncertainty_metrics: Optional[Dict[str, float]] = None,
+    outside_margin: float = 0.05,
+    lesion_min_ratio: float = 0.6,
+    uncertainty_ratio_threshold: float = 2.0,
+) -> Dict[str, Any]:
+    """Flag clinically risky samples: off-mask peaks, cold lesions, or high uncertainty."""
+    pred_pos = _positive_pet_for_detection(pred)
+    target_pos = _positive_pet_for_detection(target)
+    lesion = np.asarray(lesion_mask > 0.5)
+    outside = ~lesion
+
+    if not lesion.any():
+        return {
+            "inside_peak": float("nan"),
+            "outside_peak": float("nan"),
+            "outside_inside_peak_ratio": float("nan"),
+            "pred_target_suvmax_ratio": float("nan"),
+            "failure_outside_peak_gt_inside": 0.0,
+            "failure_lesion_too_cold": 0.0,
+            "failure_high_uncertainty": 0.0,
+            "failure_any": 0.0,
+            "failure_reason": "no_lesion_mask",
+        }
+
+    inside_peak = float(np.max(pred_pos[lesion]))
+    target_peak = float(np.max(target_pos[lesion]))
+    outside_peak = float(np.max(pred_pos[outside])) if outside.any() else 0.0
+    outside_ratio = outside_peak / max(inside_peak, 1e-8)
+    pred_target_ratio = inside_peak / max(target_peak, 1e-8)
+
+    outside_fail = outside_peak > inside_peak + outside_margin
+    cold_fail = pred_target_ratio < lesion_min_ratio
+    uncertainty_ratio = float("nan")
+    if uncertainty_metrics is not None:
+        uncertainty_ratio = float(uncertainty_metrics.get("uncertainty_ratio", float("nan")))
+    uncertainty_fail = np.isfinite(uncertainty_ratio) and uncertainty_ratio > uncertainty_ratio_threshold
+
+    reasons = []
+    if outside_fail:
+        reasons.append("outside_peak")
+    if cold_fail:
+        reasons.append("lesion_cold")
+    if uncertainty_fail:
+        reasons.append("high_uncertainty")
+
+    return {
+        "inside_peak": inside_peak,
+        "outside_peak": outside_peak,
+        "outside_inside_peak_ratio": float(outside_ratio),
+        "pred_target_suvmax_ratio": float(pred_target_ratio),
+        "failure_outside_peak_gt_inside": float(outside_fail),
+        "failure_lesion_too_cold": float(cold_fail),
+        "failure_high_uncertainty": float(uncertainty_fail),
+        "failure_any": float(bool(reasons)),
+        "failure_reason": "|".join(reasons) if reasons else "ok",
+    }
+
+
 def _denormalise_pet_np(pet_norm: np.ndarray, meta: dict) -> np.ndarray:
     """Reverse [-1,1] -> physical SUV for a single sample."""
     if not _valid_suv_meta(meta):
@@ -197,6 +349,25 @@ def compute_false_hotspot_count(
     }
 
 
+def _append_calibration_summary(summary: Dict[str, Any], all_metrics: List[Dict[str, Any]]) -> None:
+    pairs = [
+        ("pred_suv_max", "target_suv_max", "suv_calib"),
+        ("pred_suv_mean", "target_suv_mean", "suv_mean_calib"),
+    ]
+    for pred_key, target_key, prefix in pairs:
+        pred_values = [
+            row[pred_key]
+            for row in all_metrics
+            if pred_key in row and target_key in row
+        ]
+        target_values = [
+            row[target_key]
+            for row in all_metrics
+            if pred_key in row and target_key in row
+        ]
+        summary.update(compute_calibration_metrics(np.asarray(pred_values), np.asarray(target_values), prefix=prefix))
+
+
 # ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
@@ -208,6 +379,9 @@ def evaluate(
     device: str = "cuda",
     amp: bool = True,
     save_samples: Optional[Path] = None,
+    mc_samples: int = 1,
+    mc_steps: Optional[int] = None,
+    failure_thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Run full evaluation over a dataloader."""
     model.eval()
@@ -218,6 +392,7 @@ def evaluate(
     all_metrics: List[Dict[str, Any]] = []
 
     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    failure_thresholds = failure_thresholds or {}
 
     for batch_idx, batch in enumerate(dataloader):
         batch_gpu = {
@@ -226,9 +401,14 @@ def evaluate(
         }
 
         with torch.amp.autocast("cuda", enabled=amp and device == "cuda", dtype=amp_dtype):
-            sample_out = model.sample(batch_gpu)
+            if mc_samples and mc_samples > 1:
+                sample_out = model.sample_mc(batch_gpu, n_samples=mc_samples, num_steps=mc_steps, progress=False)
+            else:
+                sample_out = model.sample(batch_gpu, num_steps=mc_steps)
 
         synth_pet = sample_out["synthetic_pet"]  # [B, 1, H, W]
+        uncertainty_map = sample_out.get("total_var", sample_out.get("epistemic_var"))
+        confidence_map = sample_out.get("confidence_map")
         target_pet = batch_gpu["pet"]
         ct = batch_gpu["ct"]
         mask = batch_gpu.get("mask", torch.zeros_like(target_pet))
@@ -244,6 +424,7 @@ def evaluate(
             organ_np = _to_numpy(organ_mask[i])
             meta = meta_samples[i] if i < len(meta_samples) else {}
             has_valid_suv = _valid_suv_meta(meta)
+            uncertainty_metrics: Dict[str, float] = {}
 
             pid = meta.get("patient_id", f"sample_{batch_idx}_{i}")
 
@@ -264,6 +445,34 @@ def evaluate(
                     target_suv_np = _to_numpy(pet_suv[i])
                 suv_m = compute_suv_metrics(pred_np, target_np, mask_np, organ_np, meta, target_suv=target_suv_np)
                 sample_metrics.update(suv_m)
+
+            if torch.is_tensor(uncertainty_map):
+                conf_np = _to_numpy(confidence_map[i]) if torch.is_tensor(confidence_map) else None
+                uncertainty_metrics = compute_uncertainty_metrics(_to_numpy(uncertainty_map[i]), mask_np, confidence=conf_np)
+                sample_metrics.update(uncertainty_metrics)
+
+            failure_pred = pred_np
+            failure_target = target_np
+            if has_valid_suv:
+                try:
+                    failure_pred = _denormalise_pet_np(pred_np, meta)
+                    if torch.is_tensor(pet_suv) and _meta_bool(meta.get("pet_suv_available", False)):
+                        failure_target = _to_numpy(pet_suv[i])
+                    else:
+                        failure_target = _denormalise_pet_np(target_np, meta)
+                except ValueError:
+                    failure_pred = pred_np
+                    failure_target = target_np
+            failure_metrics = compute_failure_detection_metrics(
+                failure_pred,
+                failure_target,
+                mask_np,
+                uncertainty_metrics=uncertainty_metrics or None,
+                outside_margin=failure_thresholds.get("outside_margin", 0.05),
+                lesion_min_ratio=failure_thresholds.get("lesion_min_ratio", 0.6),
+                uncertainty_ratio_threshold=failure_thresholds.get("uncertainty_ratio_threshold", 2.0),
+            )
+            sample_metrics.update(failure_metrics)
 
             # False hotspots
             fh = compute_false_hotspot_count(pred_np, organ_np)
@@ -305,6 +514,7 @@ def evaluate(
         patient_summary[pid] = p_agg
 
     summary["per_patient"] = patient_summary
+    _append_calibration_summary(summary, all_metrics)
 
     return summary
 
@@ -325,6 +535,13 @@ def print_report(summary: Dict[str, Any]) -> None:
         ("Image Quality", ["mae", "mse", "psnr", "ssim"]),
         ("Clinical SUV (lesion ROI)", ["suv_max_error", "suv_mean_error", "tbr_error",
                                         "pred_suv_max", "target_suv_max"]),
+        ("SUV Calibration", ["suv_calib_slope", "suv_calib_intercept", "suv_calib_r2",
+                             "suv_calib_mae", "suv_calib_bias"]),
+        ("Uncertainty", ["lesion_uncertainty_mean", "outside_uncertainty_mean",
+                         "uncertainty_ratio", "confidence_lesion_mean"]),
+        ("Failure Detection", ["outside_inside_peak_ratio", "pred_target_suvmax_ratio",
+                               "failure_outside_peak_gt_inside", "failure_lesion_too_cold",
+                               "failure_high_uncertainty", "failure_any"]),
         ("False Hotspots", ["false_hotspot_count", "false_hotspot_density", "false_hotspot_mean_intensity"]),
     ]
 
@@ -355,6 +572,11 @@ def main():
     ap.add_argument("--fake-data", action="store_true", help="Use fake data for smoke test")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--mc-samples", type=int, default=None, help="Monte Carlo samples for uncertainty/failure analysis")
+    ap.add_argument("--mc-steps", type=int, default=None, help="Sampling steps for evaluation/MC sampling")
+    ap.add_argument("--failure-outside-margin", type=float, default=None)
+    ap.add_argument("--failure-lesion-ratio", type=float, default=None)
+    ap.add_argument("--failure-uncertainty-ratio", type=float, default=None)
     ap.add_argument(
         "--allow-train-fallback",
         action="store_true",
@@ -367,6 +589,24 @@ def main():
     config = resolve_runtime_profile(config)
     if args.fake_data:
         config.setdefault("data", {})["use_fake_data"] = True
+    eval_cfg = config.get("evaluation", {})
+    failure_cfg = eval_cfg.get("failure_detection", {})
+    mc_samples = args.mc_samples if args.mc_samples is not None else eval_cfg.get("mc_samples", 1)
+    failure_outside_margin = (
+        args.failure_outside_margin
+        if args.failure_outside_margin is not None
+        else failure_cfg.get("outside_margin", 0.05)
+    )
+    failure_lesion_ratio = (
+        args.failure_lesion_ratio
+        if args.failure_lesion_ratio is not None
+        else failure_cfg.get("lesion_min_ratio", 0.6)
+    )
+    failure_uncertainty_ratio = (
+        args.failure_uncertainty_ratio
+        if args.failure_uncertainty_ratio is not None
+        else failure_cfg.get("uncertainty_ratio_threshold", 2.0)
+    )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -417,6 +657,13 @@ def main():
         model, loader,
         device=device,
         amp=not args.no_amp,
+        mc_samples=mc_samples,
+        mc_steps=args.mc_steps,
+        failure_thresholds={
+            "outside_margin": failure_outside_margin,
+            "lesion_min_ratio": failure_lesion_ratio,
+            "uncertainty_ratio_threshold": failure_uncertainty_ratio,
+        },
     )
 
     print_report(summary)

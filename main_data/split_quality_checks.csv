@@ -1,0 +1,9 @@
+﻿check,value,target,absolute_deviation,status
+patients,20.00%,20.00%,0.00%,pass
+slices,19.90%,20.00%,0.10%,pass
+area_0_small,19.90%,20.00%,0.10%,pass
+area_1_medium,19.90%,20.00%,0.10%,pass
+area_2_large,19.90%,20.00%,0.10%,pass
+patients_le_2_slices,20.00%,20.00%,0.00%,pass
+patient_leakage,0,0,0,pass
+physical_files,"missing=0, extra=0","missing=0, extra=0",0,pass

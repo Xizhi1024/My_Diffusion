@@ -231,7 +231,7 @@ class Trainer:
         print(f"Losses: {[n for n, loss in self.model.loss_terms.items() if loss.enabled]}")
         print(f"{'='*60}\n")
 
-        for epoch in range(num_epochs):
+        while self.epoch_count < num_epochs:
             train_logs = self.train_epoch()
 
             total = train_logs.get("loss/total", 0)

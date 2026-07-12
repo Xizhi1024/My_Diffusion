@@ -1,0 +1,7 @@
+﻿criterion,train,val,total,val_ratio
+patients,124,31,155,20.00%
+slices,954,237,1191,19.90%
+area_0_small,318,79,397,19.90%
+area_1_medium,318,79,397,19.90%
+area_2_large,318,79,397,19.90%
+patients_le_2_slices,12,3,15,20.00%

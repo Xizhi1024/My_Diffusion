@@ -123,20 +123,16 @@ class ScaleAdaptiveNoise(NoiseSchedule):
         while base.dim() < 4:
             base = base.unsqueeze(-1)
 
-        if shape is not None:
-            low = torch.ones(B, 1, *shape[2:], device=device) * self.low_sigma_mult * base
-            mid = torch.ones(B, 1, *shape[2:], device=device) * self.mid_sigma_mult * base
-            high = torch.ones(B, 1, *shape[2:], device=device) * self.high_sigma_mult * base
-        else:
-            low = self.low_sigma_mult * base
-            mid = self.mid_sigma_mult * base
-            high = self.high_sigma_mult * base
+        low = self.low_sigma_mult * base
+        mid = self.mid_sigma_mult * base
+        high = self.high_sigma_mult * base
 
         # Gabor modulation: reduce high-frequency noise where Gabor energy is high
         if self.use_gabor_energy and gabor_energy is not None:
             gabor = F.avg_pool2d(gabor_energy, kernel_size=8)  # spatial smooth
-            if gabor.shape[2:] != high.shape[2:]:
-                gabor = F.interpolate(gabor, size=high.shape[2:], mode="bilinear", align_corners=False)
+            target_hw = shape[2:] if shape is not None else high.shape[2:]
+            if gabor.shape[2:] != target_hw:
+                gabor = F.interpolate(gabor, size=target_hw, mode="bilinear", align_corners=False)
             high = high * (1.0 - self.gabor_weight * gabor.clamp(0.0, 1.0))
 
         return low, mid, high
@@ -151,7 +147,8 @@ class ScaleAdaptiveNoise(NoiseSchedule):
         gabor_energy = condition.get_map("gabor_energy")
         band_sigmas: List[torch.Tensor] = []
         for i, band in enumerate(pyramid):
-            low, mid, high = self._get_scale_multipliers(timesteps, gabor_energy, band.shape)
+            band_gabor = gabor_energy if i == 0 else None
+            low, mid, high = self._get_scale_multipliers(timesteps, band_gabor, band.shape)
             sigma = high if i == 0 else mid if i < len(pyramid) - 1 else low
             band_sigmas.append(sigma.to(device=band.device, dtype=band.dtype))
         return band_sigmas

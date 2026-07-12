@@ -17,6 +17,9 @@ data-manifest = "python -m src.data.data_manifest --raw-root Data --dicom-root D
 # 2. 从 manifest 读取 DICOM/label，生成训练用 .npz 张量缓存
 data-cache = "python -m src.data.dataset --manifest cache/manifest.csv --out-dir cache/tensors --image-size 192"
 
+# 2b. Build cache from the sibling ../main_data PNG split folder.
+data-cache-png-main = "python -m src.data.png_cache --png-root ../main_data --split-csv ../main_data/split.csv --out-dir cache/tensors_main --split-manifest ../main_data/split_manifest.csv --image-size 192"
+
 # 3. 从 .npz 缓存生成 train/val/test 患者级划分清单
 data-split = "python -m src.data.split_manifest --cache-dir cache/tensors --output cache/split_manifest.csv --val-ratio 0.15 --seed 42"
 

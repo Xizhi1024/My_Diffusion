@@ -181,6 +181,138 @@ class TestConfig:
         assert isinstance(cfg["training"]["lr_min"], float)
 
 
+class TestClinicalEvaluationHelpers:
+    def test_suv_calibration_metrics_fit_known_linear_relation(self):
+        from scripts.evaluate import compute_calibration_metrics
+
+        target = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        pred = 2.0 * target + 1.0
+        metrics = compute_calibration_metrics(pred, target, prefix="suv_calib")
+
+        assert metrics["suv_calib_n"] == 4
+        assert np.isclose(metrics["suv_calib_slope"], 2.0)
+        assert np.isclose(metrics["suv_calib_intercept"], 1.0)
+        assert np.isclose(metrics["suv_calib_r2"], 1.0)
+        assert np.isclose(metrics["suv_calib_bias"], np.mean(pred - target))
+
+    def test_failure_detection_flags_cold_lesion_and_outside_peak(self):
+        from scripts.evaluate import compute_failure_detection_metrics
+
+        pred = np.zeros((1, 4, 4), dtype=np.float32)
+        target = np.zeros((1, 4, 4), dtype=np.float32)
+        mask = np.zeros((1, 4, 4), dtype=np.float32)
+        mask[:, 1, 1] = 1.0
+        pred[:, 1, 1] = 0.2
+        target[:, 1, 1] = 1.0
+        pred[:, 0, 0] = 0.9
+
+        metrics = compute_failure_detection_metrics(
+            pred,
+            target,
+            mask,
+            outside_margin=0.05,
+            lesion_min_ratio=0.6,
+        )
+
+        assert metrics["failure_outside_peak_gt_inside"] == 1.0
+        assert metrics["failure_lesion_too_cold"] == 1.0
+        assert metrics["failure_any"] == 1.0
+        assert "outside_peak" in metrics["failure_reason"]
+        assert "lesion_cold" in metrics["failure_reason"]
+
+    def test_uncertainty_metrics_flag_high_lesion_uncertainty(self):
+        from scripts.evaluate import compute_uncertainty_metrics, compute_failure_detection_metrics
+
+        mask = np.zeros((1, 4, 4), dtype=np.float32)
+        mask[:, 1, 1] = 1.0
+        uncertainty = np.full((1, 4, 4), 0.1, dtype=np.float32)
+        uncertainty[:, 1, 1] = 0.8
+        u_metrics = compute_uncertainty_metrics(uncertainty, mask)
+        f_metrics = compute_failure_detection_metrics(
+            np.ones((1, 4, 4), dtype=np.float32),
+            np.ones((1, 4, 4), dtype=np.float32),
+            mask,
+            uncertainty_metrics=u_metrics,
+            uncertainty_ratio_threshold=2.0,
+        )
+
+        assert u_metrics["lesion_uncertainty_mean"] > u_metrics["outside_uncertainty_mean"]
+        assert f_metrics["failure_high_uncertainty"] == 1.0
+
+    def test_run_metadata_records_lesion_aware_posttraining(self, tmp_path):
+        from scripts.train_v2 import _save_run_metadata
+
+        cfg = _toy_config()
+        cfg["training"]["stage"] = "lesion_posttrain"
+        cfg["training"]["init_from"] = "checkpoints/slmf_bbdm_full/ckpt_epoch1000.pt"
+        cfg["training"]["lesion_posttrain"] = {
+            "enabled": True,
+            "description": "ROI dense reconstruction plus outside peak ranking",
+        }
+        cfg["losses"]["lesion_roi_l1"]["enabled"] = True
+        cfg["losses"]["outside_peak_ranking"]["enabled"] = True
+        model = SLMFBBDM.from_config(cfg)
+
+        _save_run_metadata(model, cfg, str(tmp_path), ablation=None)
+        metadata = json.loads((tmp_path / "run_metadata.json").read_text(encoding="utf-8"))
+
+        assert metadata["training_stage"] == "lesion_posttrain"
+        assert metadata["lesion_aware_posttraining"]["enabled"] is True
+        assert metadata["lesion_aware_posttraining"]["source_checkpoint"].endswith("ckpt_epoch1000.pt")
+        assert "lesion_roi_l1" in metadata["lesion_aware_posttraining"]["lesion_losses"]
+        assert "outside_peak_ranking" in metadata["lesion_aware_posttraining"]["lesion_losses"]
+
+    def test_train_entrypoint_loads_resume_checkpoint(self, monkeypatch):
+        import scripts.train_v2 as train_v2
+
+        cfg = _toy_config()
+        cfg["training"]["resume_from"] = "checkpoints/demo/ckpt_epoch0800.pt"
+        calls = []
+
+        class FakePrior:
+            enabled = False
+
+        class FakeModel:
+            priors = {"gabor": FakePrior()}
+            loss_terms = {}
+
+            def get_trainable_params(self):
+                return 0
+
+            def get_total_params(self):
+                return 0
+
+        class FakeSLMF:
+            @staticmethod
+            def from_config(config):
+                calls.append(("from_config", config["training"]["resume_from"]))
+                return FakeModel()
+
+        class FakeTrainer:
+            def __init__(self, model, config, train_loader, val_loader):
+                calls.append(("trainer_init", config["training"]["resume_from"]))
+
+            def load_checkpoint(self, path):
+                calls.append(("load_checkpoint", path))
+
+            def run(self):
+                calls.append(("run", None))
+
+        monkeypatch.setattr(train_v2, "load_full_config", lambda *args, **kwargs: cfg)
+        monkeypatch.setattr(train_v2, "resolve_runtime_profile", lambda config: config)
+        monkeypatch.setattr(train_v2, "save_resolved_config", lambda *args, **kwargs: None)
+        monkeypatch.setattr(train_v2, "_save_run_metadata", lambda *args, **kwargs: None)
+        monkeypatch.setattr(train_v2, "SLMFBBDM", FakeSLMF)
+        monkeypatch.setattr(train_v2, "Trainer", FakeTrainer)
+        monkeypatch.setattr("src.data.dataset.build_dataloaders", lambda *args, **kwargs: ("train", "val"))
+        monkeypatch.setattr(sys, "argv", ["train_v2.py", "--config", "demo.yaml"])
+
+        train_v2.main()
+
+        assert ("load_checkpoint", "checkpoints/demo/ckpt_epoch0800.pt") in calls
+        assert calls[-1] == ("run", None)
+
+
 # ---------------------------------------------------------------------------
 # Registry tests
 # ---------------------------------------------------------------------------
@@ -378,6 +510,64 @@ class TestNoiseSchedules:
         t = torch.tensor([10, 50])
         out = schedule.add_noise(x0, noise, t, ConditionBundle(), x_source=x_source)
         assert out.shape == x0.shape
+
+    def test_scale_adaptive_sigmas_use_broadcast_shapes(self):
+        from src.model.noise.scale_adaptive import ScaleAdaptiveNoise
+
+        schedule = ScaleAdaptiveNoise(
+            num_train_timesteps=100,
+            use_gabor_energy=False,
+            enabled=True,
+        )
+        t = torch.tensor([1, 10])
+        low, mid, high = schedule._get_scale_multipliers(t, gabor_energy=None, shape=(2, 1, 64, 64))
+
+        assert low.shape == (2, 1, 1, 1)
+        assert mid.shape == (2, 1, 1, 1)
+        assert high.shape == (2, 1, 1, 1)
+        assert (torch.ones(2, 1, 64, 64) * high).shape == (2, 1, 64, 64)
+
+    def test_scale_adaptive_only_gabor_high_sigma_is_spatial(self):
+        from src.model.noise.scale_adaptive import ScaleAdaptiveNoise
+
+        schedule = ScaleAdaptiveNoise(
+            num_train_timesteps=100,
+            use_gabor_energy=True,
+            enabled=True,
+        )
+        t = torch.tensor([1, 10])
+        gabor = torch.rand(2, 1, 64, 64)
+        low, mid, high = schedule._get_scale_multipliers(t, gabor_energy=gabor, shape=(2, 1, 32, 32))
+
+        assert low.shape == (2, 1, 1, 1)
+        assert mid.shape == (2, 1, 1, 1)
+        assert high.shape == (2, 1, 32, 32)
+
+    def test_scale_adaptive_uses_gabor_only_for_high_frequency_band(self):
+        from src.model.interfaces import ConditionBundle
+        from src.model.noise.scale_adaptive import ScaleAdaptiveNoise
+
+        schedule = ScaleAdaptiveNoise(num_train_timesteps=100, use_gabor_energy=True, enabled=True)
+        t = torch.tensor([1, 10])
+        pyramid = [
+            torch.zeros(2, 1, 64, 64),
+            torch.zeros(2, 1, 32, 32),
+            torch.zeros(2, 1, 16, 16),
+            torch.zeros(2, 1, 8, 8),
+        ]
+        calls = []
+
+        def fake_get_scale_multipliers(timesteps, gabor_energy=None, shape=None):
+            calls.append(gabor_energy is not None)
+            sigma = torch.ones(2, 1, 1, 1)
+            return sigma, sigma, sigma
+
+        schedule._get_scale_multipliers = fake_get_scale_multipliers
+        condition = ConditionBundle(maps={"gabor_energy": torch.ones(2, 1, 64, 64)})
+
+        schedule._get_band_sigmas(t, condition, pyramid)
+
+        assert calls == [True, False, False, False]
 
     def test_scale_adaptive_noise_shape(self):
         from src.model.noise.scale_adaptive import ScaleAdaptiveNoise
@@ -1128,6 +1318,50 @@ class TestTrainer:
         assert trainer.ema.step_count == 2
         assert trainer.accum_count == 0
 
+    def test_run_stops_at_configured_total_epochs_after_resume(self):
+        from src.model.trainer import Trainer
+
+        class FakeModel:
+            priors = {}
+            loss_terms = {}
+
+            def get_trainable_params(self):
+                return 0
+
+            def get_total_params(self):
+                return 0
+
+        trainer = object.__new__(Trainer)
+        trainer.config = {"training": {"num_epochs": 3}}
+        trainer.device = "cpu"
+        trainer.amp_dtype = torch.float32
+        trainer.torch_compile = False
+        trainer.grad_accum = 1
+        trainer.log_interval = 1
+        trainer.eval_interval = 999
+        trainer.sample_interval = 999
+        trainer.save_interval = 999
+        trainer.val_loader = None
+        trainer.model = FakeModel()
+        trainer.epoch_count = 2
+        calls = []
+
+        def fake_train_epoch():
+            trainer.epoch_count += 1
+            calls.append(trainer.epoch_count)
+            return {
+                "loss/total": 0.0,
+                "perf/epoch_seconds": 0.0,
+                "perf/lr": 0.0,
+            }
+
+        trainer.train_epoch = fake_train_epoch
+
+        trainer.run()
+
+        assert calls == [3]
+        assert trainer.epoch_count == 3
+
 
 # ---------------------------------------------------------------------------
 # Dataset tests
@@ -1264,6 +1498,79 @@ class TestDataset:
         assert torch.allclose(sample["ct"], torch.from_numpy(np.flip(ct, axis=-1).copy()))
         assert torch.allclose(sample["pet"], torch.from_numpy(np.flip(pet, axis=-1).copy()))
         assert torch.allclose(sample["mask"], torch.from_numpy(np.flip(mask, axis=-1).copy()))
+
+    def test_png_cache_builds_npz_and_manifest_from_split_csv(self, tmp_path):
+        from PIL import Image
+        from src.data.dataset import CachedDataset
+        from src.data.png_cache import build_png_cache
+
+        main_data = tmp_path / "main_data"
+        for split in ["train", "val"]:
+            for subdir in ["ct", "pet", "pet_peizhuan", "label"]:
+                (main_data / split / subdir).mkdir(parents=True)
+
+        split_csv = main_data / "split.csv"
+        split_csv.write_text(
+            "file_name,patient_id,split,mask_area,area_class,area_level\n"
+            "001001.png,001,train,4,0,small\n"
+            "002001.png,002,val,4,0,small\n",
+            encoding="utf-8",
+        )
+
+        for split, sample_id in [("train", "001001"), ("val", "002001")]:
+            ct = np.arange(16, dtype=np.uint8).reshape(4, 4)
+            pet = np.full((4, 4), 25, dtype=np.uint8)
+            registered_pet = np.full((4, 4), 200, dtype=np.uint8)
+            label = np.zeros((4, 4), dtype=np.uint8)
+            label[1:3, 1:3] = 255
+            Image.fromarray(ct).save(main_data / split / "ct" / f"{sample_id}.png")
+            Image.fromarray(pet).save(main_data / split / "pet" / f"{sample_id}.png")
+            Image.fromarray(registered_pet).save(main_data / split / "pet_peizhuan" / f"{sample_id}.png")
+            Image.fromarray(label).save(main_data / split / "label" / f"{sample_id}.png")
+
+        cache_dir = tmp_path / "cache" / "tensors_main"
+        split_manifest = main_data / "split_manifest.csv"
+        stats = build_png_cache(
+            png_root=main_data,
+            split_csv=split_csv,
+            out_dir=cache_dir,
+            split_manifest=split_manifest,
+            image_size=8,
+        )
+
+        assert stats["built"] == 2
+        assert stats["skipped"] == {}
+        assert stats["pet_source_counts"] == {"pet_peizhuan": 2}
+        assert split_manifest.exists()
+
+        with np.load(cache_dir / "001001.npz") as data:
+            assert set(["ct", "pet", "mask", "scale_meta_json"]).issubset(data.keys())
+            assert data["ct"].shape == (1, 8, 8)
+            assert data["pet"].shape == (1, 8, 8)
+            assert data["mask"].shape == (1, 8, 8)
+            assert data["mask"].max() == 1.0
+            assert data["pet"].min() > 0.0  # registered PET was selected over the darker raw PET
+            scale_meta = json.loads(bytes(data["scale_meta_json"].tolist()).decode("utf-8"))
+            assert scale_meta["pet_physical_kind"] == "png_intensity"
+            assert scale_meta["pet_suv_available"] is False
+
+        train_ds = CachedDataset(
+            cache_dir,
+            split="train",
+            augment=False,
+            split_manifest=split_manifest,
+            required_keys=["ct", "pet", "mask"],
+        )
+        val_ds = CachedDataset(
+            cache_dir,
+            split="val",
+            augment=False,
+            split_manifest=split_manifest,
+            required_keys=["ct", "pet", "mask"],
+        )
+        assert len(train_ds) == 1
+        assert len(val_ds) == 1
+        assert train_ds[0]["meta"]["pet_suv_available"] is False
 
 
 class TestScaleMeta:
