@@ -15,13 +15,44 @@ from __future__ import annotations
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from .slmf_bbdm import SLMFBBDM
 from .ema import EMA
+
+
+def _stripe_score(pred_np: np.ndarray) -> float:
+    """Directional-gradient anisotropy: max directional energy / mean.
+
+    High score → strong directional bias (stripes).  Isotropic texture → ~1.
+    pred_np: [H, W] ndarray in model output space.
+    """
+    if pred_np.ndim == 3:
+        pred_np = pred_np[0]
+    # Sobel gradients
+    kx = np.array([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
+    ky = kx.T
+    from scipy.ndimage import correlate
+    gx = correlate(pred_np, kx, mode="reflect")
+    gy = correlate(pred_np, ky, mode="reflect")
+    n_dirs = 8
+    energies = np.empty(n_dirs, dtype=np.float64)
+    for i in range(n_dirs):
+        theta = i * np.pi / n_dirs
+        dg = gx * np.cos(theta) + gy * np.sin(theta)
+        energies[i] = float((dg * dg).sum())
+    return float(energies.max() / max(energies.mean(), 1e-8))
+
+
+def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
+    return {
+        k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+        for k, v in batch.items()
+    }
 
 
 def _detect_dtype() -> torch.dtype:
@@ -106,6 +137,25 @@ class Trainer:
         self.accum_count = 0
         self.epoch_count = 0
         self.start_time = None
+
+        # ---- Training monitoring: tracked samples, best ckpt, early stop ----
+        bc_cfg = run_cfg.get("best_checkpoint", {}) or {}
+        es_cfg = run_cfg.get("early_stopping", {}) or {}
+        self.best_ckpts_enabled = bool(bc_cfg.get("enabled", True))
+        self.best_combined_alpha = float(bc_cfg.get("combined_alpha", 0.5))
+        self.best_stripe_penalty = float(bc_cfg.get("stripe_penalty", 0.3))
+
+        self.early_stopping_enabled = bool(es_cfg.get("enabled", False))
+        self.early_stopping_patience = int(es_cfg.get("patience", 40))
+        self.early_stopping_min_epochs = int(es_cfg.get("min_epochs", 0))
+        self._best_combined_score: float = -1e9
+        self._best_lesion_score: float = -1e9
+        self._best_image_score: float = -1e9
+        self._epochs_since_improve: int = 0
+
+        self.tracked_sample_ids: List[str] = list(run_cfg.get("tracked_sample_ids", []) or [])
+        self._tracked_batch: Optional[Dict[str, Any]] = None
+        self._tracked_meta: Optional[List[Dict[str, Any]]] = None
 
     def _apply_optimizer_step(self) -> None:
         """Apply one optimiser/EMA update and clear accumulated gradients."""
@@ -222,6 +272,14 @@ class Trainer:
         num_epochs = num_epochs or self.config.get("training", {}).get("num_epochs", 1000)
         self.start_time = time.time()
 
+        # Backwards-compat: a few unit tests build Trainer via object.__new__
+        # without calling __init__.  Ensure the monitoring attributes exist.
+        if not hasattr(self, "_tracked_batch"):
+            self._tracked_batch = None
+            self._tracked_meta = None
+            self.best_ckpts_enabled = False
+            self.early_stopping_enabled = False
+
         print(f"\n{'='*60}")
         print(f"SLMF-BBDM Training")
         print(f"Device: {self.device} | AMP: {self.amp_dtype} | Compile: {self.torch_compile}")
@@ -245,7 +303,14 @@ class Trainer:
                 f"LR: {lr:.2e}"
             )
 
-            # Evaluation (with EMA)
+            # Select fixed tracked samples once (lazy — val_loader must exist)
+            if self._tracked_batch is None and self.val_loader is not None:
+                with self.ema_scope():
+                    pass  # no EMA needed for selection; keep symmetry
+                self._select_tracked_batch()
+
+            # Evaluation (with EMA) + sample-based monitoring + model selection
+            should_stop = False
             if self.val_loader is not None and self.epoch_count % self.eval_interval == 0:
                 with self.ema_scope():
                     eval_logs = [self.eval_step(b) for b in self.val_loader]
@@ -253,24 +318,248 @@ class Trainer:
                 avg_eval = {k: sum(d.get(k, 0) for d in eval_logs) / len(eval_logs) for k in k0}
                 print(f"  Eval  Loss: {avg_eval.get('loss/total', 0):.4f}")
 
+                if self._tracked_batch is not None:
+                    with self.ema_scope():
+                        val_metrics = self._compute_val_sample_metrics(self._tracked_batch)
+                    print("  " + "  ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                    self._save_best_checkpoints(val_metrics)
+                    _, _, combined = self._model_selection_scores(val_metrics)
+                    if self._check_early_stopping(combined):
+                        should_stop = True
+
             # Checkpoint
             if self.epoch_count % self.save_interval == 0:
                 self.save_checkpoint()
 
-            # Sampling
-            if self.val_loader is not None and self.epoch_count % self.sample_interval == 0:
+            # Sampling — fixed tracked samples (not next(iter(val_loader)))
+            if self._tracked_batch is not None and self.epoch_count % self.sample_interval == 0:
                 with self.ema_scope():
-                    val_batch = next(iter(self.val_loader))
-                    val_batch = {
-                        k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
-                        for k, v in val_batch.items()
-                    }
-                    sample_result = self.model.sample(val_batch)
+                    sample_result = self.model.sample(_to_device(self._tracked_batch, self.device))
                 synth_pet = sample_result["synthetic_pet"]
                 print(f"  Sample PET range: [{synth_pet.min().item():.4f}, {synth_pet.max().item():.4f}]")
-                self._save_sample_grid(val_batch, synth_pet)
+                self._save_sample_grid(self._tracked_batch, synth_pet)
+
+            if should_stop:
+                break
 
         print(f"\nTraining complete. Total: {time.time() - self.start_time:.0f}s")
+
+    # ------------------------------------------------------------------
+    # Validation & model selection
+    # ------------------------------------------------------------------
+
+    def _select_tracked_batch(self) -> None:
+        """Scan val_loader once and cache a fixed batch of small/medium/large
+        lesion samples for visual + metric tracking across epochs.
+
+        If ``tracked_sample_ids`` is set in config, only those samples are kept.
+        Otherwise we pick 2 small / 2 medium / 2 large (by mask area).
+        """
+        if self.val_loader is None:
+            return
+        candidates: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
+        wanted = set(self.tracked_sample_ids)
+        for batch in self.val_loader:
+            masks = batch.get("mask")
+            if masks is None:
+                continue
+            B = masks.shape[0]
+            for i in range(B):
+                area = float(masks[i].sum().item())
+                sample = {
+                    k: (v[i:i + 1].clone() if torch.is_tensor(v) else ([v[i]] if isinstance(v, list) else v))
+                    for k, v in batch.items()
+                }
+                # patient / sample id for display
+                meta = batch.get("meta")
+                pid = ""
+                if isinstance(meta, list) and i < len(meta):
+                    pid = str(meta[i].get("patient_id", "")) if isinstance(meta[i], dict) else ""
+                elif isinstance(meta, dict):
+                    mv = meta.get("patient_id")
+                    if isinstance(mv, list) and i < len(mv):
+                        pid = str(mv[i])
+                sid = f"{pid or 's'}_{i}"
+                if wanted and sid not in wanted and pid not in wanted:
+                    continue
+                candidates.append((area, sample, {"sample_id": sid, "patient_id": pid}))
+
+        if not candidates:
+            print("  [tracked samples] no candidates found; skipping fixed tracking")
+            return
+
+        candidates.sort(key=lambda c: c[0])
+        n = len(candidates)
+        if not self.tracked_sample_ids:
+            idx_sets = [0, n // 3, 2 * n // 3]
+            picks: List[int] = []
+            for s in idx_sets:
+                picks.extend(range(s, min(s + 2, n)))
+            picks = sorted(set(picks))
+        else:
+            picks = list(range(n))
+
+        merged: Dict[str, List[Any]] = {}
+        meta_list: List[Dict[str, Any]] = []
+        for p in picks:
+            _, sample, meta = candidates[p]
+            meta_list.append(meta)
+            for k, v in sample.items():
+                merged.setdefault(k, []).append(v)
+        tracked: Dict[str, Any] = {}
+        for k, vs in merged.items():
+            if vs and torch.is_tensor(vs[0]):
+                tracked[k] = torch.cat(vs, dim=0)
+            elif vs and isinstance(vs[0], dict):
+                tracked[k] = vs
+            else:
+                tracked[k] = vs
+        self._tracked_batch = tracked
+        self._tracked_meta = meta_list
+        print(f"  [tracked samples] {len(meta_list)} fixed samples: "
+              + ", ".join(m["sample_id"] for m in meta_list))
+
+    @torch.no_grad()
+    def _compute_val_sample_metrics(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        """Run sampling on a fixed batch and compute monitoring metrics."""
+        self.model.eval()
+        batch = _to_device(batch, self.device)
+        sample_out = self.model.sample(batch)
+        synth = sample_out["synthetic_pet"]  # [B,1,H,W]
+        target = batch["pet"]
+        mask = batch.get("mask")
+
+        metrics: Dict[str, float] = {}
+        mae_vals, ssim_vals, stripe_vals = [], [], []
+        peak_err_vals, centroid_vals, oir_vals = [], [], []
+        failure_count = 0
+        B = synth.shape[0]
+        for i in range(B):
+            p = synth[i, 0].float().cpu().numpy()
+            t = target[i, 0].float().cpu().numpy()
+            mae_vals.append(float(np.abs(p - t).mean()))
+            stripe_vals.append(_stripe_score(p))
+            # SSIM (lazy import to avoid hard dep at module load)
+            try:
+                from skimage.metrics import structural_similarity as _ssim
+                ssim_vals.append(float(_ssim(t, p, data_range=2.0)))
+            except Exception:
+                pass
+            if mask is not None:
+                mi = mask[i, 0].float().cpu().numpy()
+                if mi.sum() > 0:
+                    pred_in = float((p * mi).max())
+                    tgt_in = float((t * mi).max())
+                    peak_err_vals.append(abs(pred_in - tgt_in))
+                    # centroid distance (pred peak vs mask centroid)
+                    ys, xs = np.nonzero(mi)
+                    if len(xs) > 0:
+                        cy, cx = ys.mean(), xs.mean()
+                        pm = p * mi
+                        py, px = np.unravel_index(np.argmax(pm), pm.shape)
+                        centroid_vals.append(float(np.hypot(py - cy, px - cx)))
+                    # outside/inside peak ratio
+                    outside = p * (1.0 - mi)
+                    in_peak = max(pred_in, 1e-6)
+                    out_peak = float(outside.max())
+                    oir_vals.append(out_peak / in_peak)
+                    if out_peak > pred_in:
+                        failure_count += 1
+
+        def _mean(vals):
+            return float(np.mean(vals)) if vals else float("nan")
+
+        metrics["val/mae"] = _mean(mae_vals)
+        metrics["val/ssim"] = _mean(ssim_vals)
+        metrics["val/stripe_score"] = _mean(stripe_vals)
+        metrics["val/lesion_peak_error_norm"] = _mean(peak_err_vals)
+        metrics["val/lesion_centroid_distance"] = _mean(centroid_vals)
+        metrics["val/outside_inside_peak_ratio"] = _mean(oir_vals)
+        metrics["val/failure_rate"] = float(failure_count) / max(B, 1)
+        # lesion_roi_l1 (normalised) — dense PET supervision proxy inside mask
+        if mask is not None:
+            mi_all = mask.float()
+            num = (synth - target).abs() * mi_all
+            den = mi_all.sum().clamp_min(1.0)
+            metrics["val/lesion_roi_l1"] = float(num.sum().item() / den.item())
+        return metrics
+
+    def _model_selection_scores(self, metrics: Dict[str, float]) -> Tuple[float, float, float]:
+        """Return (lesion_score, image_score, combined) where higher is better.
+
+        lesion_score rewards low peak error + low centroid distance + low failure.
+        image_score rewards high SSIM + low MAE + low stripe.
+        combined blends both with a stripe penalty.
+        """
+        def _g(k):
+            v = metrics.get(k, float("nan"))
+            return v if v == v else 0.0  # NaN→0
+
+        peak = _g("val/lesion_peak_error_norm")
+        centroid = _g("val/lesion_centroid_distance")
+        fail = _g("val/failure_rate")
+        mae = _g("val/mae")
+        ssim = _g("val/ssim")
+        stripe = _g("val/stripe_score")
+
+        lesion_score = -(peak + 0.02 * centroid + fail)
+        image_score = ssim - mae - 0.1 * max(stripe - 1.0, 0.0)
+        combined = (
+            self.best_combined_alpha * lesion_score
+            + (1.0 - self.best_combined_alpha) * image_score
+            - self.best_stripe_penalty * max(stripe - 1.0, 0.0)
+        )
+        return lesion_score, image_score, combined
+
+    def _save_best_checkpoints(self, metrics: Dict[str, float]) -> None:
+        if not self.best_ckpts_enabled:
+            return
+        lesion, image, combined = self._model_selection_scores(metrics)
+        exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
+        save_dir = os.path.join("checkpoints", exp_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        def _save(tag: str, score: float, best_key: str) -> None:
+            best = getattr(self, best_key, -1e9)
+            if score > best:
+                setattr(self, best_key, score)
+                path = os.path.join(save_dir, f"ckpt_{tag}.pt")
+                torch.save({
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "scheduler": self.scheduler.state_dict(),
+                    "ema": self.ema.state_dict(),
+                    "epoch": self.epoch_count,
+                    "step": self.step_count,
+                    "score": score,
+                    "metrics": metrics,
+                    "config": self.config,
+                }, path)
+                print(f"  ★ new best {tag} (score={score:.4f}) → {path}")
+
+        _save("best_lesion", lesion, "_best_lesion_score")
+        _save("best_image", image, "_best_image_score")
+        _save("best_combined", combined, "_best_combined_score")
+
+    def _check_early_stopping(self, combined: float) -> bool:
+        """Return True if training should stop."""
+        if not self.early_stopping_enabled:
+            return False
+        if self.epoch_count < self.early_stopping_min_epochs:
+            return False
+        if combined > self._best_combined_score:
+            self._best_combined_score = combined
+            self._epochs_since_improve = 0
+        else:
+            self._epochs_since_improve += 1
+            if self._epochs_since_improve >= self.early_stopping_patience:
+                print(
+                    f"  Early stopping: no improvement for "
+                    f"{self._epochs_since_improve} epochs (patience="
+                    f"{self.early_stopping_patience})."
+                )
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -317,8 +606,11 @@ class Trainer:
             axes = axes[None, :]
 
         for i in range(n):
+            sid = ""
+            if self._tracked_meta and i < len(self._tracked_meta):
+                sid = self._tracked_meta[i].get("sample_id", "")
             axes[i, 0].imshow(batch["ct"][i, 0].cpu().numpy(), cmap="gray")
-            axes[i, 0].set_title("CT")
+            axes[i, 0].set_title(f"CT\n{sid}" if sid else "CT")
             axes[i, 1].imshow(target_pet[i, 0].cpu().numpy(), cmap="hot", vmin=-1, vmax=1)
             axes[i, 1].set_title("Target PET")
             axes[i, 2].imshow(synth_pet[i, 0].cpu().numpy(), cmap="hot", vmin=-1, vmax=1)

@@ -20,7 +20,13 @@ import torch
 # Ensure src/ is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.model.config_utils import load_full_config, save_resolved_config, resolve_runtime_profile
+from src.model.config_utils import (
+    load_full_config,
+    save_resolved_config,
+    resolve_runtime_profile,
+    validate_png_baseline_config,
+    log_startup_status,
+)
 from src.model.slmf_bbdm import SLMFBBDM
 from src.model.trainer import Trainer
 
@@ -120,6 +126,11 @@ def main():
 
     # 2. Resolve runtime profile (CPU fallback if no CUDA)
     config = resolve_runtime_profile(config)
+
+    # 2.5 Validate PNG baseline config + log startup status
+    #     Fails fast if data.mode=png but a DICOM/SUV/organ path is still on.
+    startup_status = validate_png_baseline_config(config)
+    log_startup_status(startup_status)
 
     # 3. Save resolved config
     exp_name = config.get("experiment", {}).get("name", "slmf_bbdm")

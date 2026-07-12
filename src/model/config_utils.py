@@ -141,3 +141,117 @@ def resolve_runtime_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["runtime"]["torch_compile"] = False
         print("CUDA not available. Running CPU smoke/debug profile only.")
     return cfg
+
+
+class PNGBaselineConfigError(ValueError):
+    """Raised when a PNG-mode config activates a path that needs DICOM/SUV data."""
+
+
+def _is_enabled(node: Any) -> bool:
+    """Return True only when a config node explicitly enables something."""
+    if isinstance(node, dict):
+        return bool(node.get("enabled", False))
+    return bool(node)
+
+
+def validate_png_baseline_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate that a PNG-mode config does not activate DICOM/SUV/organ paths.
+
+    Reads ``data.mode`` (the real field consumed by the startup checks). When it
+    equals ``"png"`` the following must all be disabled, otherwise a
+    :class:`PNGBaselineConfigError` is raised:
+
+      - ``losses.roi_suv``        (needs physical SUV)
+      - ``modules.organ_prior``   (needs TotalSegmentator masks)
+      - ``losses.organ_consistency`` (needs organ masks)
+      - ``metadata`` / ``model.metadata`` (FiLM needs DICOM metadata)
+      - ``segmenter`` / ``model.segmenter``
+
+    Returns a dict of startup status fields for logging.
+    """
+    data_cfg = config.get("data", {}) or {}
+    data_mode = str(data_cfg.get("mode", "")).lower().strip()
+
+    modules_cfg = config.get("modules", {}) or {}
+    losses_cfg = config.get("losses", {}) or {}
+    model_cfg = config.get("model", {}) or {}
+    eval_cfg = config.get("evaluation", {}) or {}
+
+    gabor_cfg = modules_cfg.get("gabor", {}) or {}
+    gabor_routes = {
+        "enabled": bool(gabor_cfg.get("enabled", False)),
+        "inject_adapter": bool(gabor_cfg.get("inject_adapter", False)),
+        "use_for_noise": bool(gabor_cfg.get("use_for_noise", False)),
+        "use_for_hotspot": bool(gabor_cfg.get("use_for_hotspot", False)),
+        "use_for_loss": bool(gabor_cfg.get("use_for_loss", False)),
+    }
+
+    status = {
+        "data_mode": data_mode or "(unset)",
+        "cache_dir": data_cfg.get("cache_dir", ""),
+        "split_manifest": data_cfg.get("split_manifest", ""),
+        "organ_prior_enabled": _is_enabled(modules_cfg.get("organ_prior")),
+        "roi_suv_enabled": _is_enabled(losses_cfg.get("roi_suv")),
+        "metadata_enabled": _is_enabled(config.get("metadata")) or _is_enabled(model_cfg.get("metadata")),
+        "segmenter_enabled": _is_enabled(config.get("segmenter")) or _is_enabled(model_cfg.get("segmenter")),
+        "gabor_routes": gabor_routes,
+        "physical_suv_available": bool(eval_cfg.get("physical_suv_available", False)),
+    }
+
+    if data_mode != "png":
+        # Not a PNG run — nothing to enforce. Callers may still log the status.
+        return status
+
+    # PNG mode: hard-fail on paths that need DICOM/SUV/organ ground truth.
+    offenders = []
+    if status["roi_suv_enabled"]:
+        offenders.append(
+            "losses.roi_suv is enabled but PNG cache has no physical SUV "
+            "(suv_ok=False). Disable losses.roi_suv or switch data.mode."
+        )
+    if status["organ_prior_enabled"]:
+        offenders.append(
+            "modules.organ_prior is enabled but PNG cache has no organ_mask/"
+            "organ_distance (TotalSegmentator unavailable). This would run "
+            "biased convolutions on all-zero inputs. Disable modules.organ_prior."
+        )
+    if _is_enabled(losses_cfg.get("organ_consistency")):
+        offenders.append(
+            "losses.organ_consistency is enabled but PNG cache has no organ masks."
+        )
+    if status["metadata_enabled"]:
+        offenders.append(
+            "metadata FiLM is enabled but PNG cache has no DICOM metadata "
+            "(uptake_min/weight_kg/age/...). Disable metadata.enabled."
+        )
+    if status["segmenter_enabled"]:
+        offenders.append(
+            "segmenter is enabled but requires a pretrained PET segmenter "
+            "checkpoint; not part of the PNG baseline."
+        )
+    if offenders:
+        msg = "PNG baseline config validation failed:\n  - " + "\n  - ".join(offenders)
+        raise PNGBaselineConfigError(msg)
+
+    return status
+
+
+def log_startup_status(status: Dict[str, Any]) -> None:
+    """Pretty-print the startup status dict produced by validate_png_baseline_config."""
+    print("\n" + "=" * 60)
+    print("SLMF-BBDM startup status")
+    print("=" * 60)
+    print(f"  data_mode            : {status.get('data_mode')}")
+    print(f"  cache_dir            : {status.get('cache_dir')}")
+    print(f"  split_manifest       : {status.get('split_manifest')}")
+    print(f"  organ_prior_enabled  : {status.get('organ_prior_enabled')}")
+    print(f"  roi_suv_enabled      : {status.get('roi_suv_enabled')}")
+    print(f"  metadata_enabled     : {status.get('metadata_enabled')}")
+    print(f"  segmenter_enabled    : {status.get('segmenter_enabled')}")
+    print(f"  physical_suv_available: {status.get('physical_suv_available')}")
+    routes = status.get("gabor_routes", {})
+    if routes:
+        print("  gabor routes         : " + ", ".join(
+            f"{k}={'on' if v else 'off'}" for k, v in routes.items()
+        ))
+    print("=" * 60 + "\n")

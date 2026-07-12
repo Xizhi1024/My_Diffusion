@@ -243,6 +243,21 @@ class SLMFBBDM(nn.Module):
 
         # ---- Prior modules ----
         prior_cfgs = prior_configs or {}
+
+        # ---- Gabor routing ----
+        # Real, independently-switchable routes.  These are the *only* knobs that
+        # decide where Gabor features flow.  The YAML fields below are read here
+        # (not just declared) and every consumer (adapter / noise / hotspot /
+        # loss) must consult the corresponding route.
+        gabor_cfg = prior_cfgs.get("gabor", {})
+        self.gabor_routes: Dict[str, bool] = {
+            "enabled":          bool(gabor_cfg.get("enabled", False)),
+            "inject_adapter":   bool(gabor_cfg.get("inject_adapter", False)),
+            "use_for_noise":    bool(gabor_cfg.get("use_for_noise", False)),
+            "use_for_hotspot":  bool(gabor_cfg.get("use_for_hotspot", False)),
+            "use_for_loss":     bool(gabor_cfg.get("use_for_loss", False)),
+        }
+
         self.priors = nn.ModuleDict()
         for name, cfg in prior_cfgs.items():
             if cfg.get("enabled", False):
@@ -344,9 +359,19 @@ class SLMFBBDM(nn.Module):
             )
         elif name == "hotspot_prior":
             from .priors.hotspot import HotspotPrior
+            # Gabor energy reaches the hotspot net only when Gabor is enabled
+            # AND routed to hotspot.  hotspot_prior.use_gabor_energy can refine
+            # this but can never bypass a closed route (use_for_hotspot=False
+            # forces CT-only input).
+            route_active = (
+                self.gabor_routes.get("enabled", False)
+                and self.gabor_routes.get("use_for_hotspot", False)
+            )
+            use_gabor = route_active and bool(cfg.get("use_gabor_energy", True))
             return HotspotPrior(
                 base_channels=cfg.get("base_channels", 16),
                 params_max=cfg.get("params_max", 500_000),
+                use_gabor_energy=use_gabor,
                 enabled=enabled,
             )
         elif name == "semantic_prior":
@@ -378,12 +403,21 @@ class SLMFBBDM(nn.Module):
             )
         elif name == "scale_adaptive":
             from .noise.scale_adaptive import ScaleAdaptiveNoise
+            # Gabor energy modulates the high-frequency noise band only when
+            # Gabor is enabled AND routed to noise.  A closed route forces the
+            # schedule to ignore gabor_energy even if it is present in the
+            # ConditionBundle.
+            route_active = (
+                self.gabor_routes.get("enabled", False)
+                and self.gabor_routes.get("use_for_noise", False)
+            )
+            use_gabor = route_active and bool(cfg.get("use_gabor_energy", True))
             return ScaleAdaptiveNoise(
                 num_train_timesteps=cfg.get("num_train_timesteps", 1000),
                 low_sigma_mult=cfg.get("low_sigma_mult", 1.0),
                 mid_sigma_mult=cfg.get("mid_sigma_mult", 0.75),
                 high_sigma_mult=cfg.get("high_sigma_mult", 0.45),
-                use_gabor_energy=cfg.get("use_gabor_energy", True),
+                use_gabor_energy=use_gabor,
                 bridge_mode=cfg.get("bridge_mode", False),
                 enabled=enabled,
             )
@@ -462,6 +496,8 @@ class SLMFBBDM(nn.Module):
                 focal_weight=cfg.get("focal_weight", 1.0),
                 distance_weight=cfg.get("distance_weight", 0.25),
                 pet_threshold_quantile=cfg.get("pet_threshold_quantile", 0.95),
+                target_mode=cfg.get("target_mode", "mask_only"),
+                local_uptake_radius=cfg.get("local_uptake_radius", 8),
                 enabled=enabled, weight=weight,
             )
         elif name == "organ_consistency":
@@ -602,7 +638,13 @@ class SLMFBBDM(nn.Module):
             condition.maps.get("organ_feat_3"),
             None,  # L3 uses nearest organ feat
         ]
-        gabor_feat = condition.maps.get("gabor_feat")
+        # Gabor reaches the adapter only when enabled AND routed to the adapter.
+        # When the route is closed we pass None so the adapter falls back to a
+        # strict zero placeholder — Gabor features must not leak into the UNet.
+        if self.gabor_routes.get("enabled", False) and self.gabor_routes.get("inject_adapter", False):
+            gabor_feat = condition.maps.get("gabor_feat")
+        else:
+            gabor_feat = None
         hotspot = condition.maps.get("hotspot_prior")
 
         if hw_list is None:
@@ -732,6 +774,9 @@ class SLMFBBDM(nn.Module):
             logs[f"module/{name}"] = torch.tensor(
                 1.0 if self.priors[name].enabled else 0.0, device=device
             )
+        # Gabor routing status (independent of whether the prior itself ran)
+        for route, flag in self.gabor_routes.items():
+            logs[f"module/gabor_{route}"] = torch.tensor(1.0 if flag else 0.0, device=device)
         logs["module/zero_adapter"] = torch.tensor(1.0 if self.zero_adapter_enabled else 0.0, device=device)
         logs["module/condition_dropout"] = torch.tensor(
             1.0 if self.condition_dropout.enabled else 0.0, device=device
@@ -805,6 +850,13 @@ class SLMFBBDM(nn.Module):
             x_t = noise
         self_cond = torch.zeros_like(x_t) if self.self_conditioning else None
 
+        # Track the terminal clean estimate.  The loop below updates x_t at every
+        # step except the last; the last step's pred_x0 is the model's final
+        # denoised output and must be what we return (not the previous x_t which
+        # still carries schedule noise).
+        final_pred_x0: Optional[torch.Tensor] = None
+        final_output: Optional[torch.Tensor] = None
+
         step_range = range(len(ddim_timesteps))
         if progress:
             from tqdm import tqdm
@@ -870,10 +922,20 @@ class SLMFBBDM(nn.Module):
                         alpha_next = alpha_next.unsqueeze(-1)
                     eps_pred = (x_t - alpha_t.sqrt() * pred_x0) / (1 - alpha_t).sqrt().clamp_min(1e-8)
                     x_t = alpha_next.sqrt() * pred_x0 + (1 - alpha_next).sqrt() * eps_pred
+            else:
+                # Terminal step (t≈0): pred_x0 is the final clean estimate and
+                # must be returned directly.  x_t at this point still carries
+                # residual schedule noise, so we do NOT return it.
+                final_pred_x0 = pred_x0
+                final_output = output
 
-        result = {"synthetic_pet": x_t}
-        if self.enable_heteroscedastic:
-            result["logvar"] = output[:, 1:].clamp(
+        # Prefer the final-step pred_x0.  Fall back to x_t only if the loop did
+        # not execute (defensive — steps is always ≥1 in practice).
+        synthetic_pet = final_pred_x0 if final_pred_x0 is not None else x_t
+        result = {"synthetic_pet": synthetic_pet}
+        if self.enable_heteroscedastic and final_output is not None:
+            # logvar must come from the same terminal model output as pred_x0.
+            result["logvar"] = final_output[:, 1:].clamp(
                 self.heteroscedastic_logvar_min, self.heteroscedastic_logvar_max)
         if "hotspot_prior" in condition.maps:
             result["hotspot_prior"] = condition.maps["hotspot_prior"]

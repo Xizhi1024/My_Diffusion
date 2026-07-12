@@ -1,4 +1,16 @@
-"""2D PatchNCE loss for CT-PET spatial binding."""
+"""2D PatchNCE loss for CT-PET spatial binding.
+
+WARNING — raw-image PatchNCE is NOT suitable as a default PNG baseline.
+This loss directly compares raw CT patches against raw pred-PET patches in a
+contrastive objective.  Because CT anatomy is far richer in high-frequency
+texture than lesion PET, the model is rewarded for *copying CT texture into the
+PET prediction* — one of the observed failure modes (CT解剖纹理泄漏).  Keep
+``losses.patch_nce.enabled: false`` for the PNG baseline.
+
+If a contrastive spatial binding is needed experimentally, it should compare
+high-level features from an independent (frozen) encoder rather than raw
+grey-scale patches.  Implementing such an encoder is out of scope for this fix.
+"""
 
 from typing import Dict
 

@@ -44,7 +44,7 @@ from src.model.loss_terms.roi_suv import _de_collate_meta
 # ---------------------------------------------------------------------------
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
-    return t.detach().cpu().numpy()
+    return t.detach().cpu().float().numpy()
 
 
 def compute_mae(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None = None) -> float:
@@ -349,6 +349,66 @@ def compute_false_hotspot_count(
     }
 
 
+def compute_normalized_lesion_metrics(
+    pred: np.ndarray,         # [1, H, W] in [-1, 1] (model output space)
+    target: np.ndarray,       # [1, H, W] in [-1, 1]
+    lesion_mask: np.ndarray,  # [1, H, W] binary
+    organ_mask: np.ndarray,   # [C, H, W] one-hot (may be all-zero for PNG)
+) -> Dict[str, float]:
+    """Lesion intensity metrics in normalised [-1, 1] space.
+
+    These do NOT require physical SUV calibration and are the primary
+    lesion-fidelity metrics for the PNG baseline.  Emitted for every sample
+    that has a non-empty lesion mask, regardless of ``suv_ok``.
+
+    Never convert these values back to pseudo-SUV — that would fabricate
+    physical units the PNG export does not have.
+    """
+    nan_metrics = {
+        "lesion_peak_error_norm": float("nan"),
+        "lesion_mean_error_norm": float("nan"),
+        "lesion_to_background_ratio_norm": float("nan"),
+        "lesion_centroid_distance": float("nan"),
+    }
+    if lesion_mask.sum() <= 0:
+        return nan_metrics
+
+    pred_max = float((pred * lesion_mask).max())
+    target_max = float((target * lesion_mask).max())
+    mask_sum = max(float(lesion_mask.sum()), 1.0)
+    pred_mean = float((pred * lesion_mask).sum() / mask_sum)
+    target_mean = float((target * lesion_mask).sum() / mask_sum)
+
+    organ_any = (
+        (organ_mask.sum(axis=0, keepdims=True) > 0).astype(np.float32)
+        if organ_mask.shape[0] > 0 else np.zeros_like(lesion_mask)
+    )
+    bg_mask = np.maximum(1.0 - lesion_mask - organ_any, 0.0)
+    bg_sum = max(float(bg_mask.sum()), 1.0)
+    pred_bg = float((pred * bg_mask).sum() / bg_sum)
+    target_bg = float((target * bg_mask).sum() / bg_sum)
+    pred_tbr = pred_mean / max(abs(pred_bg), 1e-6)
+    target_tbr = target_mean / max(abs(target_bg), 1e-6)
+
+    # Distance (pixels) between the pred peak inside the mask and the mask centroid
+    pred_masked = pred[0] * lesion_mask[0]
+    ys, xs = np.nonzero(lesion_mask[0])
+    if len(ys) > 0:
+        cy, cx = float(ys.mean()), float(xs.mean())
+        peak_idx = np.unravel_index(np.argmax(pred_masked), pred_masked.shape)
+        py, px = float(peak_idx[0]), float(peak_idx[1])
+        centroid_dist = float(np.hypot(py - cy, px - cx))
+    else:
+        centroid_dist = float("nan")
+
+    return {
+        "lesion_peak_error_norm": float(abs(pred_max - target_max)),
+        "lesion_mean_error_norm": float(abs(pred_mean - target_mean)),
+        "lesion_to_background_ratio_norm": float(abs(pred_tbr - target_tbr)),
+        "lesion_centroid_distance": centroid_dist,
+    }
+
+
 def _append_calibration_summary(summary: Dict[str, Any], all_metrics: List[Dict[str, Any]]) -> None:
     pairs = [
         ("pred_suv_max", "target_suv_max", "suv_calib"),
@@ -438,6 +498,14 @@ def evaluate(
                 "suv_valid": float(has_valid_suv),
             }
 
+            # Normalized-intensity lesion metrics: always emitted when a lesion
+            # mask exists.  These are the PNG-baseline lesion-fidelity metrics
+            # (no physical SUV needed).
+            if mask_np.sum() > 0:
+                sample_metrics.update(
+                    compute_normalized_lesion_metrics(pred_np, target_np, mask_np, organ_np)
+                )
+
             # Clinical SUV metrics are emitted only for validated SUV samples.
             if mask_np.sum() > 0 and has_valid_suv:
                 target_suv_np = None
@@ -491,6 +559,11 @@ def evaluate(
     summary: Dict[str, Any] = {
         "num_samples": len(all_metrics),
         "num_patients": len(patient_results),
+        # Derived from data: True only if at least one sample had suv_ok=True
+        # AND a valid pet_suv_max.  PNG cache → always False.
+        "physical_suv_available": bool(
+            any(row.get("suv_valid", 0) > 0 for row in all_metrics)
+        ),
     }
 
     for metric_name, values in results.items():
@@ -529,10 +602,16 @@ def print_report(summary: Dict[str, Any]) -> None:
     print("SLMF-BBDM Evaluation Report")
     print("=" * 60)
     print(f"Samples: {summary['num_samples']}  |  Patients: {summary['num_patients']}")
+    suv_avail = summary.get("physical_suv_available", False)
+    print(f"physical_suv_available: {suv_avail}"
+          + ("" if suv_avail else "  (PNG baseline: clinical SUV metrics omitted)"))
     print("-" * 60)
 
     sections = [
         ("Image Quality", ["mae", "mse", "psnr", "ssim"]),
+        ("Normalized-Intensity Lesion ([-1,1] space, no SUV)",
+         ["lesion_peak_error_norm", "lesion_mean_error_norm",
+          "lesion_to_background_ratio_norm", "lesion_centroid_distance"]),
         ("Clinical SUV (lesion ROI)", ["suv_max_error", "suv_mean_error", "tbr_error",
                                         "pred_suv_max", "target_suv_max"]),
         ("SUV Calibration", ["suv_calib_slope", "suv_calib_intercept", "suv_calib_r2",

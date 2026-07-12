@@ -2,6 +2,17 @@
 
 Directly supervises the tiny CT→hotspot prior with lesion masks, optional
 PET high-uptake targets, and optional relaxed distance maps.
+
+target_mode (default ``mask_only``):
+  - ``mask_only``             : target = lesion mask only.  Strict, never pulls
+                                in far-away high-uptake pixels.  Use this for the
+                                PNG baseline (no clean SUV / no reliable uptake).
+  - ``mask_plus_local_uptake``: target = max(lesion mask, high-uptake pixels
+                                inside the *dilated* lesion ROI).  The full-image
+                                top-percentile shortcut is forbidden here.
+  - ``legacy``                : target = max(lesion mask, full-image top-q% PET).
+                                Kept for backward compatibility; NOT recommended
+                                for the PNG baseline (pulls in off-mask hotspots).
 """
 
 from typing import Dict, Optional
@@ -21,6 +32,14 @@ def _normalise_map(x: torch.Tensor) -> torch.Tensor:
     lo = x.amin(dim=(2, 3), keepdim=True)
     hi = x.amax(dim=(2, 3), keepdim=True)
     return (x - lo) / (hi - lo).clamp_min(1e-6)
+
+
+def _dilate_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Dilate a binary mask via max-pooling. radius<=0 returns the mask unchanged."""
+    if radius <= 0:
+        return mask
+    kernel = 2 * radius + 1
+    return F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=radius)
 
 
 def _get_distance_target(ctx: LossContext) -> Optional[torch.Tensor]:
@@ -43,10 +62,17 @@ class HotspotPriorLoss(LossTerm):
         focal_weight: float = 1.0,
         distance_weight: float = 0.25,
         pet_threshold_quantile: float = 0.95,
+        target_mode: str = "mask_only",
+        local_uptake_radius: int = 8,
         enabled: bool = True,
         weight: float = 0.1,
     ):
         super().__init__(enabled=enabled, weight=weight)
+        if target_mode not in {"mask_only", "mask_plus_local_uptake", "legacy"}:
+            raise ValueError(
+                f"hotspot_prior.target_mode must be one of "
+                f"mask_only / mask_plus_local_uptake / legacy, got {target_mode!r}"
+            )
         self.active_tau_min = active_tau_min
         self.active_tau_max = active_tau_max
         self.focal_gamma = focal_gamma
@@ -54,20 +80,47 @@ class HotspotPriorLoss(LossTerm):
         self.focal_weight = focal_weight
         self.distance_weight = distance_weight
         self.pet_threshold_quantile = pet_threshold_quantile
+        self.target_mode = target_mode
+        self.local_uptake_radius = local_uptake_radius
 
     def _target(self, ctx: LossContext) -> torch.Tensor:
         mask = ctx.batch.get("mask")
         if mask is None:
             mask = torch.zeros_like(ctx.target_pet)
+        mask = mask.float()
+
+        # mask_only: target strictly from the lesion mask.  No PET-derived
+        # pixels are added, so far-away high-uptake regions can never enter.
+        if self.target_mode == "mask_only":
+            return mask
 
         pet = _normalise_map(ctx.target_pet.detach())
+
+        if self.target_mode == "mask_plus_local_uptake":
+            # Restrict high-uptake selection to the dilated lesion ROI only.
+            dilated = _dilate_mask(mask, self.local_uptake_radius)
+            local_pet = pet * dilated
+            B = pet.shape[0]
+            uptake = torch.zeros_like(mask)
+            for b in range(B):
+                d = dilated[b, 0]
+                n_pix = int(d.sum().item())
+                if n_pix < 1:
+                    continue
+                vals = pet[b, 0][d > 0]  # flatten within ROI
+                q = torch.quantile(vals, self.pet_threshold_quantile)
+                uptake[b, 0] = ((pet[b, 0] >= q) & (d > 0)).float()
+            _ = local_pet  # kept for debugging / diagnostics
+            return torch.maximum(mask, uptake)
+
+        # legacy: full-image top-percentile (NOT recommended for PNG baseline)
         q = torch.quantile(
             pet.reshape(pet.shape[0], -1),
             self.pet_threshold_quantile,
             dim=1,
         ).view(-1, 1, 1, 1)
         uptake = (pet >= q).to(mask.dtype)
-        return torch.maximum(mask.float(), uptake.float())
+        return torch.maximum(mask, uptake)
 
     def forward(self, ctx: LossContext) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         pred = ctx.condition.get_map("hotspot_prior")
