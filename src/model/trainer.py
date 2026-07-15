@@ -84,6 +84,14 @@ def _compute_pet_sample_metrics(
     }
 
 
+def _stratified_indices(total: int, count: int) -> List[int]:
+    """Return deterministic, near-quantile indices including both endpoints."""
+    if total <= 0 or count <= 0:
+        return []
+    count = min(total, count)
+    return np.rint(np.linspace(0, total - 1, num=count)).astype(int).tolist()
+
+
 def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     return {
         k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
@@ -130,6 +138,10 @@ class Trainer:
         self.grad_clip_norm = run_cfg.get("grad_clip_norm", 1.0)
         self.log_interval = run_cfg.get("log_interval", 10)
         self.eval_interval = run_cfg.get("eval_interval", 50)
+        self.eval_num_samples = int(run_cfg.get("eval_num_samples", 16))
+        self.eval_seed = int(
+            run_cfg.get("eval_seed", config.get("experiment", {}).get("seed", 42))
+        )
         self.sample_interval = run_cfg.get("sample_interval", 50)
         self.save_interval = run_cfg.get("save_interval", 50)
 
@@ -427,11 +439,7 @@ class Trainer:
         candidates.sort(key=lambda c: c[0])
         n = len(candidates)
         if not self.tracked_sample_ids:
-            idx_sets = [0, n // 3, 2 * n // 3]
-            picks: List[int] = []
-            for s in idx_sets:
-                picks.extend(range(s, min(s + 2, n)))
-            picks = sorted(set(picks))
+            picks = _stratified_indices(n, self.eval_num_samples)
         else:
             picks = list(range(n))
 
@@ -452,16 +460,33 @@ class Trainer:
                 tracked[k] = vs
         self._tracked_batch = tracked
         self._tracked_meta = meta_list
-        print(f"  [tracked samples] {len(meta_list)} fixed samples: "
+        print(f"  [fixed validation samples] {len(meta_list)} samples: "
               + ", ".join(m["sample_id"] for m in meta_list))
 
     @torch.no_grad()
-    def _compute_val_sample_metrics(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def _sample_with_eval_seed(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Sample with fixed noise without advancing the training RNG state."""
+        cuda_devices: List[int] = []
+        device = torch.device(self.device)
+        if device.type == "cuda":
+            cuda_devices = [
+                device.index if device.index is not None else torch.cuda.current_device()
+            ]
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(self.eval_seed)
+            return self.model.sample(_to_device(batch, self.device))
+
+    @torch.no_grad()
+    def _compute_val_sample_metrics(
+        self,
+        batch: Dict[str, Any],
+        synth: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
         """Run sampling on a fixed batch and compute monitoring metrics."""
         self.model.eval()
         batch = _to_device(batch, self.device)
-        sample_out = self.model.sample(batch)
-        synth = sample_out["synthetic_pet"]  # [B,1,H,W]
+        if synth is None:
+            synth = self._sample_with_eval_seed(batch)["synthetic_pet"]
         target = batch["pet"]
         mask = batch.get("mask")
 

@@ -5,10 +5,11 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.model.trainer import _compute_pet_sample_metrics
+from src.model.trainer import Trainer, _compute_pet_sample_metrics, _stratified_indices
 
 
 def test_signed_pet_metrics_do_not_select_zeroed_mask_background():
@@ -36,3 +37,34 @@ def test_signed_pet_metrics_skip_empty_mask():
     mask = np.zeros((4, 4), dtype=np.float32)
 
     assert _compute_pet_sample_metrics(pred, target, mask) is None
+
+
+def test_stratified_indices_are_deterministic_unique_and_cover_endpoints():
+    indices = _stratified_indices(total=30, count=16)
+
+    assert indices == _stratified_indices(total=30, count=16)
+    assert len(indices) == 16
+    assert len(set(indices)) == 16
+    assert indices[0] == 0
+    assert indices[-1] == 29
+
+
+def test_eval_sampling_is_repeatable_without_advancing_outer_rng():
+    class RandomSampleModel:
+        def sample(self, batch):
+            return {"synthetic_pet": torch.randn_like(batch["ct"])}
+
+    trainer = object.__new__(Trainer)
+    trainer.device = "cpu"
+    trainer.eval_seed = 123
+    trainer.model = RandomSampleModel()
+    batch = {"ct": torch.zeros(2, 1, 4, 4)}
+
+    torch.manual_seed(999)
+    before = torch.random.get_rng_state().clone()
+    first = trainer._sample_with_eval_seed(batch)["synthetic_pet"]
+    after = torch.random.get_rng_state().clone()
+    second = trainer._sample_with_eval_seed(batch)["synthetic_pet"]
+
+    assert torch.equal(before, after)
+    assert torch.equal(first, second)
