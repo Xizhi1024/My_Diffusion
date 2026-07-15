@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,3 +110,50 @@ def test_mean_pretrainer_requires_validation_loader():
             _config(),
             device="cpu",
         )
+
+
+def test_mean_pretraining_cli_runs_fake_data_and_writes_all_artifacts(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    output_dir = tmp_path / "mean_cli"
+    command = [
+        sys.executable,
+        "scripts/pretrain_conditional_mean.py",
+        "--config",
+        "configs/experiments/slmf_png_residual_frequency.yaml",
+        "--output-dir",
+        str(output_dir),
+        "--epochs",
+        "1",
+        "--seed",
+        "42",
+        "--override",
+        "data.use_fake_data=true",
+        "--override",
+        "data.cache_dir=",
+        "--override",
+        "data.image_size=32",
+        "--override",
+        "data.batch_size=8",
+        "--override",
+        "data.val_batch_size=8",
+        "--override",
+        "runtime.num_workers=0",
+        "--override",
+        "runtime.amp=false",
+        "--override",
+        "modules.conditional_mean.base_channels=8",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (output_dir / "mean_best.pt").is_file()
+    assert (output_dir / "mean_last.pt").is_file()
+    assert (output_dir / "history.json").is_file()
+    assert (output_dir / "resolved_config.yaml").is_file()
+    checkpoint = torch.load(output_dir / "mean_best.pt", weights_only=True)
+    assert torch.isfinite(torch.tensor(checkpoint["val_loss"]))
