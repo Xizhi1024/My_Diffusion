@@ -332,6 +332,68 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    def test_frozen_mean_requires_checkpoint(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=False, gabor=False)
+        cfg["modules"]["conditional_mean"]["freeze"] = True
+        with pytest.raises(ValueError, match="checkpoint"):
+            SLMFBBDM.from_config(cfg)
+
+    def test_pretrained_mean_loads_strictly_and_stays_frozen_in_train_mode(self, tmp_path):
+        from src.model.mean_predictor import LowFrequencyPETPredictor
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        source = LowFrequencyPETPredictor(base_channels=8, levels=2)
+        with torch.no_grad():
+            for parameter in source.parameters():
+                parameter.fill_(0.125)
+        checkpoint_path = tmp_path / "mean_best.pt"
+        torch.save(
+            {
+                "format_version": 1,
+                "model": source.state_dict(),
+                "mean_config": {"base_channels": 8, "levels": 2},
+                "epoch": 3,
+                "val_loss": 0.1,
+            },
+            checkpoint_path,
+        )
+
+        cfg = _residual_config(frequency=False, gabor=False, mean_weight=0.0)
+        cfg["modules"]["conditional_mean"].update({
+            "checkpoint": str(checkpoint_path),
+            "freeze": True,
+        })
+        model = SLMFBBDM.from_config(cfg)
+        assert model.mean_frozen is True
+        assert all(not parameter.requires_grad for parameter in model.mean_predictor.parameters())
+        assert all(
+            torch.allclose(parameter, torch.full_like(parameter, 0.125))
+            for parameter in model.mean_predictor.parameters()
+        )
+        model.train()
+        assert model.training is True
+        assert model.mean_predictor.training is False
+
+    def test_mean_checkpoint_rejects_unsupported_format(self, tmp_path):
+        from src.model.mean_predictor import LowFrequencyPETPredictor
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        predictor = LowFrequencyPETPredictor(base_channels=8, levels=2)
+        checkpoint_path = tmp_path / "bad_mean.pt"
+        torch.save(
+            {"format_version": 99, "model": predictor.state_dict()},
+            checkpoint_path,
+        )
+        cfg = _residual_config(frequency=False, gabor=False)
+        cfg["modules"]["conditional_mean"].update({
+            "checkpoint": str(checkpoint_path),
+            "freeze": True,
+        })
+        with pytest.raises(ValueError, match="format_version"):
+            SLMFBBDM.from_config(cfg)
+
     def test_invalid_module_combinations_fail_at_construction(self):
         from src.model.slmf_bbdm import SLMFBBDM
 

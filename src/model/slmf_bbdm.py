@@ -13,6 +13,7 @@ Disabled modules follow NoOp paths – zero new code branches in training.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -289,10 +290,16 @@ class SLMFBBDM(nn.Module):
         self.conditional_mean_enabled = bool(mean_cfg.get("enabled", False))
         self.residual_bridge_enabled = bool(residual_cfg.get("enabled", False))
         self.residual_frequency_enabled = bool(frequency_cfg.get("enabled", False))
+        self.mean_checkpoint = mean_cfg.get("checkpoint")
+        self.mean_frozen = bool(mean_cfg.get("freeze", False))
         self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
         self.mean_loss_weight = float(mean_cfg.get("loss_weight", 1.0))
         self.mean_charbonnier_eps = float(mean_cfg.get("charbonnier_eps", 1e-3))
 
+        if self.conditional_mean_enabled and self.mean_frozen and not self.mean_checkpoint:
+            raise ValueError(
+                "modules.conditional_mean.freeze=true requires a pretrained checkpoint"
+            )
         if self.residual_bridge_enabled and not self.conditional_mean_enabled:
             raise ValueError("modules.residual_bridge requires modules.conditional_mean.enabled=true")
         if self.residual_bridge_enabled and getattr(self.noise_schedule, "name", "") != "bbdm_bridge":
@@ -320,6 +327,35 @@ class SLMFBBDM(nn.Module):
                 base_channels=mean_cfg.get("base_channels", 32),
                 levels=mean_cfg.get("levels", 2),
             )
+            if self.mean_checkpoint:
+                checkpoint_path = Path(self.mean_checkpoint)
+                if not checkpoint_path.is_file():
+                    raise FileNotFoundError(
+                        f"Conditional-mean checkpoint not found: {checkpoint_path}"
+                    )
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                if not isinstance(checkpoint, dict):
+                    raise ValueError("Conditional-mean checkpoint must contain a mapping")
+                if checkpoint.get("format_version") != 1:
+                    raise ValueError(
+                        "Unsupported conditional-mean checkpoint format_version: "
+                        f"{checkpoint.get('format_version')!r}; expected 1"
+                    )
+                mean_state = checkpoint.get("model")
+                if not isinstance(mean_state, dict):
+                    raise ValueError(
+                        "Conditional-mean checkpoint is missing the 'model' state dict"
+                    )
+                self.mean_predictor.load_state_dict(mean_state, strict=True)
+                print(f"[SLMF-BBDM] Loaded conditional mean from {checkpoint_path}")
+            if self.mean_frozen:
+                for parameter in self.mean_predictor.parameters():
+                    parameter.requires_grad_(False)
+                self.mean_predictor.eval()
 
         self.residual_preconditioner: Optional[nn.Module] = None
         if self.residual_frequency_enabled:
@@ -391,6 +427,13 @@ class SLMFBBDM(nn.Module):
             p_gabor=drop_cfg.get("p_gabor", 0.1),
             enabled=drop_cfg.get("enabled", False),
         )
+
+    def train(self, mode: bool = True) -> SLMFBBDM:
+        """Set training mode while keeping a frozen conditional mean deterministic."""
+        super().train(mode)
+        if self.mean_frozen and self.mean_predictor is not None:
+            self.mean_predictor.eval()
+        return self
 
     # ------------------------------------------------------------------
     # Builder helpers
@@ -971,6 +1014,9 @@ class SLMFBBDM(nn.Module):
         logs["module/segmenter"] = torch.tensor(1.0 if self.segmenter_enabled else 0.0, device=device)
         logs["module/conditional_mean"] = torch.tensor(
             1.0 if self.conditional_mean_enabled else 0.0, device=device
+        )
+        logs["module/conditional_mean_frozen"] = torch.tensor(
+            1.0 if self.mean_frozen else 0.0, device=device
         )
         logs["module/residual_bridge"] = torch.tensor(
             1.0 if self.residual_bridge_enabled else 0.0, device=device
