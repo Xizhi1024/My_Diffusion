@@ -354,10 +354,7 @@ class Trainer:
             )
 
             # Select fixed tracked samples once (lazy — val_loader must exist)
-            if self._tracked_batch is None and self.val_loader is not None:
-                with self.ema_scope():
-                    pass  # no EMA needed for selection; keep symmetry
-                self._select_tracked_batch()
+            self._initialize_tracked_batch()
 
             # Evaluation (with EMA) + sample-based monitoring + model selection
             should_stop = False
@@ -412,6 +409,13 @@ class Trainer:
     # Validation & model selection
     # ------------------------------------------------------------------
 
+    def _initialize_tracked_batch(self) -> None:
+        """Lazily select validation samples without advancing training RNG."""
+        if self._tracked_batch is not None or self.val_loader is None:
+            return
+        with self._eval_rng_scope():
+            self._select_tracked_batch()
+
     def _select_tracked_batch(self) -> None:
         """Scan val_loader once and cache a fixed lesion-area-stratified batch.
 
@@ -422,6 +426,7 @@ class Trainer:
             return
         candidates: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
         wanted = set(self.tracked_sample_ids)
+        global_index = 0
         for batch in self.val_loader:
             masks = batch.get("mask")
             if masks is None:
@@ -433,16 +438,38 @@ class Trainer:
                     k: (v[i:i + 1].clone() if torch.is_tensor(v) else ([v[i]] if isinstance(v, list) else v))
                     for k, v in batch.items()
                 }
-                # patient / sample id for display
+                # Patient / sample ID for display and explicit sample tracking.
                 meta = batch.get("meta")
-                pid = ""
+                sample_meta: Dict[str, Any] = {}
                 if isinstance(meta, list) and i < len(meta):
-                    pid = str(meta[i].get("patient_id", "")) if isinstance(meta[i], dict) else ""
+                    if isinstance(meta[i], dict):
+                        sample_meta = meta[i]
                 elif isinstance(meta, dict):
-                    mv = meta.get("patient_id")
-                    if isinstance(mv, list) and i < len(mv):
-                        pid = str(mv[i])
-                sid = f"{pid or 's'}_{i}"
+                    for key, value in meta.items():
+                        if torch.is_tensor(value):
+                            if value.ndim == 0:
+                                sample_meta[key] = value.item()
+                            elif i < len(value):
+                                item = value[i]
+                                sample_meta[key] = item.item() if item.numel() == 1 else item
+                        elif isinstance(value, (list, tuple)) and i < len(value):
+                            sample_meta[key] = value[i]
+                        else:
+                            sample_meta[key] = value
+                patient_value = sample_meta.get("patient_id")
+                pid = "" if patient_value is None else str(patient_value)
+                source_value = next(
+                    (
+                        sample_meta[key]
+                        for key in ("sample_id", "slice_id", "filename")
+                        if sample_meta.get(key) is not None
+                        and str(sample_meta.get(key)) != ""
+                    ),
+                    global_index,
+                )
+                source_id = str(source_value)
+                sid = f"{pid}_{source_id}" if pid else f"s_{source_id}"
+                global_index += 1
                 if wanted and sid not in wanted and pid not in wanted:
                     continue
                 candidates.append((area, sample, {"sample_id": sid, "patient_id": pid}))
@@ -615,7 +642,12 @@ class Trainer:
 
     def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
         lesion, image, combined = self._model_selection_scores(metrics)
-        combined_improved = combined > self._best_combined_score
+        improvements = {
+            "best_lesion": lesion > self._best_lesion_score,
+            "best_image": image > self._best_image_score,
+            "best_combined": combined > self._best_combined_score,
+        }
+        combined_improved = improvements["best_combined"]
         if combined_improved:
             self._last_combined_improvement_epoch = self.epoch_count
             self._epochs_since_improve = 0
@@ -623,36 +655,43 @@ class Trainer:
             self._epochs_since_improve = (
                 self.epoch_count - self._last_combined_improvement_epoch
             )
+
+        # Update all scores before writing any file so every checkpoint saved
+        # in this evaluation carries the same complete monitoring snapshot.
+        if improvements["best_lesion"]:
+            self._best_lesion_score = lesion
+        if improvements["best_image"]:
+            self._best_image_score = image
+        if combined_improved:
+            self._best_combined_score = combined
+
         save_dir = ""
         if self.best_ckpts_enabled:
             exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
             save_dir = os.path.join("checkpoints", exp_name)
             os.makedirs(save_dir, exist_ok=True)
 
-        def _save(tag: str, score: float, best_key: str) -> None:
-            best = getattr(self, best_key, -1e9)
-            if score > best:
-                setattr(self, best_key, score)
-                if not self.best_ckpts_enabled:
-                    return
-                path = os.path.join(save_dir, f"ckpt_{tag}.pt")
-                torch.save({
-                    "model": self.model.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "scheduler": self.scheduler.state_dict(),
-                    "ema": self.ema.state_dict(),
-                    "epoch": self.epoch_count,
-                    "step": self.step_count,
-                    "score": score,
-                    "metrics": metrics,
-                    "config": self.config,
-                    "monitoring": self._monitoring_state_dict(),
-                }, path)
-                print(f"  ★ new best {tag} (score={score:.4f}) → {path}")
+        def _save(tag: str, score: float) -> None:
+            if not self.best_ckpts_enabled or not improvements[tag]:
+                return
+            path = os.path.join(save_dir, f"ckpt_{tag}.pt")
+            torch.save({
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+                "ema": self.ema.state_dict(),
+                "epoch": self.epoch_count,
+                "step": self.step_count,
+                "score": score,
+                "metrics": metrics,
+                "config": self.config,
+                "monitoring": self._monitoring_state_dict(),
+            }, path)
+            print(f"  ★ new best {tag} (score={score:.4f}) → {path}")
 
-        _save("best_lesion", lesion, "_best_lesion_score")
-        _save("best_image", image, "_best_image_score")
-        _save("best_combined", combined, "_best_combined_score")
+        _save("best_lesion", lesion)
+        _save("best_image", image)
+        _save("best_combined", combined)
         return combined_improved
 
     def _check_early_stopping(self, improved: bool) -> bool:

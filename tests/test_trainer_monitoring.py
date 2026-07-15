@@ -88,6 +88,41 @@ def test_eval_rng_scope_is_repeatable_without_advancing_training_rng():
     assert torch.equal(first, second)
 
 
+def test_initial_tracked_batch_scan_does_not_advance_training_rng():
+    class TwoSampleDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            mask = torch.zeros(1, 4, 4)
+            mask.flatten()[: index + 1] = 1.0
+            return {
+                "ct": torch.zeros(1, 4, 4),
+                "pet": torch.zeros(1, 4, 4),
+                "mask": mask,
+            }
+
+    trainer = object.__new__(Trainer)
+    trainer.device = "cpu"
+    trainer.eval_seed = 42
+    trainer.eval_num_samples = 2
+    trainer.tracked_sample_ids = []
+    trainer.val_loader = torch.utils.data.DataLoader(
+        TwoSampleDataset(), batch_size=1, shuffle=False
+    )
+    trainer._tracked_batch = None
+    trainer._tracked_meta = None
+
+    torch.manual_seed(999)
+    before = torch.random.get_rng_state().clone()
+    trainer._initialize_tracked_batch()
+    after = torch.random.get_rng_state().clone()
+
+    assert torch.equal(before, after)
+    assert trainer._tracked_batch is not None
+    assert len({row["sample_id"] for row in trainer._tracked_meta}) == 2
+
+
 def test_checkpoint_selection_returns_one_shared_combined_improvement():
     trainer = object.__new__(Trainer)
     trainer.best_ckpts_enabled = False
@@ -111,6 +146,50 @@ def test_checkpoint_selection_returns_one_shared_combined_improvement():
     assert trainer._save_best_checkpoints(metrics) is True
     assert trainer._last_combined_improvement_epoch == 50
     assert trainer._save_best_checkpoints(metrics) is False
+
+
+def test_all_best_checkpoints_capture_one_atomic_monitoring_snapshot(monkeypatch):
+    class HasState:
+        def state_dict(self):
+            return {}
+
+    trainer = object.__new__(Trainer)
+    trainer.best_ckpts_enabled = True
+    trainer.best_combined_alpha = 0.5
+    trainer.best_stripe_penalty = 0.3
+    trainer._best_combined_score = -1e9
+    trainer._best_lesion_score = -1e9
+    trainer._best_image_score = -1e9
+    trainer._last_combined_improvement_epoch = None
+    trainer._epochs_since_improve = 0
+    trainer.epoch_count = 50
+    trainer.step_count = 10
+    trainer.config = {"experiment": {"name": "atomic-monitoring-test"}}
+    trainer.model = HasState()
+    trainer.optimizer = HasState()
+    trainer.scheduler = HasState()
+    trainer.ema = HasState()
+    metrics = {
+        "val/mae": 0.1,
+        "val/ssim": 0.8,
+        "val/stripe_score": 1.0,
+        "val/lesion_peak_error_norm": 0.2,
+        "val/lesion_centroid_distance": 2.0,
+        "val/failure_rate": 0.0,
+    }
+    snapshots = []
+    monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        torch,
+        "save",
+        lambda payload, path: snapshots.append((path, dict(payload["monitoring"]))),
+    )
+
+    trainer._save_best_checkpoints(metrics)
+
+    assert len(snapshots) == 3
+    assert all(snapshot == snapshots[0][1] for _, snapshot in snapshots)
+    assert snapshots[0][1] == trainer._monitoring_state_dict()
 
 
 def test_early_stopping_patience_is_measured_in_epochs():
