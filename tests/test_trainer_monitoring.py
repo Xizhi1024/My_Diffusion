@@ -6,6 +6,7 @@ import sys
 import numpy as np
 import pytest
 import torch
+import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -121,3 +122,11 @@ def test_early_stopping_improvement_resets_epoch_origin():
     assert trainer._check_early_stopping(improved=True) is False
     assert trainer._last_combined_improvement_epoch == 80
     assert trainer._epochs_since_improve == 0
+
+
+def test_png_baseline_declares_deterministic_eval_seed():
+    with open("configs/experiments/slmf_png_baseline.yaml", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+
+    assert cfg["runtime"]["eval_num_samples"] == 16
+    assert cfg["runtime"]["eval_seed"] == cfg["experiment"]["seed"]

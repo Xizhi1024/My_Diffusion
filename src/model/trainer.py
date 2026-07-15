@@ -340,6 +340,7 @@ class Trainer:
 
         while self.epoch_count < num_epochs:
             train_logs = self.train_epoch()
+            tracked_sample_result = None
 
             total = train_logs.get("loss/total", 0)
             elapsed = time.time() - self.start_time
@@ -361,17 +362,31 @@ class Trainer:
             # Evaluation (with EMA) + sample-based monitoring + model selection
             should_stop = False
             if self.val_loader is not None and self.epoch_count % self.eval_interval == 0:
+                val_metrics = None
+                combined_improved = False
                 with self.ema_scope():
                     eval_logs = [self.eval_step(b) for b in self.val_loader]
+                    if self._tracked_batch is not None:
+                        tracked_sample_result = self._sample_with_eval_seed(self._tracked_batch)
+                        val_metrics = self._compute_val_sample_metrics(
+                            self._tracked_batch,
+                            tracked_sample_result["synthetic_pet"],
+                        )
+                        # Scores use EMA weights, so best checkpoints must store them too.
+                        combined_improved = self._save_best_checkpoints(val_metrics)
                 k0 = list(eval_logs[0].keys())
                 avg_eval = {k: sum(d.get(k, 0) for d in eval_logs) / len(eval_logs) for k in k0}
                 print(f"  Eval  Loss: {avg_eval.get('loss/total', 0):.4f}")
+                print(
+                    "  Eval components: "
+                    f"base={avg_eval.get('loss/base_diffusion', float('nan')):.4f}  "
+                    f"roi={avg_eval.get('loss/lesion_roi_l1/loss', float('nan')):.4f}  "
+                    f"topk={avg_eval.get('loss/topk_lesion/loss', float('nan')):.4f}  "
+                    f"ranking={avg_eval.get('loss/outside_peak_ranking/loss', float('nan')):.4f}"
+                )
 
-                if self._tracked_batch is not None:
-                    with self.ema_scope():
-                        val_metrics = self._compute_val_sample_metrics(self._tracked_batch)
+                if val_metrics is not None:
                     print("  " + "  ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
-                    combined_improved = self._save_best_checkpoints(val_metrics)
                     if self._check_early_stopping(combined_improved):
                         should_stop = True
 
@@ -381,9 +396,10 @@ class Trainer:
 
             # Sampling — fixed tracked samples (not next(iter(val_loader)))
             if self._tracked_batch is not None and self.epoch_count % self.sample_interval == 0:
-                with self.ema_scope():
-                    sample_result = self.model.sample(_to_device(self._tracked_batch, self.device))
-                synth_pet = sample_result["synthetic_pet"]
+                if tracked_sample_result is None:
+                    with self.ema_scope():
+                        tracked_sample_result = self._sample_with_eval_seed(self._tracked_batch)
+                synth_pet = tracked_sample_result["synthetic_pet"]
                 print(f"  Sample PET range: [{synth_pet.min().item():.4f}, {synth_pet.max().item():.4f}]")
                 self._save_sample_grid(self._tracked_batch, synth_pet)
 

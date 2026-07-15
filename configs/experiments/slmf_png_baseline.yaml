@@ -43,6 +43,7 @@ runtime:
   log_interval: 10
   eval_interval: 50
   eval_num_samples: 16
+  eval_seed: 42                     # fixed sampling noise for cross-epoch comparison
   eval_sampling_steps: 20
   sample_interval: 50
   save_interval: 50
