@@ -293,6 +293,7 @@ class SLMFBBDM(nn.Module):
         self.conditional_mean_enabled = bool(mean_cfg.get("enabled", False))
         self.residual_bridge_enabled = bool(residual_cfg.get("enabled", False))
         self.residual_frequency_enabled = bool(frequency_cfg.get("enabled", False))
+        self.residual_frequency_mode = str(frequency_cfg.get("mode", "legacy"))
         self.mean_checkpoint = mean_cfg.get("checkpoint")
         self.mean_frozen = bool(mean_cfg.get("freeze", False))
         self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
@@ -309,8 +310,22 @@ class SLMFBBDM(nn.Module):
             raise ValueError("modules.residual_bridge requires the bbdm_bridge noise schedule")
         if self.residual_frequency_enabled and not self.residual_bridge_enabled:
             raise ValueError("modules.residual_frequency requires modules.residual_bridge.enabled=true")
+        if self.residual_frequency_mode not in {"legacy", "boundary_reliable"}:
+            raise ValueError(
+                "modules.residual_frequency.mode must be 'legacy' or "
+                "'boundary_reliable'"
+            )
         use_gabor_gate = bool(frequency_cfg.get("use_gabor_gate", False))
-        if use_gabor_gate and not self.gabor_routes.get("enabled", False):
+        use_directional_reliability = bool(
+            frequency_cfg.get("use_directional_reliability", False)
+        )
+        if (
+            (use_gabor_gate and self.residual_frequency_mode == "legacy")
+            or (
+                use_directional_reliability
+                and self.residual_frequency_mode == "boundary_reliable"
+            )
+        ) and not self.gabor_routes.get("enabled", False):
             raise ValueError("Residual-frequency Gabor gating requires modules.gabor.enabled=true")
         configured_losses = loss_configs or {}
         residual_wavelet_cfg = configured_losses.get("residual_wavelet", {})
@@ -362,18 +377,43 @@ class SLMFBBDM(nn.Module):
 
         self.residual_preconditioner: Optional[nn.Module] = None
         if self.residual_frequency_enabled:
-            from .frequency.residual_preconditioner import ResidualFrequencyPreconditioner
             gabor_orientations = frequency_cfg.get(
                 "gabor_orientations", gabor_cfg.get("orientations", 8)
             )
-            self.residual_preconditioner = ResidualFrequencyPreconditioner(
-                output_channels=tuple(frequency_cfg.get("output_channels", [256, 256, 128, 64])),
-                band_scales=tuple(frequency_cfg.get("band_scales", [1.0, 0.5, 0.25])),
-                inject_wavelet=frequency_cfg.get("inject_wavelet", True),
-                use_gabor_gate=use_gabor_gate,
-                gabor_orientations=gabor_orientations,
-                gate_strength=frequency_cfg.get("gate_strength", 0.1),
-            )
+            if self.residual_frequency_mode == "legacy":
+                from .frequency.residual_preconditioner import ResidualFrequencyPreconditioner
+
+                self.residual_preconditioner = ResidualFrequencyPreconditioner(
+                    output_channels=tuple(frequency_cfg.get("output_channels", [256, 256, 128, 64])),
+                    band_scales=tuple(frequency_cfg.get("band_scales", [1.0, 0.5, 0.25])),
+                    inject_wavelet=frequency_cfg.get("inject_wavelet", True),
+                    use_gabor_gate=use_gabor_gate,
+                    gabor_orientations=gabor_orientations,
+                    gate_strength=frequency_cfg.get("gate_strength", 0.1),
+                    state_modulation=frequency_cfg.get("state_modulation", True),
+                )
+            else:
+                from .frequency.boundary_reliable import (
+                    BoundaryReliableFrequencyInjector,
+                )
+
+                self.residual_preconditioner = BoundaryReliableFrequencyInjector(
+                    output_channels=tuple(frequency_cfg.get("output_channels", [256, 256, 128, 64])),
+                    band_scales=tuple(frequency_cfg.get("band_scales", [0.5, 0.25])),
+                    use_noise_release=frequency_cfg.get("use_noise_release", True),
+                    use_ct_reliability=frequency_cfg.get("use_ct_reliability", True),
+                    use_subband_gates=frequency_cfg.get("use_subband_gates", True),
+                    use_directional_reliability=use_directional_reliability,
+                    gabor_orientations=gabor_orientations,
+                    gate_max=frequency_cfg.get("gate_max", 0.25),
+                    snr_center=frequency_cfg.get("snr_center", 0.0),
+                    snr_temperature=frequency_cfg.get("snr_temperature", 2.0),
+                    cross_temperature=frequency_cfg.get("cross_temperature", 1.0),
+                    content_hidden_channels=frequency_cfg.get(
+                        "content_hidden_channels", 16
+                    ),
+                )
+        self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
 
         # ---- Metadata FiLM ----
         meta_cfg = meta_config or {}
@@ -771,17 +811,70 @@ class SLMFBBDM(nn.Module):
         timesteps: Optional[torch.Tensor],
         noisy_residual: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
+        self._last_frequency_diagnostics = {}
         if not self.residual_frequency_enabled:
             return []
         if timesteps is None or noisy_residual is None or self.residual_preconditioner is None:
             raise ValueError("Residual-frequency injection requires noisy_residual and timesteps")
-        injections, _ = self.residual_preconditioner(
-            noisy_residual,
-            timesteps,
-            self.noise_schedule,
-            condition.maps.get("gabor_orientation"),
-        )
+        if self.residual_frequency_mode == "boundary_reliable":
+            injections, diagnostics = self.residual_preconditioner(
+                noisy_residual,
+                timesteps,
+                self.noise_schedule,
+                condition.maps["ct"],
+                gabor_orientation=condition.maps.get("gabor_orientation"),
+            )
+            self._last_frequency_diagnostics = diagnostics
+            condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]
+        else:
+            injections, diagnostics = self.residual_preconditioner(
+                noisy_residual,
+                timesteps,
+                self.noise_schedule,
+                condition.maps.get("gabor_orientation"),
+            )
+            self._last_frequency_diagnostics = diagnostics
         return injections
+
+    def _build_adapter_injections(
+        self,
+        condition: ConditionBundle,
+        timesteps: Optional[torch.Tensor] = None,
+        hw_list: Optional[List[int]] = None,
+    ) -> List[torch.Tensor]:
+        """Build only the existing CT/organ/Gabor/hotspot adapter branch."""
+        if not self.zero_adapter_enabled:
+            return []
+
+        ct_feats = [condition.maps[f"ct_feat_{i}"] for i in range(4)]
+        organ_feats = [
+            condition.maps.get("organ_feat_1"),
+            condition.maps.get("organ_feat_2"),
+            condition.maps.get("organ_feat_3"),
+            None,
+        ]
+        if self.gabor_routes.get("enabled", False) and self.gabor_routes.get("inject_adapter", False):
+            gabor_feat = condition.maps.get("gabor_feat")
+        else:
+            gabor_feat = None
+        hotspot = condition.maps.get("hotspot_prior")
+        if hw_list is None:
+            hw_list = [
+                ct_feats[0].shape[2],
+                ct_feats[0].shape[2] // 2,
+                ct_feats[0].shape[2] // 4,
+                ct_feats[0].shape[2] // 8,
+            ]
+        tau = self.noise_schedule.get_tau(timesteps) if timesteps is not None else None
+        injections = self.adapter.get_zero_conv_outputs(
+            ct_feats,
+            organ_feats,
+            gabor_feat,
+            hotspot,
+            hw_list,
+            tau=tau,
+        )
+        return list(reversed(injections)) if injections else []
 
     def _build_skip_injections(
         self,
@@ -795,36 +888,11 @@ class SLMFBBDM(nn.Module):
         When adapter is disabled, returns empty injections (no-op).
         Applies time-varying beta modulation from the adapter.
         """
-        if not self.zero_adapter_enabled:
-            return self._build_frequency_injections(condition, timesteps, noisy_residual)
-
-        ct_feats = [condition.maps[f"ct_feat_{i}"] for i in range(4)]
-
-        organ_feats = [
-            condition.maps.get("organ_feat_1"),
-            condition.maps.get("organ_feat_2"),
-            condition.maps.get("organ_feat_3"),
-            None,  # L3 uses nearest organ feat
-        ]
-        # Gabor reaches the adapter only when enabled AND routed to the adapter.
-        # When the route is closed we pass None so the adapter falls back to a
-        # strict zero placeholder — Gabor features must not leak into the UNet.
-        if self.gabor_routes.get("enabled", False) and self.gabor_routes.get("inject_adapter", False):
-            gabor_feat = condition.maps.get("gabor_feat")
-        else:
-            gabor_feat = None
-        hotspot = condition.maps.get("hotspot_prior")
-
-        if hw_list is None:
-            hw_list = [ct_feats[0].shape[2], ct_feats[0].shape[2] // 2,
-                       ct_feats[0].shape[2] // 4, ct_feats[0].shape[2] // 8]
-
-        tau = self.noise_schedule.get_tau(timesteps) if timesteps is not None else None
-        injections = self.adapter.get_zero_conv_outputs(
-            ct_feats, organ_feats, gabor_feat, hotspot, hw_list, tau=tau,
+        adapter_injections = self._build_adapter_injections(
+            condition,
+            timesteps=timesteps,
+            hw_list=hw_list,
         )
-        # Reverse: adapter outputs [shallow→deep], decoder consumes [deep→shallow]
-        adapter_injections = list(reversed(injections)) if injections else []
         frequency_injections = self._build_frequency_injections(
             condition, timesteps, noisy_residual
         )
@@ -873,7 +941,6 @@ class SLMFBBDM(nn.Module):
 
         # 1. Build condition bundle
         condition = self.build_condition_bundle(batch, timesteps)
-
         # 2. Forward diffusion (add noise)
         # BBDM bridge needs x_source; DDPM ignores it
         noisy_x = _add_noise(
@@ -891,7 +958,9 @@ class SLMFBBDM(nn.Module):
         if (
             self.residual_frequency_enabled
             and self.residual_preconditioner is not None
+            and self.residual_frequency_mode == "legacy"
             and not self.residual_preconditioner.inject_wavelet
+            and self.residual_preconditioner.state_modulation
         ):
             denoiser_state = self.residual_preconditioner.modulate_residual(
                 noisy_x, condition.maps.get("gabor_orientation")
@@ -1046,6 +1115,17 @@ class SLMFBBDM(nn.Module):
         logs["module/residual_frequency"] = torch.tensor(
             1.0 if self.residual_frequency_enabled else 0.0, device=device
         )
+        if self.residual_frequency_mode == "boundary_reliable":
+            for level, key in ((2, "gates_l2"), (1, "gates_l1")):
+                gates = self._last_frequency_diagnostics.get(key)
+                if gates is not None:
+                    for index, band in enumerate(("lh", "hl", "hh")):
+                        logs[f"frequency/gate_l{level}_{band}"] = (
+                            gates[:, index].mean().detach()
+                        )
+            gate_tv = self._last_frequency_diagnostics.get("gate_tv")
+            if gate_tv is not None:
+                logs["frequency/gate_tv"] = gate_tv.detach()
         logs["module/wavelet_unet"] = torch.tensor(
             1.0 if self.wavelet_unet_enabled else 0.0, device=device
         )
@@ -1108,7 +1188,6 @@ class SLMFBBDM(nn.Module):
         noise = torch.randn_like(x_source)
         timesteps_T = torch.full((B,), T - 1, device=device, dtype=torch.long)
         condition = self.build_condition_bundle(batch, timesteps_T)
-
         if is_bbdm:
             # x_T = m_T·CT + (1-m_T)·0 + σ_T·ε ≈ CT + noise
             x_t = _add_noise(self.noise_schedule, torch.zeros_like(x_source),
@@ -1142,7 +1221,9 @@ class SLMFBBDM(nn.Module):
             if (
                 self.residual_frequency_enabled
                 and self.residual_preconditioner is not None
+                and self.residual_frequency_mode == "legacy"
                 and not self.residual_preconditioner.inject_wavelet
+                and self.residual_preconditioner.state_modulation
             ):
                 denoiser_state = self.residual_preconditioner.modulate_residual(
                     x_t, condition.maps.get("gabor_orientation")

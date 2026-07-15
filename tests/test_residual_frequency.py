@@ -332,6 +332,140 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    def test_boundary_reliable_mode_constructs_without_noisy_state_modulation(self):
+        from src.model.frequency.boundary_reliable import (
+            BoundaryReliableFrequencyInjector,
+        )
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=False)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": False,
+        })
+
+        model = SLMFBBDM.from_config(cfg)
+
+        assert model.residual_frequency_mode == "boundary_reliable"
+        assert isinstance(
+            model.residual_preconditioner, BoundaryReliableFrequencyInjector
+        )
+        assert not hasattr(model.residual_preconditioner, "modulate_residual")
+
+    def test_boundary_reliable_frequency_is_added_without_gating_adapter_output(
+        self, monkeypatch
+    ):
+        from src.model.interfaces import ConditionBundle
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=False)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": False,
+        })
+        cfg["modules"]["zero_adapter"]["enabled"] = True
+        cfg["modules"]["organ_prior"] = {"enabled": True, "organ_channels": 6}
+        model = SLMFBBDM.from_config(cfg)
+        shapes = [
+            (1, 256, 4, 4),
+            (1, 256, 8, 8),
+            (1, 128, 16, 16),
+            (1, 64, 32, 32),
+        ]
+        adapter = [torch.full(shape, 2.0) for shape in shapes]
+        frequency = [torch.full(shape, 3.0) for shape in shapes]
+        monkeypatch.setattr(
+            model, "_build_adapter_injections", lambda *args, **kwargs: adapter
+        )
+        monkeypatch.setattr(
+            model, "_build_frequency_injections", lambda *args, **kwargs: frequency
+        )
+
+        combined = model._build_skip_injections(
+            ConditionBundle.empty(),
+            torch.tensor([10]),
+            noisy_residual=torch.randn(1, 1, 32, 32),
+        )
+
+        assert all(torch.all(tensor == 5.0) for tensor in combined)
+
+    def test_boundary_reliable_forward_routes_only_inference_available_ct_and_gabor(
+        self, monkeypatch
+    ):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=True)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": True,
+        })
+        model = SLMFBBDM.from_config(cfg)
+        injector = model.residual_preconditioner
+        original_forward = injector.forward
+        captured = {}
+
+        def _capture(*args, **kwargs):
+            captured["ct"] = args[3]
+            captured["gabor_orientation"] = kwargs.get("gabor_orientation")
+            captured["keywords"] = set(kwargs)
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(injector, "forward", _capture)
+        loss, _ = model(_model_batch(), timesteps=torch.tensor([25]))
+
+        assert torch.isfinite(loss)
+        assert captured["ct"].shape == (1, 1, 32, 32)
+        assert captured["gabor_orientation"].shape == (1, 4, 32, 32)
+        assert captured["keywords"] == {"gabor_orientation"}
+
+    def test_boundary_reliable_forward_logs_native_subband_gates_and_tv(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=True)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": True,
+        })
+        model = SLMFBBDM.from_config(cfg)
+
+        _, logs = model(_model_batch(), timesteps=torch.tensor([25]))
+
+        for level in (2, 1):
+            for band in ("lh", "hl", "hh"):
+                assert f"frequency/gate_l{level}_{band}" in logs
+        assert "frequency/gate_tv" in logs
+        assert torch.isfinite(logs["frequency/gate_tv"])
+
+    def test_legacy_state_modulation_can_be_disabled_without_disabling_skips(
+        self, monkeypatch
+    ):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=True)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "legacy",
+            "inject_wavelet": False,
+            "state_modulation": False,
+        })
+        model = SLMFBBDM.from_config(cfg)
+        calls = []
+
+        def _unexpected(*args, **kwargs):
+            calls.append(True)
+            return args[0]
+
+        monkeypatch.setattr(
+            model.residual_preconditioner, "modulate_residual", _unexpected
+        )
+        loss, _ = model(_model_batch(), timesteps=torch.tensor([25]))
+
+        assert torch.isfinite(loss)
+        assert calls == []
+
     def test_wavelet_unet_is_selected_only_when_explicitly_enabled(self):
         from src.model.bbdm_unet import BBDMUNet
         from src.model.slmf_bbdm import SLMFBBDM

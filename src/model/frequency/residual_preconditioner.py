@@ -57,6 +57,7 @@ class ResidualFrequencyPreconditioner(nn.Module):
         use_gabor_gate: bool = False,
         gabor_orientations: int = 8,
         gate_strength: float = 0.1,
+        state_modulation: bool = True,
     ):
         super().__init__()
         if len(output_channels) != 4:
@@ -71,6 +72,7 @@ class ResidualFrequencyPreconditioner(nn.Module):
         self.inject_wavelet = bool(inject_wavelet)
         self.use_gabor_gate = bool(use_gabor_gate)
         self.gate_strength = float(gate_strength)
+        self.state_modulation = bool(state_modulation)
         self.band_gates = _IndependentBandGates()
         self.gabor_gate = nn.Conv2d(gabor_orientations, 1, 1)
         nn.init.zeros_(self.gabor_gate.weight)
