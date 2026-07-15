@@ -638,6 +638,22 @@ class SLMFBBDM(nn.Module):
                 enabled=enabled,
                 weight=weight,
             )
+        elif name == "boundary_frequency":
+            from .loss_terms.boundary_frequency import BoundaryFrequencyLoss
+            return BoundaryFrequencyLoss(
+                lesion_weight=cfg.get("lesion_weight", 1.0),
+                anatomy_weight=cfg.get("anatomy_weight", 0.5),
+                organ_weight=cfg.get("organ_weight", 0.5),
+                wavelet_weight=cfg.get("wavelet_weight", 0.25),
+                boundary_radius=cfg.get("boundary_radius", 2),
+                epsilon=cfg.get("epsilon", 1e-3),
+                active_tau_max=cfg.get("active_tau_max", 0.7),
+                enabled=enabled,
+                weight=weight,
+            )
+        elif name == "frequency_gate_tv":
+            from .loss_terms.frequency_gate_tv import FrequencyGateTVLoss
+            return FrequencyGateTVLoss(enabled=enabled, weight=weight)
         elif name == "roi_suv":
             from .loss_terms.roi_suv import ROISUVLoss
             return ROISUVLoss(
@@ -826,6 +842,9 @@ class SLMFBBDM(nn.Module):
             )
             self._last_frequency_diagnostics = diagnostics
             condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]
+            condition.scalars["frequency_noise_reliability"] = diagnostics[
+                "noise_reliability"
+            ].mean(dim=1)
         else:
             injections, diagnostics = self.residual_preconditioner(
                 noisy_residual,
