@@ -1,0 +1,27 @@
+/Data/
+__pycache__/
+*.pyc
+.gitignore
+wandb/
+checkpoints/
+samples/
+test_results/
+notebook/
+notebook/test-2/
+.claude/
+deep-research-report.md
+*.z
+.pixi/
+.worktrees/
+epoch_*.png
+plan.md
+.codex
+.mcp.json
+diffusion 论文/
+pixi.lock
+pixi.toml
+/cache/*
+/results/*
+/data.zip
+/My_diffusion.zip
+/vis_epoch1000/*
