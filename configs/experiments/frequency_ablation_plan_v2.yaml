@@ -1,0 +1,67 @@
+base_config: configs/experiments/slmf_png_residual_frequency.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/frequency_ablations_v2
+reference_id: R0
+top_k: 2
+
+mean_pretrain:
+  enabled: true
+  experiment: freq_mean_pretrain_v2
+  output_dir: checkpoints/freq_mean_pretrain_v2
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  epochs: 30
+  seed: 42
+
+common_train_overrides:
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+variants:
+  - id: R0
+    preset: freq_r0
+  - id: R2
+    preset: freq_r2
+  - id: F1
+    preset: freq_f1
+  - id: F2
+    preset: freq_f2
+  - id: F3
+    preset: freq_f3
+  - id: F4
+    preset: freq_f4
+
+screen:
+  experiment_prefix: freq_v2_screen
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 16
+  seed: 42
+  mc_steps: 20
+
+promote:
+  experiment_prefix: freq_v2_full
+  epochs: 300
+  eval_interval: 50
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: true
+
+hard_gates:
+  failure_any_mean:
+    direction: lower
+    max_delta: 0.0625
+  false_hotspot_density_mean:
+    direction: lower
+    max_ratio: 1.25
+    epsilon: 1e-6
+  stripe_excess_mean:
+    direction: lower
+    max_delta: 0.05
+  ssim_mean:
+    direction: higher
+    max_delta: 0.03

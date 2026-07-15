@@ -67,6 +67,9 @@ train-png-baseline = "python scripts/train_v2.py --config configs/experiments/sl
 # PNG residual-frequency R0/R2/F1-F4 screen + artifact gates + clean top-K retraining
 train-frequency-ablations = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan.yaml --stage all"
 
+# V2: pretrain one shared PET mean, freeze it, then screen and promote variants
+train-frequency-ablations-v2 = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan_v2.yaml --stage all"
+
 # PNG baseline 5-epoch 过拟合冒烟测试（假数据，验证管线）
 train-png-smoke = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml --override data.use_fake_data=true --override training.num_epochs=5 --override runtime.eval_interval=2 --override runtime.save_interval=5 --override runtime.sample_interval=2"
 

@@ -224,6 +224,24 @@ def test_v2_manifest_runs_mean_first_and_applies_common_train_overrides():
     assert "modules.conditional_mean.loss_weight=0.0" in train_text
 
 
+def test_v2_plan_keeps_v1_outputs_separate_and_freezes_shared_mean():
+    from pathlib import Path
+
+    import yaml
+
+    plan_path = Path("configs/experiments/frequency_ablation_plan_v2.yaml")
+    with plan_path.open("r", encoding="utf-8") as handle:
+        plan = yaml.safe_load(handle)
+
+    assert plan["output_dir"] == "results/frequency_ablations_v2"
+    assert plan["mean_pretrain"]["epochs"] == 30
+    assert plan["common_train_overrides"]["model.initialization_seed"] == 4242
+    assert plan["common_train_overrides"]["modules.conditional_mean.freeze"] is True
+    assert plan["common_train_overrides"]["modules.conditional_mean.loss_weight"] == 0.0
+    assert plan["screen"]["experiment_prefix"] == "freq_v2_screen"
+    assert plan["promote"]["experiment_prefix"] == "freq_v2_full"
+
+
 def test_ranking_json_sanitizes_unavailable_clinical_nan(tmp_path):
     import json
     import math
