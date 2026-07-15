@@ -137,6 +137,7 @@ def build_train_command(
     seed: int,
     eval_interval: int,
     early_stopping_enabled: bool = False,
+    extra_overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> List[str]:
     overrides = [
         f"experiment.name={experiment}",
@@ -149,6 +150,7 @@ def build_train_command(
         f"runtime.save_interval={eval_interval}",
         f"runtime.sample_interval={eval_interval}",
     ]
+    overrides.extend(_normalise_overrides(extra_overrides))
     command = [
         python,
         "scripts/train_v2.py",
@@ -157,6 +159,52 @@ def build_train_command(
         "--ablation-config", ablation_config,
     ]
     for override in overrides:
+        command.extend(["--override", override])
+    return command
+
+
+def _override_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, dict)):
+        return yaml.safe_dump(
+            value,
+            default_flow_style=True,
+            sort_keys=False,
+        ).strip()
+    return str(value)
+
+
+def _normalise_overrides(
+    overrides: Mapping[str, Any] | Sequence[str] | None,
+) -> List[str]:
+    if overrides is None:
+        return []
+    if isinstance(overrides, Mapping):
+        return [f"{key}={_override_value(value)}" for key, value in overrides.items()]
+    return [str(override) for override in overrides]
+
+
+def build_mean_pretrain_command(
+    *,
+    python: str,
+    config: str,
+    output_dir: str,
+    epochs: int,
+    seed: int,
+    overrides: Mapping[str, Any] | Sequence[str] | None = None,
+) -> List[str]:
+    command = [
+        python,
+        "scripts/pretrain_conditional_mean.py",
+        "--config", config,
+        "--output-dir", output_dir,
+        "--epochs", str(epochs),
+        "--seed", str(seed),
+    ]
+    for override in _normalise_overrides(overrides):
         command.extend(["--override", override])
     return command
 
@@ -217,6 +265,7 @@ def _run_manifest_entry(
             seed=int(settings["seed"]),
             eval_interval=int(settings["eval_interval"]),
             early_stopping_enabled=bool(settings.get("early_stopping", False)),
+            extra_overrides=plan.get("common_train_overrides"),
         ),
         "eval_command": build_eval_command(
             python=python,
@@ -239,8 +288,37 @@ def build_execution_manifest(
     promoted_ids: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
     variants = list(plan.get("variants", []))
+    mean_run = None
     screen_runs = []
     promotion_runs = []
+    mean_settings = plan.get("mean_pretrain", {})
+    if (
+        stage in {"mean", "all"}
+        and isinstance(mean_settings, Mapping)
+        and mean_settings.get("enabled", False)
+    ):
+        experiment = str(mean_settings.get("experiment", "freq_mean_pretrain"))
+        output_dir = str(
+            mean_settings.get("output_dir", Path("checkpoints") / experiment)
+        )
+        checkpoint = str(
+            mean_settings.get("checkpoint", Path(output_dir) / "mean_best.pt")
+        )
+        mean_overrides = dict(mean_settings.get("overrides", {}))
+        mean_overrides.setdefault("experiment.name", experiment)
+        mean_run = {
+            "experiment": experiment,
+            "output_dir": output_dir,
+            "checkpoint": checkpoint,
+            "command": build_mean_pretrain_command(
+                python=python,
+                config=str(plan["base_config"]),
+                output_dir=output_dir,
+                epochs=int(mean_settings.get("epochs", 30)),
+                seed=int(mean_settings.get("seed", 42)),
+                overrides=mean_overrides,
+            ),
+        }
     if stage in {"screen", "all"}:
         screen_runs = [
             _run_manifest_entry(plan, variant, plan["screen"], python, "screen")
@@ -254,6 +332,7 @@ def build_execution_manifest(
         ]
     return {
         "stage": stage,
+        "mean_run": mean_run,
         "screen_runs": screen_runs,
         "promotion_runs": promotion_runs,
     }
@@ -262,6 +341,31 @@ def build_execution_manifest(
 def _execute(command: Sequence[str]) -> None:
     print("\n+ " + subprocess.list2cmdline(list(command)), flush=True)
     subprocess.run(list(command), check=True)
+
+
+def _run_mean(entry: Mapping[str, Any], force: bool) -> None:
+    checkpoint = Path(str(entry["checkpoint"]))
+    if force or not checkpoint.exists():
+        _execute(entry["command"])
+    else:
+        print(f"[skip mean] checkpoint exists: {checkpoint}")
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"Mean pretraining did not produce {checkpoint}"
+        )
+
+
+def _require_planned_mean_checkpoint(plan: Mapping[str, Any]) -> None:
+    mean_settings = plan.get("mean_pretrain", {})
+    if not isinstance(mean_settings, Mapping) or not mean_settings.get("enabled", False):
+        return
+    experiment = str(mean_settings.get("experiment", "freq_mean_pretrain"))
+    output_dir = Path(str(mean_settings.get("output_dir", Path("checkpoints") / experiment)))
+    checkpoint = Path(str(mean_settings.get("checkpoint", output_dir / "mean_best.pt")))
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"Required mean checkpoint is missing: {checkpoint}; run --stage mean first"
+        )
 
 
 def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict[str, Any]]:
@@ -344,7 +448,11 @@ def main() -> None:
         default="configs/experiments/frequency_ablation_plan.yaml",
         help="Ablation plan YAML",
     )
-    parser.add_argument("--stage", choices=["screen", "promote", "all"], default="all")
+    parser.add_argument(
+        "--stage",
+        choices=["mean", "screen", "promote", "all"],
+        default="all",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Re-run existing train/eval outputs")
     args = parser.parse_args()
@@ -362,13 +470,27 @@ def main() -> None:
         with destination.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, ensure_ascii=False)
         print(f"Dry-run manifest saved to {destination}")
+        if manifest["mean_run"] is not None:
+            print(subprocess.list2cmdline(manifest["mean_run"]["command"]))
         for entry in [*manifest["screen_runs"], *manifest["promotion_runs"]]:
             print(subprocess.list2cmdline(entry["train_command"]))
             print(subprocess.list2cmdline(entry["eval_command"]))
         return
 
+    if args.stage in {"mean", "all"}:
+        mean_manifest = build_execution_manifest(
+            plan,
+            python=sys.executable,
+            stage="mean",
+        )
+        if mean_manifest["mean_run"] is not None:
+            _run_mean(mean_manifest["mean_run"], force=args.force)
+        if args.stage == "mean":
+            return
+
     promoted: List[str] = []
     if args.stage in {"screen", "all"}:
+        _require_planned_mean_checkpoint(plan)
         screen_manifest = build_execution_manifest(plan, python=sys.executable, stage="screen")
         records = _run_entries(screen_manifest["screen_runs"], force=args.force)
         promoted, ranked = select_promotions(

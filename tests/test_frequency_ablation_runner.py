@@ -94,7 +94,11 @@ def test_select_promotions_excludes_reference_and_applies_top_k():
 
 
 def test_command_builders_pin_experiment_seed_subset_ema_and_fresh_training():
-    from scripts.run_frequency_ablations import build_eval_command, build_train_command
+    from scripts.run_frequency_ablations import (
+        build_eval_command,
+        build_mean_pretrain_command,
+        build_train_command,
+    )
 
     train = build_train_command(
         python="python",
@@ -130,6 +134,20 @@ def test_command_builders_pin_experiment_seed_subset_ema_and_fresh_training():
     assert "--seed 42" in eval_text
     assert "--mc-steps 20" in eval_text
 
+    mean = build_mean_pretrain_command(
+        python="python",
+        config="base.yaml",
+        output_dir="checkpoints/freq_mean_v2",
+        epochs=30,
+        seed=42,
+        overrides={"data.num_workers": 2},
+    )
+    mean_text = " ".join(mean)
+    assert "scripts/pretrain_conditional_mean.py" in mean_text
+    assert "--output-dir checkpoints/freq_mean_v2" in mean_text
+    assert "--epochs 30" in mean_text
+    assert "data.num_workers=2" in mean_text
+
 
 def test_dry_run_manifest_contains_all_screen_blocks_and_no_promotions_yet():
     from scripts.run_frequency_ablations import build_execution_manifest
@@ -161,6 +179,49 @@ def test_dry_run_manifest_contains_all_screen_blocks_and_no_promotions_yet():
     ]
     assert all(run["train_command"] and run["eval_command"] for run in manifest["screen_runs"])
     assert manifest["promotion_runs"] == []
+    assert manifest["mean_run"] is None
+
+
+def test_v2_manifest_runs_mean_first_and_applies_common_train_overrides():
+    from scripts.run_frequency_ablations import build_execution_manifest
+
+    plan = {
+        "base_config": "base.yaml",
+        "ablation_config": "ablations.yaml",
+        "output_dir": "results/frequency_ablations_v2",
+        "mean_pretrain": {
+            "enabled": True,
+            "experiment": "freq_mean_pretrain_v2",
+            "output_dir": "checkpoints/freq_mean_pretrain_v2",
+            "checkpoint": "checkpoints/freq_mean_pretrain_v2/mean_best.pt",
+            "epochs": 30,
+            "seed": 42,
+        },
+        "common_train_overrides": {
+            "model.initialization_seed": 4242,
+            "modules.conditional_mean.checkpoint": "checkpoints/freq_mean_pretrain_v2/mean_best.pt",
+            "modules.conditional_mean.freeze": True,
+            "modules.conditional_mean.loss_weight": 0.0,
+        },
+        "variants": [{"id": "R0", "preset": "freq_r0"}],
+        "screen": {
+            "epochs": 50,
+            "eval_interval": 10,
+            "max_samples": 16,
+            "seed": 42,
+            "mc_steps": 20,
+            "experiment_prefix": "freq_v2_screen",
+        },
+    }
+    manifest = build_execution_manifest(plan, python="python", stage="all")
+    assert manifest["mean_run"]["checkpoint"].endswith("mean_best.pt")
+    assert "scripts/pretrain_conditional_mean.py" in " ".join(
+        manifest["mean_run"]["command"]
+    )
+    train_text = " ".join(manifest["screen_runs"][0]["train_command"])
+    assert "model.initialization_seed=4242" in train_text
+    assert "modules.conditional_mean.freeze=true" in train_text
+    assert "modules.conditional_mean.loss_weight=0.0" in train_text
 
 
 def test_ranking_json_sanitizes_unavailable_clinical_nan(tmp_path):
