@@ -68,3 +68,56 @@ def test_eval_sampling_is_repeatable_without_advancing_outer_rng():
 
     assert torch.equal(before, after)
     assert torch.equal(first, second)
+
+
+def test_checkpoint_selection_returns_one_shared_combined_improvement():
+    trainer = object.__new__(Trainer)
+    trainer.best_ckpts_enabled = False
+    trainer.best_combined_alpha = 0.5
+    trainer.best_stripe_penalty = 0.3
+    trainer._best_combined_score = -1e9
+    trainer._best_lesion_score = -1e9
+    trainer._best_image_score = -1e9
+    metrics = {
+        "val/mae": 0.1,
+        "val/ssim": 0.8,
+        "val/stripe_score": 1.0,
+        "val/lesion_peak_error_norm": 0.2,
+        "val/lesion_centroid_distance": 2.0,
+        "val/failure_rate": 0.0,
+    }
+
+    assert trainer._save_best_checkpoints(metrics) is True
+    assert trainer._save_best_checkpoints(metrics) is False
+
+
+def test_early_stopping_patience_is_measured_in_epochs():
+    trainer = object.__new__(Trainer)
+    trainer.early_stopping_enabled = True
+    trainer.early_stopping_patience = 40
+    trainer.early_stopping_min_epochs = 50
+    trainer._last_combined_improvement_epoch = None
+    trainer._epochs_since_improve = 0
+
+    trainer.epoch_count = 50
+    assert trainer._check_early_stopping(improved=True) is False
+    trainer.epoch_count = 80
+    assert trainer._check_early_stopping(improved=False) is False
+    assert trainer._epochs_since_improve == 30
+    trainer.epoch_count = 90
+    assert trainer._check_early_stopping(improved=False) is True
+    assert trainer._epochs_since_improve == 40
+
+
+def test_early_stopping_improvement_resets_epoch_origin():
+    trainer = object.__new__(Trainer)
+    trainer.early_stopping_enabled = True
+    trainer.early_stopping_patience = 40
+    trainer.early_stopping_min_epochs = 0
+    trainer._last_combined_improvement_epoch = 50
+    trainer._epochs_since_improve = 30
+
+    trainer.epoch_count = 80
+    assert trainer._check_early_stopping(improved=True) is False
+    assert trainer._last_combined_improvement_epoch == 80
+    assert trainer._epochs_since_improve == 0

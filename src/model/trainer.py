@@ -200,6 +200,7 @@ class Trainer:
         self._best_lesion_score: float = -1e9
         self._best_image_score: float = -1e9
         self._epochs_since_improve: int = 0
+        self._last_combined_improvement_epoch: Optional[int] = None
 
         self.tracked_sample_ids: List[str] = list(run_cfg.get("tracked_sample_ids", []) or [])
         self._tracked_batch: Optional[Dict[str, Any]] = None
@@ -370,9 +371,8 @@ class Trainer:
                     with self.ema_scope():
                         val_metrics = self._compute_val_sample_metrics(self._tracked_batch)
                     print("  " + "  ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
-                    self._save_best_checkpoints(val_metrics)
-                    _, _, combined = self._model_selection_scores(val_metrics)
-                    if self._check_early_stopping(combined):
+                    combined_improved = self._save_best_checkpoints(val_metrics)
+                    if self._check_early_stopping(combined_improved):
                         should_stop = True
 
             # Checkpoint
@@ -557,18 +557,21 @@ class Trainer:
         )
         return lesion_score, image_score, combined
 
-    def _save_best_checkpoints(self, metrics: Dict[str, float]) -> None:
-        if not self.best_ckpts_enabled:
-            return
+    def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
         lesion, image, combined = self._model_selection_scores(metrics)
-        exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
-        save_dir = os.path.join("checkpoints", exp_name)
-        os.makedirs(save_dir, exist_ok=True)
+        combined_improved = combined > self._best_combined_score
+        save_dir = ""
+        if self.best_ckpts_enabled:
+            exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
+            save_dir = os.path.join("checkpoints", exp_name)
+            os.makedirs(save_dir, exist_ok=True)
 
         def _save(tag: str, score: float, best_key: str) -> None:
             best = getattr(self, best_key, -1e9)
             if score > best:
                 setattr(self, best_key, score)
+                if not self.best_ckpts_enabled:
+                    return
                 path = os.path.join(save_dir, f"ckpt_{tag}.pt")
                 torch.save({
                     "model": self.model.state_dict(),
@@ -586,25 +589,27 @@ class Trainer:
         _save("best_lesion", lesion, "_best_lesion_score")
         _save("best_image", image, "_best_image_score")
         _save("best_combined", combined, "_best_combined_score")
+        return combined_improved
 
-    def _check_early_stopping(self, combined: float) -> bool:
+    def _check_early_stopping(self, improved: bool) -> bool:
         """Return True if training should stop."""
         if not self.early_stopping_enabled:
             return False
+        if improved or self._last_combined_improvement_epoch is None:
+            self._last_combined_improvement_epoch = self.epoch_count
+            self._epochs_since_improve = 0
+            return False
+
+        self._epochs_since_improve = self.epoch_count - self._last_combined_improvement_epoch
         if self.epoch_count < self.early_stopping_min_epochs:
             return False
-        if combined > self._best_combined_score:
-            self._best_combined_score = combined
-            self._epochs_since_improve = 0
-        else:
-            self._epochs_since_improve += 1
-            if self._epochs_since_improve >= self.early_stopping_patience:
-                print(
-                    f"  Early stopping: no improvement for "
-                    f"{self._epochs_since_improve} epochs (patience="
-                    f"{self.early_stopping_patience})."
-                )
-                return True
+        if self._epochs_since_improve >= self.early_stopping_patience:
+            print(
+                f"  Early stopping: no combined-score improvement for "
+                f"{self._epochs_since_improve} epochs "
+                f"(patience={self.early_stopping_patience})."
+            )
+            return True
         return False
 
     # ------------------------------------------------------------------
