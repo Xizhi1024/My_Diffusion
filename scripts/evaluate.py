@@ -13,6 +13,13 @@ Usage:
         --split test \\
         --output results/eval_report.json
 
+    # Reproducible PNG baseline checkpoint evaluation (EMA + fixed 16 cases)
+    python scripts/evaluate.py \\
+        --config configs/experiments/slmf_png_baseline.yaml \\
+        --checkpoint checkpoints/slmf_png_baseline/ckpt_best_combined.pt \\
+        --weights ema --split val --max-samples 16 --seed 42 \\
+        --output results/slmf_png_baseline_best_combined_eval.json
+
     # CPU-only smoke test
     python scripts/evaluate.py --config configs/experiments/slmf_baseline.yaml --fake-data
 """
@@ -29,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from scipy.ndimage import correlate
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -37,6 +44,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.model.config_utils import load_full_config, resolve_runtime_profile
 from src.model.slmf_bbdm import SLMFBBDM
 from src.model.loss_terms.roi_suv import _de_collate_meta
+from src.model.trainer import (
+    _compute_pet_sample_metrics,
+    _stratified_indices,
+    _to_unit_interval,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +183,13 @@ def compute_calibration_metrics(
     return metrics
 
 
-def _positive_pet_for_detection(x: np.ndarray) -> np.ndarray:
+def _positive_pet_for_detection(
+    x: np.ndarray,
+    *,
+    model_space: bool,
+) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
-    if np.nanmin(x) < 0.0:
+    if model_space:
         return np.clip((x + 1.0) * 0.5, 0.0, None)
     return np.clip(x, 0.0, None)
 
@@ -217,10 +233,11 @@ def compute_failure_detection_metrics(
     outside_margin: float = 0.05,
     lesion_min_ratio: float = 0.6,
     uncertainty_ratio_threshold: float = 2.0,
+    model_space: bool = False,
 ) -> Dict[str, Any]:
     """Flag clinically risky samples: off-mask peaks, cold lesions, or high uncertainty."""
-    pred_pos = _positive_pet_for_detection(pred)
-    target_pos = _positive_pet_for_detection(target)
+    pred_pos = _positive_pet_for_detection(pred, model_space=model_space)
+    target_pos = _positive_pet_for_detection(target, model_space=model_space)
     lesion = np.asarray(lesion_mask > 0.5)
     outside = ~lesion
 
@@ -370,43 +387,95 @@ def compute_normalized_lesion_metrics(
         "lesion_to_background_ratio_norm": float("nan"),
         "lesion_centroid_distance": float("nan"),
     }
-    if lesion_mask.sum() <= 0:
+    lesion = lesion_mask > 0.5
+    if not lesion.any():
         return nan_metrics
 
-    pred_max = float((pred * lesion_mask).max())
-    target_max = float((target * lesion_mask).max())
-    mask_sum = max(float(lesion_mask.sum()), 1.0)
-    pred_mean = float((pred * lesion_mask).sum() / mask_sum)
-    target_mean = float((target * lesion_mask).sum() / mask_sum)
+    pred_unit = _to_unit_interval(pred)
+    target_unit = _to_unit_interval(target)
+    pred_mean = float(pred_unit[lesion].mean())
+    target_mean = float(target_unit[lesion].mean())
 
     organ_any = (
-        (organ_mask.sum(axis=0, keepdims=True) > 0).astype(np.float32)
-        if organ_mask.shape[0] > 0 else np.zeros_like(lesion_mask)
+        organ_mask.sum(axis=0, keepdims=True) > 0.5
+        if organ_mask.shape[0] > 0 else np.zeros_like(lesion, dtype=bool)
     )
-    bg_mask = np.maximum(1.0 - lesion_mask - organ_any, 0.0)
-    bg_sum = max(float(bg_mask.sum()), 1.0)
-    pred_bg = float((pred * bg_mask).sum() / bg_sum)
-    target_bg = float((target * bg_mask).sum() / bg_sum)
-    pred_tbr = pred_mean / max(abs(pred_bg), 1e-6)
-    target_tbr = target_mean / max(abs(target_bg), 1e-6)
+    background = ~(lesion | organ_any)
+    pred_bg = float(pred_unit[background].mean()) if background.any() else 0.0
+    target_bg = float(target_unit[background].mean()) if background.any() else 0.0
+    pred_tbr = pred_mean / max(pred_bg, 1e-6)
+    target_tbr = target_mean / max(target_bg, 1e-6)
 
-    # Distance (pixels) between the pred peak inside the mask and the mask centroid
-    pred_masked = pred[0] * lesion_mask[0]
-    ys, xs = np.nonzero(lesion_mask[0])
-    if len(ys) > 0:
-        cy, cx = float(ys.mean()), float(xs.mean())
-        peak_idx = np.unravel_index(np.argmax(pred_masked), pred_masked.shape)
-        py, px = float(peak_idx[0]), float(peak_idx[1])
-        centroid_dist = float(np.hypot(py - cy, px - cx))
-    else:
-        centroid_dist = float("nan")
+    peak_metrics = _compute_pet_sample_metrics(pred[0], target[0], lesion_mask[0])
+    assert peak_metrics is not None
 
     return {
-        "lesion_peak_error_norm": float(abs(pred_max - target_max)),
+        "lesion_peak_error_norm": peak_metrics["lesion_peak_error_norm"],
         "lesion_mean_error_norm": float(abs(pred_mean - target_mean)),
         "lesion_to_background_ratio_norm": float(abs(pred_tbr - target_tbr)),
-        "lesion_centroid_distance": centroid_dist,
+        "lesion_centroid_distance": peak_metrics["lesion_centroid_distance"],
     }
+
+
+def _select_checkpoint_state(
+    checkpoint: Dict[str, Any],
+    weights: str = "ema",
+) -> Tuple[Dict[str, torch.Tensor], str]:
+    """Select raw weights or overlay an old-style EMA shadow on model state."""
+    raw_state = checkpoint.get("model", checkpoint)
+    if weights == "raw":
+        return raw_state, "model"
+    if weights != "ema":
+        raise ValueError(f"Unknown checkpoint weights: {weights!r}")
+
+    for key in ("ema_model", "model_ema"):
+        state = checkpoint.get(key)
+        if isinstance(state, dict):
+            return state, key
+
+    ema_state = checkpoint.get("ema")
+    if isinstance(ema_state, dict):
+        shadow = ema_state.get("shadow")
+        if isinstance(shadow, dict):
+            merged = dict(raw_state)
+            merged.update(shadow)
+            return merged, "ema.shadow"
+
+    raise KeyError(
+        "EMA weights requested, but checkpoint has no ema.shadow, ema_model, or model_ema"
+    )
+
+
+def _seed_evaluation(seed: int) -> None:
+    """Seed every RNG used by the standalone evaluator."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _build_stratified_subset(dataset, count: int):
+    """Choose deterministic lesion-area quantiles from an evaluation dataset."""
+    total = len(dataset)
+    if count <= 0:
+        raise ValueError(f"Evaluation subset size must be positive, got {count}")
+    if total <= count:
+        return dataset, list(range(total))
+
+    ranked: List[Tuple[float, int]] = []
+    for index in range(total):
+        sample = dataset[index]
+        mask = sample.get("mask") if isinstance(sample, dict) else None
+        if torch.is_tensor(mask):
+            area = float(mask.sum().item())
+        elif mask is not None:
+            area = float(np.asarray(mask).sum())
+        else:
+            area = 0.0
+        ranked.append((area, index))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    positions = _stratified_indices(total, count)
+    indices = [ranked[position][1] for position in positions]
+    return Subset(dataset, indices), indices
 
 
 def _append_calibration_summary(summary: Dict[str, Any], all_metrics: List[Dict[str, Any]]) -> None:
@@ -521,6 +590,7 @@ def evaluate(
 
             failure_pred = pred_np
             failure_target = target_np
+            failure_model_space = True
             if has_valid_suv:
                 try:
                     failure_pred = _denormalise_pet_np(pred_np, meta)
@@ -528,6 +598,7 @@ def evaluate(
                         failure_target = _to_numpy(pet_suv[i])
                     else:
                         failure_target = _denormalise_pet_np(target_np, meta)
+                    failure_model_space = False
                 except ValueError:
                     failure_pred = pred_np
                     failure_target = target_np
@@ -539,6 +610,7 @@ def evaluate(
                 outside_margin=failure_thresholds.get("outside_margin", 0.05),
                 lesion_min_ratio=failure_thresholds.get("lesion_min_ratio", 0.6),
                 uncertainty_ratio_threshold=failure_thresholds.get("uncertainty_ratio_threshold", 2.0),
+                model_space=failure_model_space,
             )
             sample_metrics.update(failure_metrics)
 
@@ -646,10 +718,23 @@ def main():
     ap = argparse.ArgumentParser(description="SLMF-BBDM Evaluation")
     ap.add_argument("--config", type=str, required=True, help="Path to YAML config")
     ap.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint (.pt)")
+    ap.add_argument(
+        "--weights",
+        choices=["ema", "raw"],
+        default="ema",
+        help="Checkpoint weights to evaluate (default: EMA, matching trainer model selection)",
+    )
     ap.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
     ap.add_argument("--output", type=str, default=None, help="Path to save JSON results")
     ap.add_argument("--fake-data", action="store_true", help="Use fake data for smoke test")
     ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="Deterministic evaluation seed")
+    ap.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Evaluate a lesion-area-stratified subset of this size",
+    )
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--mc-samples", type=int, default=None, help="Monte Carlo samples for uncertainty/failure analysis")
     ap.add_argument("--mc-steps", type=int, default=None, help="Sampling steps for evaluation/MC sampling")
@@ -668,8 +753,16 @@ def main():
     config = resolve_runtime_profile(config)
     if args.fake_data:
         config.setdefault("data", {})["use_fake_data"] = True
+    run_cfg = config.get("runtime", {})
     eval_cfg = config.get("evaluation", {})
     failure_cfg = eval_cfg.get("failure_detection", {})
+    eval_seed = int(
+        args.seed
+        if args.seed is not None
+        else run_cfg.get("eval_seed", config.get("experiment", {}).get("seed", 42))
+    )
+    _seed_evaluation(eval_seed)
+    print(f"Evaluation seed: {eval_seed}")
     mc_samples = args.mc_samples if args.mc_samples is not None else eval_cfg.get("mc_samples", 1)
     failure_outside_margin = (
         args.failure_outside_margin
@@ -697,21 +790,21 @@ def main():
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt["model"])
+        state, state_source = _select_checkpoint_state(ckpt, weights=args.weights)
+        model.load_state_dict(state)
+        print(f"Checkpoint weights: {state_source}")
     else:
         print("WARNING: No checkpoint provided, using randomly initialised weights")
 
     # Build dataloader for the requested split
     from src.data.dataset import CachedDataset, FakeDataset, build_dataloaders
     data_cfg = config.get("data", {})
-    run_cfg = config.get("runtime", {})
     run_cfg["num_workers"] = 0
 
     split_manifest = Path(data_cfg["split_manifest"]) if data_cfg.get("split_manifest") else None
 
     if data_cfg.get("use_fake_data", False):
         ds = FakeDataset(32, data_cfg.get("image_size", 192))
-        loader = DataLoader(ds, batch_size=data_cfg.get("batch_size", 4), shuffle=False)
     elif data_cfg.get("cache_dir"):
         cache_dir = data_cfg["cache_dir"]
         try:
@@ -725,9 +818,19 @@ def main():
                 )
             print(f"[evaluate] No {args.split} samples in {cache_dir}, falling back to train split...")
             ds = CachedDataset(cache_dir, split="train", augment=False, split_manifest=split_manifest)
-        loader = DataLoader(ds, batch_size=data_cfg.get("batch_size", 4), shuffle=False, num_workers=0)
     else:
         raise RuntimeError("No cache_dir configured and fake_data is not enabled")
+
+    original_count = len(ds)
+    if args.max_samples is not None:
+        ds, selected_indices = _build_stratified_subset(ds, args.max_samples)
+        print(
+            f"Using lesion-area-stratified subset: {len(ds)} samples "
+            f"from {original_count} candidates (indices={selected_indices})"
+        )
+
+    eval_batch_size = data_cfg.get("val_batch_size", data_cfg.get("batch_size", 4))
+    loader = DataLoader(ds, batch_size=eval_batch_size, shuffle=False, num_workers=0)
 
     print(f"Evaluating on {len(loader.dataset)} samples...")
 

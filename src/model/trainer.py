@@ -364,7 +364,7 @@ class Trainer:
             if self.val_loader is not None and self.epoch_count % self.eval_interval == 0:
                 val_metrics = None
                 combined_improved = False
-                with self.ema_scope():
+                with self.ema_scope(), self._eval_rng_scope():
                     eval_logs = [self.eval_step(b) for b in self.val_loader]
                     if self._tracked_batch is not None:
                         tracked_sample_result = self._sample_with_eval_seed(self._tracked_batch)
@@ -413,11 +413,10 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _select_tracked_batch(self) -> None:
-        """Scan val_loader once and cache a fixed batch of small/medium/large
-        lesion samples for visual + metric tracking across epochs.
+        """Scan val_loader once and cache a fixed lesion-area-stratified batch.
 
         If ``tracked_sample_ids`` is set in config, only those samples are kept.
-        Otherwise we pick 2 small / 2 medium / 2 large (by mask area).
+        Otherwise we pick ``eval_num_samples`` lesion-area quantiles.
         """
         if self.val_loader is None:
             return
@@ -479,9 +478,9 @@ class Trainer:
         print(f"  [fixed validation samples] {len(meta_list)} samples: "
               + ", ".join(m["sample_id"] for m in meta_list))
 
-    @torch.no_grad()
-    def _sample_with_eval_seed(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """Sample with fixed noise without advancing the training RNG state."""
+    @contextmanager
+    def _eval_rng_scope(self):
+        """Isolate every validation random draw from the training RNG state."""
         cuda_devices: List[int] = []
         device = torch.device(self.device)
         if device.type == "cuda":
@@ -490,6 +489,12 @@ class Trainer:
             ]
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(self.eval_seed)
+            yield
+
+    @torch.no_grad()
+    def _sample_with_eval_seed(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Sample with fixed noise without advancing the training RNG state."""
+        with self._eval_rng_scope():
             return self.model.sample(_to_device(batch, self.device))
 
     @torch.no_grad()
@@ -573,9 +578,51 @@ class Trainer:
         )
         return lesion_score, image_score, combined
 
+    def _monitoring_state_dict(self) -> Dict[str, Any]:
+        """Return checkpointable model-selection and early-stop state."""
+        return {
+            "best_combined_score": self._best_combined_score,
+            "best_lesion_score": self._best_lesion_score,
+            "best_image_score": self._best_image_score,
+            "epochs_since_improve": self._epochs_since_improve,
+            "last_combined_improvement_epoch": self._last_combined_improvement_epoch,
+        }
+
+    def _load_monitoring_state(self, checkpoint: Dict[str, Any]) -> None:
+        """Restore monitoring state when present; accept older checkpoints."""
+        state = checkpoint.get("monitoring")
+        if not isinstance(state, dict):
+            return
+        self._best_combined_score = float(
+            state.get("best_combined_score", self._best_combined_score)
+        )
+        self._best_lesion_score = float(
+            state.get("best_lesion_score", self._best_lesion_score)
+        )
+        self._best_image_score = float(
+            state.get("best_image_score", self._best_image_score)
+        )
+        self._epochs_since_improve = int(
+            state.get("epochs_since_improve", self._epochs_since_improve)
+        )
+        last_epoch = state.get(
+            "last_combined_improvement_epoch",
+            self._last_combined_improvement_epoch,
+        )
+        self._last_combined_improvement_epoch = (
+            int(last_epoch) if last_epoch is not None else None
+        )
+
     def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
         lesion, image, combined = self._model_selection_scores(metrics)
         combined_improved = combined > self._best_combined_score
+        if combined_improved:
+            self._last_combined_improvement_epoch = self.epoch_count
+            self._epochs_since_improve = 0
+        elif self._last_combined_improvement_epoch is not None:
+            self._epochs_since_improve = (
+                self.epoch_count - self._last_combined_improvement_epoch
+            )
         save_dir = ""
         if self.best_ckpts_enabled:
             exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
@@ -599,6 +646,7 @@ class Trainer:
                     "score": score,
                     "metrics": metrics,
                     "config": self.config,
+                    "monitoring": self._monitoring_state_dict(),
                 }, path)
                 print(f"  ★ new best {tag} (score={score:.4f}) → {path}")
 
@@ -646,6 +694,7 @@ class Trainer:
             "epoch": self.epoch_count,
             "step": self.step_count,
             "config": self.config,
+            "monitoring": self._monitoring_state_dict(),
         }
         torch.save(checkpoint, path)
         print(f"  Saved → {path}")
@@ -703,5 +752,6 @@ class Trainer:
         self.ema.load_state_dict(checkpoint["ema"])
         self.epoch_count = checkpoint["epoch"]
         self.step_count = checkpoint["step"]
+        self._load_monitoring_state(checkpoint)
         self.accum_count = 0
         print(f"Loaded checkpoint from {path} (epoch {self.epoch_count})")
