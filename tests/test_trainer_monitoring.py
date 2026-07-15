@@ -332,6 +332,22 @@ def test_evaluator_failure_metrics_use_explicit_model_space_conversion():
     assert metrics["outside_peak"] == pytest.approx(0.6)
 
 
+def test_evaluator_reports_prediction_target_and_excess_stripe_scores():
+    from scripts.evaluate import compute_stripe_metrics
+
+    target = np.zeros((1, 32, 32), dtype=np.float32)
+    target[:, 8:24, 8:24] = 1.0
+    pred = target.copy()
+    pred[:, :, ::2] += 0.5
+    metrics = compute_stripe_metrics(pred, target)
+
+    assert set(metrics) == {"stripe_score", "target_stripe_score", "stripe_excess"}
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert metrics["stripe_excess"] == pytest.approx(
+        metrics["stripe_score"] - metrics["target_stripe_score"]
+    )
+
+
 def test_monitoring_state_round_trips_for_resumed_early_stopping():
     trainer = object.__new__(Trainer)
     trainer._best_combined_score = 1.25

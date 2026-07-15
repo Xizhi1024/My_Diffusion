@@ -81,7 +81,7 @@ def resolve_noise_config(modules_cfg: dict) -> dict:
     Searches for a key whose value is a dict containing ``"name"`` with a
     recognised noise schedule name.  Falls back to ``bbdm_bridge``.
     """
-    noise_keys = {"scale_adaptive_noise", "bbdm_bridge", "noise"}
+    noise_keys = ("scale_adaptive_noise", "bbdm_bridge", "noise")
     for key in noise_keys:
         cfg = modules_cfg.get(key)
         if isinstance(cfg, dict) and "name" in cfg:
@@ -205,6 +205,9 @@ class SLMFBBDM(nn.Module):
         condition_dropout_config: Optional[Dict[str, Any]] = None,
         base_loss_config: Optional[Dict[str, Any]] = None,
         self_conditioning_config: Optional[Dict[str, Any]] = None,
+        conditional_mean_config: Optional[Dict[str, Any]] = None,
+        residual_bridge_config: Optional[Dict[str, Any]] = None,
+        residual_frequency_config: Optional[Dict[str, Any]] = None,
         meta_config: Optional[Dict[str, Any]] = None,
         segmenter_config: Optional[Dict[str, Any]] = None,
         # Inference
@@ -279,6 +282,60 @@ class SLMFBBDM(nn.Module):
         noise_cfg = noise_config or {"name": "bbdm_bridge"}
         self.noise_schedule = self._build_noise(noise_cfg)
 
+        # ---- Conditional-mean residual bridge ----
+        mean_cfg = conditional_mean_config or {}
+        residual_cfg = residual_bridge_config or {}
+        frequency_cfg = residual_frequency_config or {}
+        self.conditional_mean_enabled = bool(mean_cfg.get("enabled", False))
+        self.residual_bridge_enabled = bool(residual_cfg.get("enabled", False))
+        self.residual_frequency_enabled = bool(frequency_cfg.get("enabled", False))
+        self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
+        self.mean_loss_weight = float(mean_cfg.get("loss_weight", 1.0))
+        self.mean_charbonnier_eps = float(mean_cfg.get("charbonnier_eps", 1e-3))
+
+        if self.residual_bridge_enabled and not self.conditional_mean_enabled:
+            raise ValueError("modules.residual_bridge requires modules.conditional_mean.enabled=true")
+        if self.residual_bridge_enabled and getattr(self.noise_schedule, "name", "") != "bbdm_bridge":
+            raise ValueError("modules.residual_bridge requires the bbdm_bridge noise schedule")
+        if self.residual_frequency_enabled and not self.residual_bridge_enabled:
+            raise ValueError("modules.residual_frequency requires modules.residual_bridge.enabled=true")
+        use_gabor_gate = bool(frequency_cfg.get("use_gabor_gate", False))
+        if use_gabor_gate and not self.gabor_routes.get("enabled", False):
+            raise ValueError("Residual-frequency Gabor gating requires modules.gabor.enabled=true")
+        configured_losses = loss_configs or {}
+        residual_wavelet_cfg = configured_losses.get("residual_wavelet", {})
+        if residual_wavelet_cfg.get("enabled", False) and not self.residual_bridge_enabled:
+            raise ValueError("losses.residual_wavelet requires modules.residual_bridge.enabled=true")
+        gabor_loss_cfg = configured_losses.get("gabor_consistency", {})
+        if gabor_loss_cfg.get("enabled", False) and not self.gabor_routes.get("use_for_loss", False):
+            raise ValueError(
+                "losses.gabor_consistency requires modules.gabor.use_for_loss=true"
+            )
+
+        self.mean_predictor: Optional[nn.Module] = None
+        if self.conditional_mean_enabled:
+            from .mean_predictor import LowFrequencyPETPredictor
+            self.mean_predictor = LowFrequencyPETPredictor(
+                in_channels=mean_cfg.get("in_channels", 1),
+                base_channels=mean_cfg.get("base_channels", 32),
+                levels=mean_cfg.get("levels", 2),
+            )
+
+        self.residual_preconditioner: Optional[nn.Module] = None
+        if self.residual_frequency_enabled:
+            from .frequency.residual_preconditioner import ResidualFrequencyPreconditioner
+            gabor_orientations = frequency_cfg.get(
+                "gabor_orientations", gabor_cfg.get("orientations", 8)
+            )
+            self.residual_preconditioner = ResidualFrequencyPreconditioner(
+                output_channels=tuple(frequency_cfg.get("output_channels", [256, 256, 128, 64])),
+                band_scales=tuple(frequency_cfg.get("band_scales", [1.0, 0.5, 0.25])),
+                inject_wavelet=frequency_cfg.get("inject_wavelet", True),
+                use_gabor_gate=use_gabor_gate,
+                gabor_orientations=gabor_orientations,
+                gate_strength=frequency_cfg.get("gate_strength", 0.1),
+            )
+
         # ---- Metadata FiLM ----
         meta_cfg = meta_config or {}
         self.meta_enabled = meta_cfg.get("enabled", False)
@@ -348,7 +405,14 @@ class SLMFBBDM(nn.Module):
 
         if name == "gabor":
             from .priors.gabor import GaborPrior
-            return GaborPrior(filters=cfg.get("filters", 32), enabled=enabled)
+            return GaborPrior(
+                filters=cfg.get("filters"),
+                scales=cfg.get("scales", 4),
+                orientations=cfg.get("orientations", 8),
+                kernel_size=cfg.get("kernel_size", 15),
+                parameter_delta=cfg.get("parameter_delta", 0.25),
+                enabled=enabled,
+            )
         elif name == "organ_prior":
             from .priors.organ import OrganPrior
             return OrganPrior(
@@ -448,6 +512,26 @@ class SLMFBBDM(nn.Module):
                 alpha=cfg.get("alpha", 1.0),
                 active_tau_max=cfg.get("active_tau_max", 0.4),
                 enabled=enabled, weight=weight,
+            )
+        elif name == "residual_wavelet":
+            from .loss_terms.residual_frequency import ResidualWaveletLoss
+            return ResidualWaveletLoss(
+                lesion_weight=cfg.get("lesion_weight", 4.0),
+                band_weights=tuple(cfg.get("band_weights", [0.5, 1.0, 1.5])),
+                epsilon=cfg.get("epsilon", 1e-3),
+                active_tau_max=cfg.get("active_tau_max", 0.7),
+                enabled=enabled,
+                weight=weight,
+            )
+        elif name == "gabor_consistency":
+            from .loss_terms.residual_frequency import GaborConsistencyLoss
+            return GaborConsistencyLoss(
+                lesion_weight=cfg.get("lesion_weight", 3.0),
+                orientation_weight=cfg.get("orientation_weight", 0.1),
+                epsilon=cfg.get("epsilon", 1e-6),
+                active_tau_max=cfg.get("active_tau_max", 0.7),
+                enabled=enabled,
+                weight=weight,
             )
         elif name == "roi_suv":
             from .loss_terms.roi_suv import ROISUVLoss
@@ -616,11 +700,30 @@ class SLMFBBDM(nn.Module):
 
         return bundle
 
+    def _build_frequency_injections(
+        self,
+        condition: ConditionBundle,
+        timesteps: Optional[torch.Tensor],
+        noisy_residual: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        if not self.residual_frequency_enabled:
+            return []
+        if timesteps is None or noisy_residual is None or self.residual_preconditioner is None:
+            raise ValueError("Residual-frequency injection requires noisy_residual and timesteps")
+        injections, _ = self.residual_preconditioner(
+            noisy_residual,
+            timesteps,
+            self.noise_schedule,
+            condition.maps.get("gabor_orientation"),
+        )
+        return injections
+
     def _build_skip_injections(
         self,
         condition: ConditionBundle,
         timesteps: Optional[torch.Tensor] = None,
         hw_list: Optional[List[int]] = None,
+        noisy_residual: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """Build Zero-Conv adapter outputs for UNet skip connections.
 
@@ -628,7 +731,7 @@ class SLMFBBDM(nn.Module):
         Applies time-varying beta modulation from the adapter.
         """
         if not self.zero_adapter_enabled:
-            return []
+            return self._build_frequency_injections(condition, timesteps, noisy_residual)
 
         ct_feats = [condition.maps[f"ct_feat_{i}"] for i in range(4)]
 
@@ -656,7 +759,15 @@ class SLMFBBDM(nn.Module):
             ct_feats, organ_feats, gabor_feat, hotspot, hw_list, tau=tau,
         )
         # Reverse: adapter outputs [shallow→deep], decoder consumes [deep→shallow]
-        return list(reversed(injections)) if injections else []
+        adapter_injections = list(reversed(injections)) if injections else []
+        frequency_injections = self._build_frequency_injections(
+            condition, timesteps, noisy_residual
+        )
+        if adapter_injections and frequency_injections:
+            if len(adapter_injections) != len(frequency_injections):
+                raise RuntimeError("Adapter and residual-frequency skip levels do not match")
+            return [a + f for a, f in zip(adapter_injections, frequency_injections)]
+        return adapter_injections or frequency_injections
 
     # ------------------------------------------------------------------
     # Forward pass (training)
@@ -682,19 +793,52 @@ class SLMFBBDM(nn.Module):
             T = self.noise_schedule.num_train_timesteps
             timesteps = torch.randint(0, T, (B,), device=device)
 
+        mean_output: Optional[Dict[str, torch.Tensor]] = None
+        mean_pet: Optional[torch.Tensor] = None
+        model_target = x0
+        bridge_source = x_source
+        if self.residual_bridge_enabled:
+            if self.mean_predictor is None:
+                raise RuntimeError("Residual bridge was enabled without a mean predictor")
+            mean_output = self.mean_predictor(x_source)
+            mean_pet = mean_output["mean_pet"]
+            bridge_mean = mean_pet.detach() if self.mean_detach_bridge else mean_pet
+            model_target = x0 - bridge_mean
+            bridge_source = torch.zeros_like(x_source)
+
         # 1. Build condition bundle
         condition = self.build_condition_bundle(batch, timesteps)
 
         # 2. Forward diffusion (add noise)
         # BBDM bridge needs x_source; DDPM ignores it
-        noisy_x = _add_noise(self.noise_schedule, x0, noise, timesteps, condition, x_source)
+        noisy_x = _add_noise(
+            self.noise_schedule,
+            model_target,
+            noise,
+            timesteps,
+            condition,
+            bridge_source,
+        )
 
         # 3. Condition dropout (training only) — MUST happen BEFORE adapter reads conditions
         condition = self.condition_dropout.apply(condition, training=self.training)
+        denoiser_state = noisy_x
+        if (
+            self.residual_frequency_enabled
+            and self.residual_preconditioner is not None
+            and not self.residual_preconditioner.inject_wavelet
+        ):
+            denoiser_state = self.residual_preconditioner.modulate_residual(
+                noisy_x, condition.maps.get("gabor_orientation")
+            )
 
         # 4. Build skip injections from adapter (Zero-Conv or NoOp)
         #    Dropout already applied → adapter sees zeroed-out conditions for dropped modules
-        skip_injections = self._build_skip_injections(condition, timesteps=timesteps)
+        skip_injections = self._build_skip_injections(
+            condition,
+            timesteps=timesteps,
+            noisy_residual=noisy_x if self.residual_bridge_enabled else None,
+        )
 
         # 4.5 Build metadata tensor + Cross-Attn beta
         meta_tensor = None
@@ -708,11 +852,11 @@ class SLMFBBDM(nn.Module):
         semantic_tokens = condition.tokens.get("semantic")
         self_cond = None
         if self.self_conditioning:
-            self_cond = torch.zeros_like(x0)
+            self_cond = torch.zeros_like(model_target)
             use_self_cond = self.training and torch.rand((), device=device) < self.self_conditioning_prob
             if use_self_cond:
                 with torch.no_grad():
-                    sc_input = self._model_input(noisy_x, x_source, self_cond)
+                    sc_input = self._model_input(denoiser_state, x_source, self_cond)
                     sc_output = self.unet(
                         sc_input,
                         timesteps,
@@ -724,7 +868,7 @@ class SLMFBBDM(nn.Module):
                     self_cond = sc_output[:, :1].detach()
 
         # 5. UNet forward
-        model_input = self._model_input(noisy_x, x_source, self_cond)
+        model_input = self._model_input(denoiser_state, x_source, self_cond)
         output = self.unet(model_input, timesteps, context_tokens=semantic_tokens,
                           skip_injections=skip_injections if skip_injections else None,
                           meta=meta_tensor,
@@ -732,16 +876,38 @@ class SLMFBBDM(nn.Module):
 
         # 5. Split output
         if self.enable_heteroscedastic:
-            pred_x0, pred_logvar = output[:, :1], output[:, 1:]
+            pred_model, pred_logvar = output[:, :1], output[:, 1:]
             pred_logvar = pred_logvar.clamp(self.heteroscedastic_logvar_min, self.heteroscedastic_logvar_max)
         else:
-            pred_x0, pred_logvar = output[:, :1], None
+            pred_model, pred_logvar = output[:, :1], None
+
+        if self.residual_bridge_enabled:
+            if mean_pet is None:
+                raise RuntimeError("Residual bridge did not produce a conditional mean")
+            reconstruction_mean = mean_pet.detach() if self.mean_detach_bridge else mean_pet
+            pred_x0 = reconstruction_mean + pred_model
+        else:
+            pred_x0 = pred_model
+
+        if self.gabor_routes.get("enabled", False) and self.gabor_routes.get("use_for_loss", False):
+            gabor_prior = self.priors["gabor"]
+            if not hasattr(gabor_prior, "describe"):
+                raise RuntimeError("Gabor loss route requires a descriptor-capable Gabor prior")
+            pred_descriptor = gabor_prior.describe(pred_x0, detach_parameters=True)
+            with torch.no_grad():
+                target_descriptor = gabor_prior.describe(x0, detach_parameters=True)
+            condition.maps.update({
+                "gabor_pred_feat": pred_descriptor["gabor_feat"],
+                "gabor_target_feat": target_descriptor["gabor_feat"],
+                "gabor_pred_orientation": pred_descriptor["gabor_orientation"],
+                "gabor_target_orientation": target_descriptor["gabor_orientation"],
+            })
 
         # 6. Compute losses
         tau = self.noise_schedule.get_tau(timesteps)
         ctx = LossContext(
-            model_pred=pred_x0,
-            loss_target=x0,
+            model_pred=pred_model,
+            loss_target=model_target,
             target_pet=x0,
             pred_x0=pred_x0,
             timesteps=timesteps,
@@ -749,16 +915,35 @@ class SLMFBBDM(nn.Module):
             batch=batch,
             condition=condition,
             pred_logvar=pred_logvar,
+            pred_residual=pred_model if self.residual_bridge_enabled else None,
+            target_residual=model_target if self.residual_bridge_enabled else None,
+            mean_pet=mean_pet,
         )
 
         total_loss = torch.tensor(0.0, device=device)
         logs: Dict[str, torch.Tensor] = {}
 
         # Base diffusion/reconstruction loss (always on)
-        base_loss, base_logs = self._base_reconstruction_loss(pred_x0, x0, timesteps, tau)
+        base_loss, base_logs = self._base_reconstruction_loss(
+            pred_model, model_target, timesteps, tau
+        )
         total_loss = total_loss + base_loss
         logs["loss/base_diffusion"] = base_loss.detach()
         logs.update(base_logs)
+
+        if self.residual_bridge_enabled and mean_output is not None:
+            from .frequency.haar import haar_dwt2
+
+            target_ll1, _ = haar_dwt2(x0)
+            target_ll2, _ = haar_dwt2(target_ll1)
+            mean_error = mean_output["ll2"] - target_ll2
+            mean_lowpass = torch.sqrt(
+                mean_error.square() + self.mean_charbonnier_eps ** 2
+            ).mean()
+            weighted_mean = self.mean_loss_weight * mean_lowpass
+            total_loss = total_loss + weighted_mean
+            logs["loss/mean_lowpass"] = mean_lowpass.detach()
+            logs["loss/mean_lowpass_weighted"] = weighted_mean.detach()
 
         # Pluggable loss terms
         for name, term in self.loss_terms.items():
@@ -784,6 +969,15 @@ class SLMFBBDM(nn.Module):
         logs["module/self_conditioning"] = torch.tensor(1.0 if self.self_conditioning else 0.0, device=device)
         logs["module/metadata_film"] = torch.tensor(1.0 if self.meta_enabled else 0.0, device=device)
         logs["module/segmenter"] = torch.tensor(1.0 if self.segmenter_enabled else 0.0, device=device)
+        logs["module/conditional_mean"] = torch.tensor(
+            1.0 if self.conditional_mean_enabled else 0.0, device=device
+        )
+        logs["module/residual_bridge"] = torch.tensor(
+            1.0 if self.residual_bridge_enabled else 0.0, device=device
+        )
+        logs["module/residual_frequency"] = torch.tensor(
+            1.0 if self.residual_frequency_enabled else 0.0, device=device
+        )
         logs["module/scale_adaptive_noise"] = torch.tensor(
             1.0 if getattr(self.noise_schedule, "name", "") == "scale_adaptive_noise"
             and self.noise_schedule.enabled else 0.0,
@@ -821,6 +1015,13 @@ class SLMFBBDM(nn.Module):
         device = batch["ct"].device
         B = batch["ct"].shape[0]
         x_source = batch["ct"]
+        mean_pet: Optional[torch.Tensor] = None
+        bridge_source = x_source
+        if self.residual_bridge_enabled:
+            if self.mean_predictor is None:
+                raise RuntimeError("Residual bridge was enabled without a mean predictor")
+            mean_pet = self.mean_predictor(x_source)["mean_pet"]
+            bridge_source = torch.zeros_like(x_source)
 
         # Build metadata tensor once (shared across all denoising steps)
         meta_tensor = None
@@ -836,12 +1037,11 @@ class SLMFBBDM(nn.Module):
         noise = torch.randn_like(x_source)
         timesteps_T = torch.full((B,), T - 1, device=device, dtype=torch.long)
         condition = self.build_condition_bundle(batch, timesteps_T)
-        skip_inj = self._build_skip_injections(condition, timesteps=timesteps_T)
 
         if is_bbdm:
             # x_T = m_T·CT + (1-m_T)·0 + σ_T·ε ≈ CT + noise
             x_t = _add_noise(self.noise_schedule, torch.zeros_like(x_source),
-                            noise, timesteps_T, condition, x_source)
+                            noise, timesteps_T, condition, bridge_source)
         elif has_custom_reverse:
             # Custom schedules may define a non-isotropic forward prior state.
             x_t = self.noise_schedule.add_noise(torch.zeros_like(x_source), noise, timesteps_T, condition)
@@ -867,9 +1067,22 @@ class SLMFBBDM(nn.Module):
             t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
             condition = self.build_condition_bundle(batch, t_batch)
-            skip_inj = self._build_skip_injections(condition, timesteps=t_batch)
+            denoiser_state = x_t
+            if (
+                self.residual_frequency_enabled
+                and self.residual_preconditioner is not None
+                and not self.residual_preconditioner.inject_wavelet
+            ):
+                denoiser_state = self.residual_preconditioner.modulate_residual(
+                    x_t, condition.maps.get("gabor_orientation")
+                )
+            skip_inj = self._build_skip_injections(
+                condition,
+                timesteps=t_batch,
+                noisy_residual=x_t if self.residual_bridge_enabled else None,
+            )
             semantic_tokens = condition.tokens.get("semantic")
-            model_input = self._model_input(x_t, x_source, self_cond)
+            model_input = self._model_input(denoiser_state, x_source, self_cond)
             ca_beta_step = multi_level_betas(t_batch.float() / self.noise_schedule.num_train_timesteps, levels=5)[:, 0]
             output = self.unet(model_input, t_batch, context_tokens=semantic_tokens,
                               skip_injections=skip_inj if skip_inj else None,
@@ -904,7 +1117,7 @@ class SLMFBBDM(nn.Module):
                         t_batch,
                         t_next_batch,
                         condition,
-                        x_source=x_source,
+                        x_source=bridge_source,
                     )
                 elif is_bbdm:
                     # BBDM: x_{t-1} = m_{t-1}·CT + (1-m_{t-1})·pred_x0
@@ -912,7 +1125,7 @@ class SLMFBBDM(nn.Module):
                     m_next = self.noise_schedule.m_t[t_next_batch]
                     while m_next.dim() < x_t.dim():
                         m_next = m_next.unsqueeze(-1)
-                    x_t = m_next * x_source + (1 - m_next) * pred_x0
+                    x_t = m_next * bridge_source + (1 - m_next) * pred_x0
                 else:
                     # Standard DDIM
                     alpha_t = _get_alpha_cumprod(self.noise_schedule, t_batch)
@@ -931,8 +1144,19 @@ class SLMFBBDM(nn.Module):
 
         # Prefer the final-step pred_x0.  Fall back to x_t only if the loop did
         # not execute (defensive — steps is always ≥1 in practice).
-        synthetic_pet = final_pred_x0 if final_pred_x0 is not None else x_t
-        result = {"synthetic_pet": synthetic_pet}
+        final_model_prediction = final_pred_x0 if final_pred_x0 is not None else x_t
+        if self.residual_bridge_enabled:
+            if mean_pet is None:
+                raise RuntimeError("Residual sampling did not produce a conditional mean")
+            synthetic_pet = mean_pet + final_model_prediction
+            result = {
+                "synthetic_pet": synthetic_pet,
+                "mean_pet": mean_pet,
+                "pred_residual": final_model_prediction,
+            }
+        else:
+            synthetic_pet = final_model_prediction
+            result = {"synthetic_pet": synthetic_pet}
         if self.enable_heteroscedastic and final_output is not None:
             # logvar must come from the same terminal model output as pred_x0.
             result["logvar"] = final_output[:, 1:].clamp(
@@ -1028,6 +1252,9 @@ class SLMFBBDM(nn.Module):
             loss_configs=loss_cfg,
             condition_dropout_config=modules_cfg.get("condition_dropout", {}),
             base_loss_config=model_cfg.get("base_loss", {}),
+            conditional_mean_config=modules_cfg.get("conditional_mean", {}),
+            residual_bridge_config=modules_cfg.get("residual_bridge", {}),
+            residual_frequency_config=modules_cfg.get("residual_frequency", {}),
             meta_config=model_cfg.get("metadata", config.get("metadata", {})),
             segmenter_config=model_cfg.get("segmenter", config.get("segmenter", {})),
             self_conditioning_config=model_cfg.get("self_conditioning", {}),

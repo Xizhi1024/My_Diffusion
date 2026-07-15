@@ -1,0 +1,175 @@
+# Recommended PNG-only conditional-mean residual-frequency BBDM (F4).
+# R0/R2/F1-F4 are resolved from this file through ablations.yaml.
+
+experiment:
+  name: slmf_png_residual_frequency
+  seed: 42
+
+data:
+  mode: png
+  cache_dir: cache/tensors_main
+  split_manifest: ../main_data/split_manifest.csv
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys: [ct, pet, mask]
+  optional_keys: []
+
+runtime:
+  device: auto
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 50
+  eval_num_samples: 16
+  eval_seed: 42
+  eval_sampling_steps: 20
+  sample_interval: 50
+  save_interval: 50
+  tracked_sample_ids: []
+  best_checkpoint:
+    enabled: true
+    combined_alpha: 0.5
+    stripe_penalty: 0.3
+  early_stopping:
+    enabled: true
+    patience: 40
+    min_epochs: 50
+
+training:
+  num_epochs: 300
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  lr_min: 1e-6
+  ema:
+    decay: 0.999
+    update_every: 10
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  conditional_mean:
+    enabled: true
+    levels: 2
+    base_channels: 32
+    loss_weight: 1.0
+    charbonnier_eps: 1e-3
+    detach_bridge: true
+
+  residual_bridge:
+    enabled: true
+
+  residual_frequency:
+    enabled: true
+    inject_wavelet: true
+    use_gabor_gate: true
+    gabor_orientations: 8
+    band_scales: [1.0, 0.5, 0.25]
+    gate_strength: 0.1
+
+  gabor:
+    enabled: true
+    scales: 4
+    orientations: 8
+    kernel_size: 15
+    parameter_delta: 0.25
+    inject_adapter: false
+    use_for_noise: false
+    use_for_hotspot: false
+    use_for_loss: true
+
+  organ_prior:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  semantic_prior:
+    enabled: false
+  zero_adapter:
+    enabled: false
+  condition_dropout:
+    enabled: false
+  bbdm_bridge:
+    name: bbdm_bridge
+    num_train_timesteps: 1000
+    m_schedule: linear
+
+losses:
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+  topk_lesion:
+    enabled: true
+    weight: 0.4
+    topk_percent: 0.01
+    active_tau_max: 0.5
+  outside_peak_ranking:
+    enabled: true
+    weight: 0.1
+    margin: 0.05
+    inside_radius: 3
+    outside_radius: 8
+    topk_percent: 0.01
+    active_tau_max: 0.65
+  residual_wavelet:
+    enabled: true
+    weight: 0.05
+    lesion_weight: 4.0
+    band_weights: [0.5, 1.0, 1.5]
+    active_tau_max: 0.7
+  gabor_consistency:
+    enabled: true
+    weight: 0.02
+    lesion_weight: 3.0
+    orientation_weight: 0.1
+    active_tau_max: 0.7
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false
+  roi_suv:
+    enabled: false
+  organ_consistency:
+    enabled: false
+  false_hotspot:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  heteroscedastic_nll:
+    enabled: false
+  segmenter_consistency:
+    enabled: false
+
+metadata:
+  enabled: false
+segmenter:
+  enabled: false
+
+evaluation:
+  mc_samples: 1
+  physical_suv_available: false
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

@@ -2,6 +2,78 @@
 # Usage: python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --ablation no_gabor
 
 ablations:
+  # ---- Residual-frequency block screen (PNG-only) ----
+  freq_r0:
+    description: R0 current full-PET CT-to-PET BBDM reference
+    overrides:
+      modules.conditional_mean.enabled: false
+      modules.residual_bridge.enabled: false
+      modules.residual_frequency.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+
+  freq_r2:
+    description: R2 conditional low-frequency mean plus zero-endpoint residual BBDM
+    overrides:
+      modules.conditional_mean.enabled: true
+      modules.residual_bridge.enabled: true
+      modules.residual_frequency.enabled: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+
+  freq_f1:
+    description: F1 R2 plus level-matched Haar residual skip injection
+    overrides:
+      modules.conditional_mean.enabled: true
+      modules.residual_bridge.enabled: true
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.inject_wavelet: true
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+
+  freq_f2:
+    description: F2 R2 plus bounded Gabor gate on level-1 residual details only
+    overrides:
+      modules.conditional_mean.enabled: true
+      modules.residual_bridge.enabled: true
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.inject_wavelet: false
+      modules.residual_frequency.use_gabor_gate: true
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+
+  freq_f3:
+    description: F3 R2 plus Haar skip injection and bounded complex-Gabor gate
+    overrides:
+      modules.conditional_mean.enabled: true
+      modules.residual_bridge.enabled: true
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.inject_wavelet: true
+      modules.residual_frequency.use_gabor_gate: true
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+
+  freq_f4:
+    description: F4 F3 plus lesion-weighted residual-wavelet and target-direction Gabor losses
+    overrides:
+      modules.conditional_mean.enabled: true
+      modules.residual_bridge.enabled: true
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.inject_wavelet: true
+      modules.residual_frequency.use_gabor_gate: true
+      modules.gabor.use_for_loss: true
+      losses.residual_wavelet.enabled: true
+      losses.gabor_consistency.enabled: true
+
   # ---- Full baseline (all off) ----
   baseline:
     description: Raw CT concat + standard BBDM + base MSE loss only

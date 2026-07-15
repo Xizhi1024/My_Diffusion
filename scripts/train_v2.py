@@ -55,6 +55,9 @@ def _save_run_metadata(model: SLMFBBDM, config: dict, ckpt_dir: str, ablation: s
         ),
         "metadata_film": bool(model.meta_enabled),
         "segmenter": bool(model.segmenter_enabled),
+        "conditional_mean": bool(model.conditional_mean_enabled),
+        "residual_bridge": bool(model.residual_bridge_enabled),
+        "residual_frequency": bool(model.residual_frequency_enabled),
     })
     enabled_losses = {
         name: bool(loss.enabled)
