@@ -1,149 +1,134 @@
-# Reliable Wavelet BBDM Design
+# Boundary-Reliable Frequency BBDM Design
 
-**Date:** 2026-07-16
-**Status:** Approved direction; implementation pending
-**Scope:** PNG CT/PET/lesion-mask training now, while retaining optional organ and physical-SUV interfaces
+**Date:** 2026-07-16  
+**Status:** Approved, revised after architecture review  
+**Scope:** PNG CT/PET/lesion-mask training; optional organ and physical-SUV interfaces remain compatible
 
 ## Goal
 
-Replace the artifact-prone V2 residual-frequency path with two independently switchable contributions:
+Replace the artifact-prone V2 frequency path with a conservative decoder-side residual branch:
 
-1. a complete Haar-wavelet U-Net whose three encoder and decoder scale transitions preserve all four subbands; and
-2. a reliability-controlled four-level residual-frequency injector that never rewrites the noisy diffusion state.
+```text
+noisy bridge state + CT + timestep + Gabor energy
+    -> two-level Haar analysis
+    -> noise/cross-modal/content reliability
+    -> LH/HL/HH subband gates
+    -> zero-initialized skip residuals
+```
 
-Add lesion-boundary and CT-aligned anatomy-edge supervision and evaluation so improvements are measured where the scientific claim is made. Preserve the existing conditional-mean residual bridge and every existing organ/SUV route.
+The branch must not modify the diffusion state, replace a skip, gate an existing adapter, or consume a ground-truth lesion mask. It is intended to improve lesion and anatomy boundaries without recreating periodic Gabor textures.
 
-## Evidence from V2
+## Evidence and constraints
 
-V2 established that the frozen conditional low-frequency mean plus zero-endpoint residual bridge is useful. It did not establish a general benefit from the existing frequency module:
+V2 supports the frozen conditional mean plus zero-endpoint residual bridge. It does not establish a general benefit from the old frequency module: F1/F2 failed the stripe gate and F4 traded small SSIM/peak-error gains for worse MAE, lesion-mean error, and centroid distance.
 
-- F1/F2 failed the stripe gate.
-- F4 only traded slightly better SSIM, lesion peak error, and failure count for worse MAE, lesion mean error, and centroid distance than R2.
-- The legacy preconditioner divides high bands by small constants, bilinearly upsamples signed Haar details, applies one shared Gabor factor to all three detail directions, and can directly alter the noisy residual state.
+The likely structural failure is repeated propagation of noisy high-frequency content through decoder skips. The first implementation is therefore deliberately smaller than a complete wavelet backbone or a global time-layer-lesion router.
 
-The new design therefore retains R2 and the legacy F4 path as controls rather than treating V2 frequency enhancement as established.
-
-## Data and claim boundary
-
-Current guaranteed inputs are PNG CT, normalized PET, and lesion masks. Consequently:
-
-- lesion-boundary metrics are valid now;
-- CT-aligned anatomy-edge metrics are valid proxy metrics now;
-- organ-specific metrics remain unavailable until non-empty organ masks exist;
-- physical SUV claims remain unavailable until calibrated SUV tensors and metadata exist.
-
-No lesion mask is consumed by the denoiser or sampler. Masks are used only by training losses and evaluation. Optional organ masks may strengthen the same boundary loss when present, but all-zero or absent masks are treated as unavailable.
+Current guaranteed inputs are PNG CT, normalized PET, and lesion masks. Lesion-boundary and CT-aligned proxy metrics are valid now. Organ-specific and physical-SUV claims remain unavailable until non-empty organ masks and calibrated SUV data are guaranteed.
 
 ## Architecture
 
-### 1. Complete Haar-wavelet U-Net
+### 1. Two-level Haar source mapping
 
-`WaveletBBDMUNet` keeps the public `BBDMUNet.forward` contract and the same four skip widths `[64, 128, 256, 256]`.
+For U-Net levels `L0=H`, `L1=H/2`, `L2=H/4`, `L3=H/8`:
 
-Every encoder transition performs:
+| Decoder level | Frequency source | Rule |
+|---|---|---|
+| L3 | none | exact zero; do not invent deep high frequency |
+| L2 | `LH2, HL2, HH2` | use at native resolution |
+| L1 | `LH1, HL1, HH1` | use at native resolution |
+| L0 | `IDWT(0, gated LH1, gated HL1, gated HH1)` | reconstruct pure full-resolution high-frequency increment |
 
-```text
-h_l
-  -> orthonormal Haar DWT
-  -> concat [LL, LH, HL, HH]
-  -> learned cross-subband projection
-  -> h_(l+1)
-```
+There is no third Haar level and no bilinear interpolation of signed wavelet coefficients. Haar is described as **subband-aligned inverse reconstruction**, not as strictly phase-consistent: critically sampled Haar remains shift-variant.
 
-Every decoder transition performs:
+The previously implemented `WaveletBBDMUNet` remains disabled by default and outside this first ablation. It is retained only as a future standalone experiment.
 
-```text
-h_(l+1)
-  -> learned expansion to [LL, LH, HL, HH]
-  -> orthonormal Haar IWT
-  -> h_l
-```
+### 2. Explicit subband reliability
 
-There are three DWT transitions and three IWT transitions. Bilinear interpolation is not used for backbone scale changes. Encoder skips, cross-attention, time/meta conditioning, heteroscedastic output, and external skip injections retain their existing semantics.
-
-The standard `BBDMUNet` remains the default. With `modules.wavelet_unet.enabled=false` or the field absent, construction and checkpoint keys are unchanged.
-
-### 2. Reliable four-level residual-frequency injector
-
-The legacy class remains available only for the V2 F4 control. The new `ReliableResidualFrequencyInjector` builds decoder-ordered bands without bilinear interpolation of signed detail coefficients:
+For each native high-frequency level and subband `b in {LH, HL, HH}`:
 
 ```text
-L3 (H/8): LL3
-L2 (H/4): [LH2, HL2, HH2]
-L1 (H/2): [LH1, HL1, HH1]
-L0 (H):   three independent IWT reconstructions of LH1, HL1, HH1
+g_l,b = cap * g_noise_l * g_cross_l,b * g_content_l,b * g_direction_l,b
 ```
 
-Each band is robustly bounded as `tanh(coefficient / scale)` before projection. This replaces unbounded high-band amplification.
+- `g_noise` is an analytic sigmoid of bridge log-SNR and releases high frequency only as the current state becomes reliable.
+- `g_cross` compares local normalized high-frequency energy between CT and the current state. It is soft and never treats every CT edge as a PET edge.
+- `g_content` is predicted from global band statistics and timestep by a two-layer MLP with few channels.
+- `g_direction` is optional and derives from phase-insensitive Gabor quadrature energy. It changes reliability only; raw signed Gabor responses are never injected.
 
-For every level, reliability is the product of:
+The gates share an overall reliability envelope while retaining bounded LH/HL/HH offsets. This avoids three unrelated spatial masks making contradictory decisions. A weak total-variation penalty is exposed from the spatial gates to discourage checkerboard/noisy gate maps.
 
-1. **analytic bridge reliability** — a sigmoid of band log-SNR derived from Brownian bridge progress, schedule sigma, and configured residual-band scale;
-2. **spatial evidence** — a learned bounded gate from residual-band magnitude, multiscale CT gradient magnitude, optional Gabor concentration, normalized timestep, and log-SNR;
-3. **optional directional agreement** — a learned `orientations -> 3 subbands` factor bounded to `[1-strength, 1+strength]`, so LH/HL/HH are not scaled identically.
+Configuration switches make the ablation identifiable:
 
-Every output projection ends in a zero-initialized convolution, making the enabled injector an exact initial no-op. The module only returns skip injections; it has no method that changes the noisy residual supplied to the denoiser.
+- `use_noise_release`
+- `use_ct_reliability`
+- `use_subband_gates`
+- `use_directional_reliability`
 
-### 3. Injection compatibility boundary
+When subband gates are disabled, all three bands share the same reliability scalar. Directional reliability requires an enabled Gabor prior.
 
-The existing `ZeroConvAdapter` remains responsible for CT, organ, legacy Gabor-adapter, and hotspot conditioning. The new frequency branch is computed separately and added after the adapter:
+### 3. Safe fusion and compatibility
+
+The original adapter and the new frequency branch are built independently:
 
 ```text
-decoder_skip = encoder_skip + existing_adapter_injection + reliable_frequency_injection
+S'_l = S_l + Adapter_l(CT, organ, hotspot, legacy routes) + Z_l(F_l)
 ```
 
-Reliability gates never multiply the existing adapter output. Therefore:
+Each `Z_l` ends with a zero-initialized `1x1` convolution. Initial behavior is therefore strictly equivalent to the same R2 model:
 
-- optional organ features remain injectable at L1-L3;
-- CT/hotspot adapter routes remain unchanged;
-- metadata FiLM and semantic cross-attention remain unchanged;
-- `roi_suv`, `organ_consistency`, and other loss interfaces remain constructible;
-- a disabled reliable injector cannot suppress an enabled organ/SUV route.
+1. original skips are unchanged;
+2. no new normalization is applied to them;
+3. concat order is unchanged;
+4. gates never multiply skips or adapter outputs;
+5. only the new additive residual starts at zero.
 
-### 4. Boundary-frequency supervision
+Consequently organ injection, metadata FiLM, semantic conditioning, `roi_suv`, and organ-consistency loss interfaces remain usable. A degraded frequency branch can be disabled without changing bridge forward/reverse equations or sampling state.
 
-`BoundaryFrequencyLoss` operates on reconstructed PET, not on the noisy bridge state.
+### 4. Gabor role
 
-It contains three independently reported terms:
+The existing Gabor prior already computes quadrature amplitude:
 
-- **lesion boundary:** Charbonnier difference between prediction and target gradient magnitude inside a morphological band around the lesion mask;
-- **anatomy consensus boundary:** the same error on a soft training-only weight formed from CT edge strength and target-PET edge strength;
-- **optional organ boundary:** the same error on boundaries extracted from non-empty organ masks.
+```text
+E_theta(x) = sqrt((G_cos*x)^2 + (G_sin*x)^2 + eps)
+```
 
-A level-1 Haar-detail error is also weighted by the downsampled union of the available boundary maps. This explicitly tests the user's edge-frequency hypothesis while avoiding the assumption that every CT edge must create a PET edge.
+The new branch maps these non-negative orientation energies to LH/HL/HH reliability offsets. Gabor content is not projected into PET features. Legacy direct adapter/noise routes remain available only for reproducing old controls and are explicitly disabled in every new reliable variant.
 
-The loss is timestep gated and off by default in legacy configurations.
+### 5. Boundary and gate supervision
 
-### 5. Boundary evaluation
+`BoundaryFrequencyLoss` operates only on predicted `x0` and target PET.
 
-The evaluator reports normalized-space metrics:
+- A lesion boundary ring is formed by dilation minus erosion of the training mask.
+- Gradient-magnitude error is measured inside that ring.
+- An anatomy proxy uses soft consensus between CT edge strength and target-PET edge strength, avoiding the assumption that every bone edge implies a metabolic edge.
+- Optional organ boundaries are used only when a non-empty organ mask is present.
+- A level-1 Haar-detail error is weighted by the available boundary union.
+- The whole boundary loss is released in middle/late denoising by bridge reliability.
+- A small `gate_tv` term regularizes only the newly generated spatial gates.
 
-- `lesion_boundary_intensity_mae_norm`;
-- `lesion_boundary_gradient_mae_norm`;
-- `anatomy_edge_gradient_mae_norm` on high-gradient CT locations;
-- `organ_boundary_gradient_mae_norm` only when a non-empty organ mask exists.
+Lesion/organ masks never enter the denoiser or sampler.
 
-The first three work with the current PNG dataset. The organ metric is omitted from aggregates when unavailable rather than replaced with zero.
+For directional artifacts, evaluation compares prediction and target Gabor orientation-energy spectra rather than imposing isotropy on anatomically directional images.
 
-## Configuration
+## Configuration sketch
 
 ```yaml
 modules:
   wavelet_unet:
-    enabled: true
-    mix_kernel_size: 3
-
+    enabled: false
   residual_frequency:
     enabled: true
-    mode: reliable
+    mode: boundary_reliable
     output_channels: [256, 256, 128, 64]
-    band_scales: [1.0, 0.5, 0.25, 0.25]
-    snr_center: 0.0
-    snr_temperature: 2.0
-    reliability_floor: 0.02
-    use_directional_gate: true
-    gabor_orientations: 8
-    direction_strength: 0.1
+    band_scales: [0.5, 0.25]
+    use_noise_release: true
+    use_ct_reliability: true
+    use_subband_gates: true
+    use_directional_reliability: true
+    gate_max: 0.25
+    cross_temperature: 1.0
+    content_hidden_channels: 16
 
 losses:
   boundary_frequency:
@@ -154,43 +139,44 @@ losses:
     organ_weight: 0.5
     wavelet_weight: 0.25
     boundary_radius: 2
-    active_tau_max: 0.7
+  frequency_gate_tv:
+    enabled: true
+    weight: 0.001
 ```
-
-Invalid modes, non-positive scales, invalid reliability temperatures/floors, and directional gating without an enabled Gabor prior fail at construction.
 
 ## V3 ablation
 
-All variants reuse the same frozen V2 conditional-mean checkpoint and initialization seed.
+`R2-A` as originally suggested is not a valid comparison in this repository because R2 has frequency disabled and never calls `modulate_residual()`. The state-modulation question is isolated with paired legacy controls instead.
 
-| ID | Wavelet U-Net | Reliable injector | Direction gate | Boundary loss | Purpose |
-|---|---:|---:|---:|---:|---|
-| R2 | off | off | off | off | validated residual-bridge reference |
-| LF4 | off | legacy F4 | legacy | legacy losses | previous frequency control |
-| W1 | on | off | off | off | wavelet backbone contribution |
-| I1 | off | on | off | off | reliable injection contribution |
-| WI | on | on | off | off | two core modules together |
-| WI-G | on | on | on | off | directional refinement contribution |
-| WI-L | on | on | off | on | boundary supervision contribution |
-| WI-F | on | on | on | on | complete proposed method |
+| ID | Change from prior row | Purpose |
+|---|---|---|
+| R2 | frozen mean + residual bridge, frequency off | validated reference |
+| F4 | legacy F4 unchanged | old frequency control |
+| F4-NM | F4 with `modulate_residual()` disabled | isolate direct state modification |
+| BR-B | two-level Haar + fixed noise release | safe high-frequency injection |
+| BR-C | add CT edge soft reliability | cross-modal boundary confidence |
+| BR-D | add independent bounded LH/HL/HH offsets | subband selectivity |
+| BR-E | add Gabor directional-energy reliability | directional reliability, no texture injection |
+| BR-F | add boundary-ring and gate-TV losses | complete proposed method |
 
-Screening runs every variant for 50 epochs without early stopping and evaluates the same 16-sample stratified validation subset. Artifact gates remain mandatory. Edge metrics enter ranking after the artifact gates.
-
-At most two non-reference variants are retrained from scratch for exactly 300 epochs. Promotion uses `eval_interval=20` and `early_stopping=false`; the final report evaluates each run's EMA `best_combined` checkpoint on 64 validation samples and records the checkpoint epoch.
+All variants reuse the same frozen V2 mean and paired U-Net initialization. Screening is 50 epochs. At most two eligible non-reference variants are retrained from scratch for exactly 300 epochs with early stopping disabled and EMA evaluation every 20 epochs.
 
 ## Acceptance criteria
 
-- Legacy configs instantiate the original `BBDMUNet` and legacy preconditioner unchanged.
-- Wavelet U-Net uses three DWT and three IWT scale transitions and accepts existing skip injections.
-- Reliable injections have exact decoder shapes, are finite/bounded, and start at zero.
-- Analytic reliability is lower at low SNR than high SNR for the same band.
-- Directional gating can produce distinct LH/HL/HH factors while remaining bounded.
-- Reliable mode never modifies the noisy residual tensor.
-- Organ adapter routing still affects skips when wavelet and reliable modules are enabled.
-- Boundary loss is finite with lesion-only PNG batches and uses optional organ masks only when non-empty.
-- Evaluation emits lesion/anatomy edge metrics and omits unavailable organ aggregates.
-- V3 promotion commands disable early stopping and pin fixed seed, frozen mean, evaluation subset, and EMA weights.
+- New band construction uses exactly two Haar levels.
+- L3 injection is exactly zero.
+- L2/L1 use native details and L0 uses `IDWT(0, details)`.
+- Gates are finite, non-negative, capped, and distinguish LH/HL/HH only when enabled.
+- Noise reliability increases with bridge SNR for identical content.
+- CT reliability compares energy, not signed cross-modal coefficients.
+- Gabor affects gates only; injected content is unchanged when only Gabor energy changes and gates are held fixed.
+- New residual heads are zero-initialized and receive gradients.
+- Boundary-reliable mode has no noisy-state modulation method or call.
+- Existing adapter output is added independently and remains effective.
+- Boundary loss uses predicted `x0`; masks are loss/evaluation-only.
+- Empty organ masks do not create fake zero metrics.
+- Legacy R2/F4 construction and checkpoints remain valid.
 
-## Scientific interpretation
+## Scientific claim boundary
 
-The complete model is considered effective only if it passes artifact gates and improves lesion/boundary metrics without materially degrading MAE/SSIM. CT-edge results are described as anatomy-aligned proxy results, not organ-specific results. Organ and physical-SUV claims are deferred until those inputs become available.
+The contribution is framed as a CT-to-PET **subband-level boundary-frequency injection mechanism jointly controlled by bridge-noise reliability, CT/PET edge-energy agreement, and Gabor directional reliability**, without modifying the diffusion state or main U-Net. It is not framed as the first use of timestep-adaptive frequency gating or generic wavelet diffusion.
