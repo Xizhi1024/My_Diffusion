@@ -168,6 +168,7 @@ def build_png_cache(
     label_subdir: str = "label",
     normalization: str = "auto",
     mask_threshold: float = 0.0,
+    pet_invert: bool = False,
     allow_missing_mask: bool = False,
     overwrite: bool = True,
 ) -> Dict[str, Any]:
@@ -244,6 +245,12 @@ def build_png_cache(
         try:
             ct_raw, ct_mode = _load_png_array(ct_path, image_size, mask=False)
             pet_raw, pet_mode = _load_png_array(pet_path, image_size, mask=False)
+            if pet_invert:
+                # pet_peizhuan PNGs are inverted grayscale on a white canvas:
+                # background (outside body) = 255, hot lesion = darkest. Invert
+                # (255 - x) so background -> 0 and hot lesion -> bright before
+                # normalisation. Use only for white-canvas inverted PET.
+                pet_raw = 255.0 - pet_raw
             ct = _normalise_image(ct_raw, ct_mode, normalization)[None, ...]
             pet = _normalise_image(pet_raw, pet_mode, normalization)[None, ...]
 
@@ -265,6 +272,7 @@ def build_png_cache(
                 "pet_physical_key": "",
                 "pet_physical_kind": "png_intensity",
                 "png_normalization": normalization,
+                "pet_invert": pet_invert,
                 "patient_id": patient_id,
                 "slice_id": int(slice_id),
             }
@@ -336,6 +344,8 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--label-subdir", default="label")
     ap.add_argument("--normalization", choices=["auto", "minmax"], default="auto")
     ap.add_argument("--mask-threshold", type=float, default=0.0)
+    ap.add_argument("--pet-invert", action="store_true",
+                    help="Invert PET (255-x): for white-canvas inverted PET where background=255 and hot lesion is dark")
     ap.add_argument("--allow-missing-mask", action="store_true")
     ap.add_argument("--no-overwrite", action="store_true")
     ap.add_argument("--allow-skips", action="store_true",
@@ -353,6 +363,7 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
         label_subdir=args.label_subdir,
         normalization=args.normalization,
         mask_threshold=args.mask_threshold,
+        pet_invert=args.pet_invert,
         allow_missing_mask=args.allow_missing_mask,
         overwrite=not args.no_overwrite,
     )

@@ -628,7 +628,14 @@ def build_dataloaders(data_cfg: Dict[str, Any], run_cfg: Dict[str, Any]) -> Tupl
     optional_keys = data_cfg.get("optional_keys", [])
 
     use_fake = data_cfg.get("use_fake_data", False)
-    if cache_dir and Path(cache_dir).is_dir():
+    if use_fake:
+        # Must be checked BEFORE the cache branch: once cache_dir exists,
+        # the cache-first ordering would silently ignore use_fake_data=true,
+        # turning a smoke test into a real training run on (possibly misaligned) data.
+        print("[DataLoader] use_fake_data=True — using FakeDataset for smoke testing")
+        train_ds = FakeDataset(32, image_size)
+        val_ds = FakeDataset(8, image_size)
+    elif cache_dir and Path(cache_dir).is_dir():
         train_ds = CachedDataset(cache_dir, split="train", augment=augment,
                                  split_manifest=split_manifest_path,
                                  required_keys=required_keys, optional_keys=optional_keys)
@@ -641,10 +648,6 @@ def build_dataloaders(data_cfg: Dict[str, Any], run_cfg: Dict[str, Any]) -> Tupl
                                        required_keys=required_keys, optional_keys=optional_keys)
             except ValueError:
                 print(f"[DataLoader] No val samples in {val_dir} — training without validation set")
-    elif use_fake:
-        print("[DataLoader] use_fake_data=True — using FakeDataset for smoke testing")
-        train_ds = FakeDataset(32, image_size)
-        val_ds = FakeDataset(8, image_size)
     else:
         raise RuntimeError(
             f"Cache directory not found: '{cache_dir}'. "
