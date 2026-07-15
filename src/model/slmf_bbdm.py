@@ -402,6 +402,9 @@ class SLMFBBDM(nn.Module):
                     band_scales=tuple(frequency_cfg.get("band_scales", [0.5, 0.25])),
                     use_noise_release=frequency_cfg.get("use_noise_release", True),
                     use_ct_reliability=frequency_cfg.get("use_ct_reliability", True),
+                    use_content_reliability=frequency_cfg.get(
+                        "use_content_reliability", True
+                    ),
                     use_subband_gates=frequency_cfg.get("use_subband_gates", True),
                     use_directional_reliability=use_directional_reliability,
                     gabor_orientations=gabor_orientations,

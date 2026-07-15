@@ -128,6 +128,29 @@ def test_shared_mode_has_one_gate_but_subband_mode_can_separate_lh_hl_hh():
     assert means[0] < means[1] < means[2]
 
 
+def test_content_reliability_can_be_disabled_for_fixed_release_ablation():
+    residual = torch.randn(1, 1, 32, 32)
+    ct = torch.zeros_like(residual)
+    from src.model.noise.base import BBDMBridgeSchedule
+
+    module = _module(
+        use_ct_reliability=False,
+        use_content_reliability=False,
+        use_subband_gates=True,
+    )
+    with torch.no_grad():
+        module.content_gates[1].net[-1].bias.copy_(torch.tensor([-4.0, 0.0, 4.0]))
+    _, diagnostics = module(
+        residual,
+        torch.tensor([100]),
+        BBDMBridgeSchedule(num_train_timesteps=1000),
+        ct,
+    )
+    gates = diagnostics["gates_l1"]
+    assert torch.allclose(gates[:, 0], gates[:, 1])
+    assert torch.allclose(gates[:, 1], gates[:, 2])
+
+
 def test_gabor_quadrature_energy_only_changes_directional_reliability():
     module = _module(
         use_directional_reliability=True,

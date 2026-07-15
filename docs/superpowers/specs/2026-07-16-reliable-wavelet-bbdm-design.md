@@ -62,6 +62,7 @@ Configuration switches make the ablation identifiable:
 
 - `use_noise_release`
 - `use_ct_reliability`
+- `use_content_reliability`
 - `use_subband_gates`
 - `use_directional_reliability`
 
@@ -124,6 +125,7 @@ modules:
     band_scales: [0.5, 0.25]
     use_noise_release: true
     use_ct_reliability: true
+    use_content_reliability: true
     use_subband_gates: true
     use_directional_reliability: true
     gate_max: 0.25

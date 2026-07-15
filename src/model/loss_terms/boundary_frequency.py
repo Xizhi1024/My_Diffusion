@@ -49,12 +49,11 @@ def _available_boundary(
     mask = mask.to(device=reference.device, dtype=reference.dtype)
     if mask.shape[-2:] != reference.shape[-2:]:
         mask = F.interpolate(mask, size=reference.shape[-2:], mode="nearest")
-    if torch.count_nonzero(mask > 0.5).item() == 0:
-        return zero_map, zero
+    available = (mask > 0.5).any().to(device=reference.device, dtype=reference.dtype)
     ring = _boundary_ring(mask, radius)
     if collapse_channels and ring.shape[1] > 1:
         ring = ring.amax(dim=1, keepdim=True)
-    return ring, torch.ones_like(zero)
+    return ring, available
 
 
 def _weighted_charbonnier(
@@ -63,8 +62,6 @@ def _weighted_charbonnier(
     spatial_weight: torch.Tensor,
     epsilon: float,
 ) -> torch.Tensor:
-    if spatial_weight.sum().detach().item() <= 0:
-        return prediction.new_zeros(())
     error = torch.sqrt((prediction - target).square() + epsilon ** 2) - epsilon
     denominator = spatial_weight.sum() * prediction.shape[1]
     return (error * spatial_weight).sum() / denominator.clamp_min(1.0)

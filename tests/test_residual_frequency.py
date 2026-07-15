@@ -391,6 +391,31 @@ class TestResidualBBDMIntegration:
 
         assert all(torch.all(tensor == 5.0) for tensor in combined)
 
+    def test_boundary_reliable_keeps_real_organ_adapter_and_roi_suv_interfaces(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=True)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": True,
+        })
+        cfg["modules"]["zero_adapter"] = {"enabled": True}
+        cfg["modules"]["organ_prior"] = {
+            "enabled": True,
+            "organ_channels": 6,
+        }
+        cfg["losses"]["roi_suv"] = {"enabled": True, "weight": 0.1}
+        model = SLMFBBDM.from_config(cfg)
+        batch = _model_batch()
+        batch["organ_mask"][:, 1, 8:20, 8:20] = 1.0
+
+        loss, logs = model(batch, timesteps=torch.tensor([25]))
+
+        assert torch.isfinite(loss)
+        assert "loss/roi_suv/loss" in logs
+        assert logs["module/organ_prior"].item() == 1.0
+
     def test_boundary_reliable_forward_routes_only_inference_available_ct_and_gabor(
         self, monkeypatch
     ):

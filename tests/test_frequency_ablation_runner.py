@@ -342,20 +342,20 @@ def test_ranking_json_sanitizes_unavailable_clinical_nan(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("preset", "mode", "inject_wavelet", "ct_reliability", "subbands", "direction", "boundary"),
+    ("preset", "mode", "inject_wavelet", "ct_reliability", "content", "subbands", "direction", "boundary"),
     [
-        ("br_r2", None, None, None, None, None, False),
-        ("br_f2", "legacy", False, None, None, None, False),
-        ("br_f4", "legacy", True, None, None, None, False),
-        ("br_b", "boundary_reliable", True, False, False, False, False),
-        ("br_c", "boundary_reliable", True, True, False, False, False),
-        ("br_d", "boundary_reliable", True, True, True, False, False),
-        ("br_e", "boundary_reliable", True, True, True, True, False),
-        ("br_f", "boundary_reliable", True, True, True, True, True),
+        ("br_r2", None, None, None, None, None, None, False),
+        ("br_f2", "legacy", False, None, None, None, None, False),
+        ("br_f4", "legacy", True, None, None, None, None, False),
+        ("br_b", "boundary_reliable", True, False, False, False, False, False),
+        ("br_c", "boundary_reliable", True, True, False, False, False, False),
+        ("br_d", "boundary_reliable", True, True, True, True, False, False),
+        ("br_e", "boundary_reliable", True, True, True, True, True, False),
+        ("br_f", "boundary_reliable", True, True, True, True, True, True),
     ],
 )
 def test_boundary_reliable_presets_are_distinct_and_keep_wavelet_backbone_off(
-    preset, mode, inject_wavelet, ct_reliability, subbands, direction, boundary
+    preset, mode, inject_wavelet, ct_reliability, content, subbands, direction, boundary
 ):
     from src.model.config_utils import load_full_config, validate_png_baseline_config
     from src.model.slmf_bbdm import SLMFBBDM
@@ -376,6 +376,7 @@ def test_boundary_reliable_presets_are_distinct_and_keep_wavelet_backbone_off(
         assert model.residual_preconditioner.inject_wavelet is inject_wavelet
     if mode == "boundary_reliable":
         assert model.residual_preconditioner.use_ct_reliability is ct_reliability
+        assert model.residual_preconditioner.use_content_reliability is content
         assert model.residual_preconditioner.use_subband_gates is subbands
         assert model.residual_preconditioner.use_directional_reliability is direction
     assert model.loss_terms["boundary_frequency"].enabled is boundary
@@ -407,6 +408,42 @@ def test_every_boundary_reliable_preset_completes_a_real_forward(preset):
     batch["mask"][:, :, 14:18, 14:18] = 1
     loss, _ = model(batch, timesteps=torch.tensor([250]))
     assert torch.isfinite(loss)
+
+
+def test_zero_initialized_br_b_is_initially_equivalent_to_paired_r2():
+    import torch
+
+    from src.model.config_utils import load_full_config
+    from src.model.slmf_bbdm import SLMFBBDM
+
+    def build(preset):
+        cfg = load_full_config(
+            "configs/experiments/slmf_png_boundary_reliable.yaml",
+            ablation=preset,
+            ablation_config_path="configs/experiments/ablations.yaml",
+            overrides=[
+                "data.image_size=32",
+                "model.initialization_seed=4242",
+                "runtime.eval_sampling_steps=2",
+            ],
+        )
+        torch.manual_seed(123)
+        return SLMFBBDM.from_config(cfg).eval()
+
+    r2 = build("br_r2")
+    br_b = build("br_b")
+    batch = {
+        "ct": torch.randn(1, 1, 32, 32),
+        "pet": torch.randn(1, 1, 32, 32),
+        "mask": torch.zeros(1, 1, 32, 32),
+    }
+    timestep = torch.tensor([250])
+    torch.manual_seed(999)
+    r2_loss, _ = r2(batch, timesteps=timestep)
+    torch.manual_seed(999)
+    br_b_loss, _ = br_b(batch, timesteps=timestep)
+
+    assert torch.allclose(r2_loss, br_b_loss, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize(

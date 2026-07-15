@@ -85,6 +85,7 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         band_scales: Sequence[float] = (0.5, 0.25),
         use_noise_release: bool = True,
         use_ct_reliability: bool = True,
+        use_content_reliability: bool = True,
         use_subband_gates: bool = True,
         use_directional_reliability: bool = False,
         gabor_orientations: int = 8,
@@ -113,6 +114,7 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         self.output_channels = tuple(int(channel) for channel in output_channels)
         self.use_noise_release = bool(use_noise_release)
         self.use_ct_reliability = bool(use_ct_reliability)
+        self.use_content_reliability = bool(use_content_reliability)
         self.use_subband_gates = bool(use_subband_gates)
         self.use_directional_reliability = bool(use_directional_reliability)
         self.gabor_orientations = int(gabor_orientations)
@@ -237,6 +239,8 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         ct_details: HaarDetails,
         noise_gate: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.use_content_reliability:
+            return residual_details[0].new_ones(residual_details[0].shape[0], 3)
         residual_stats = _stack_details(residual_details).abs().mean(dim=(-2, -1))
         ct_stats = _stack_details(ct_details).abs().mean(dim=(-2, -1))
         statistics = torch.cat((residual_stats, ct_stats, noise_gate[:, None]), dim=1)
