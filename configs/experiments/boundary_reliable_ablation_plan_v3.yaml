@@ -1,0 +1,60 @@
+base_config: configs/experiments/slmf_png_boundary_reliable.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/boundary_reliable_ablations_v3
+reference_id: R2
+top_k: 2
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+variants:
+  - {id: R2, preset: br_r2}
+  - {id: F2, preset: br_f2}
+  - {id: F4, preset: br_f4}
+  - {id: BR-B, preset: br_b}
+  - {id: BR-C, preset: br_c}
+  - {id: BR-D, preset: br_d}
+  - {id: BR-E, preset: br_e}
+  - {id: BR-F, preset: br_f}
+
+screen:
+  experiment_prefix: br_v3_screen
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 16
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+
+promote:
+  experiment_prefix: br_v3_full
+  epochs: 300
+  eval_interval: 20
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+
+hard_gates:
+  failure_any_mean:
+    direction: lower
+    max_delta: 0.0625
+  false_hotspot_density_mean:
+    direction: lower
+    max_ratio: 1.25
+    epsilon: 1e-6
+  stripe_excess_mean:
+    direction: lower
+    max_delta: 0.05
+  ssim_mean:
+    direction: higher
+    max_delta: 0.03

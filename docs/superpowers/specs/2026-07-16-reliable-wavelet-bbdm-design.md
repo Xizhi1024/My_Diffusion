@@ -146,13 +146,13 @@ losses:
 
 ## V3 ablation
 
-`R2-A` as originally suggested is not a valid comparison in this repository because R2 has frequency disabled and never calls `modulate_residual()`. The state-modulation question is isolated with paired legacy controls instead.
+`R2-A` as originally suggested is not a valid comparison in this repository because R2 has frequency disabled and never calls `modulate_residual()`. F4 is also not a valid state-modulation pair: its `inject_wavelet=true` path already bypasses `modulate_residual()`. The existing F2 preset is the true isolated state-modulation experiment because it sets `inject_wavelet=false`, enables the Gabor gate, and disables frequency skip injection/losses.
 
 | ID | Change from prior row | Purpose |
 |---|---|---|
 | R2 | frozen mean + residual bridge, frequency off | validated reference |
+| F2 | legacy Gabor state modulation, no frequency skip | isolate direct diffusion-state modification |
 | F4 | legacy F4 unchanged | old frequency control |
-| F4-NM | F4 with `modulate_residual()` disabled | isolate direct state modification |
 | BR-B | two-level Haar + fixed noise release | safe high-frequency injection |
 | BR-C | add CT edge soft reliability | cross-modal boundary confidence |
 | BR-D | add independent bounded LH/HL/HH offsets | subband selectivity |

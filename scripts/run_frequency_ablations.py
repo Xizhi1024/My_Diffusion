@@ -80,9 +80,27 @@ def composite_score(metrics: Mapping[str, Any]) -> float:
     stripe = max(metric_value(metrics, "stripe_excess_mean"), 0.0)
     ssim = metric_value(metrics, "ssim_mean")
     mae = metric_value(metrics, "mae_mean")
+    lesion_boundary = metric_value(
+        metrics, "lesion_boundary_gradient_mae_norm_mean"
+    )
+    anatomy_boundary = metric_value(
+        metrics, "anatomy_edge_gradient_mae_norm_mean"
+    )
+    direction_error = metric_value(
+        metrics, "directional_spectrum_error_norm_mean"
+    )
 
-    lesion = -(peak + 0.02 * centroid + 0.50 * failure)
-    image = ssim - mae - 0.20 * stripe - 100.0 * hotspot
+    lesion = -(
+        peak + 0.02 * centroid + 0.50 * failure + 0.20 * lesion_boundary
+    )
+    image = (
+        ssim
+        - mae
+        - 0.20 * stripe
+        - 100.0 * hotspot
+        - 0.10 * anatomy_boundary
+        - 0.10 * direction_error
+    )
     return 0.70 * lesion + 0.30 * image
 
 
@@ -116,6 +134,7 @@ def select_promotions(
             "id": variant_id,
             "preset": row.get("preset"),
             "experiment": row.get("experiment"),
+            "checkpoint_epoch": row.get("checkpoint_epoch"),
             "metrics": dict(metrics),
             "gate_passed": gate_passed,
             "gate_reasons": reasons,
@@ -357,15 +376,39 @@ def _run_mean(entry: Mapping[str, Any], force: bool) -> None:
 
 def _require_planned_mean_checkpoint(plan: Mapping[str, Any]) -> None:
     mean_settings = plan.get("mean_pretrain", {})
-    if not isinstance(mean_settings, Mapping) or not mean_settings.get("enabled", False):
+    if not isinstance(mean_settings, Mapping):
         return
-    experiment = str(mean_settings.get("experiment", "freq_mean_pretrain"))
-    output_dir = Path(str(mean_settings.get("output_dir", Path("checkpoints") / experiment)))
-    checkpoint = Path(str(mean_settings.get("checkpoint", output_dir / "mean_best.pt")))
+    if mean_settings.get("enabled", False):
+        experiment = str(mean_settings.get("experiment", "freq_mean_pretrain"))
+        output_dir = Path(
+            str(mean_settings.get("output_dir", Path("checkpoints") / experiment))
+        )
+        default_checkpoint = output_dir / "mean_best.pt"
+    else:
+        default_checkpoint = plan.get("common_train_overrides", {}).get(
+            "modules.conditional_mean.checkpoint"
+        )
+    configured = mean_settings.get("checkpoint", default_checkpoint)
+    if not configured:
+        return
+    checkpoint = Path(str(configured))
     if not checkpoint.exists():
         raise FileNotFoundError(
-            f"Required mean checkpoint is missing: {checkpoint}; run --stage mean first"
+            f"Required frozen mean checkpoint is missing: {checkpoint}"
         )
+
+
+def checkpoint_epoch(path: Path) -> int:
+    """Read the actual selected checkpoint epoch for the experiment record."""
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Checkpoint {path} is not a mapping")
+    epoch = payload.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        raise ValueError(f"Checkpoint {path} is missing integer epoch metadata")
+    return epoch
 
 
 def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict[str, Any]]:
@@ -392,6 +435,7 @@ def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict
             "id": entry["id"],
             "preset": entry["preset"],
             "experiment": entry["experiment"],
+            "checkpoint_epoch": checkpoint_epoch(checkpoint),
             "metrics": metrics,
         })
     return records
@@ -421,11 +465,14 @@ def _write_rankings(output_dir: Path, promoted: Sequence[str], ranked: Sequence[
         "stripe_excess_mean",
         "ssim_mean",
         "mae_mean",
+        "lesion_boundary_gradient_mae_norm_mean",
+        "anatomy_edge_gradient_mae_norm_mean",
+        "directional_spectrum_error_norm_mean",
     ]
     with (output_dir / "leaderboard.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["rank", "id", "preset", "gate_passed", "score", "gate_reasons", *metric_names],
+            fieldnames=["rank", "id", "preset", "checkpoint_epoch", "gate_passed", "score", "gate_reasons", *metric_names],
         )
         writer.writeheader()
         for rank, row in enumerate(ranked, start=1):
@@ -434,6 +481,7 @@ def _write_rankings(output_dir: Path, promoted: Sequence[str], ranked: Sequence[
                 "rank": rank,
                 "id": row["id"],
                 "preset": row.get("preset"),
+                "checkpoint_epoch": row.get("checkpoint_epoch"),
                 "gate_passed": row["gate_passed"],
                 "score": row["score"],
                 "gate_reasons": "; ".join(row["gate_reasons"]),
@@ -516,7 +564,19 @@ def main() -> None:
         promotion_manifest = build_execution_manifest(
             plan, python=sys.executable, stage="promote", promoted_ids=promoted
         )
-        _run_entries(promotion_manifest["promotion_runs"], force=args.force)
+        promotion_records = _run_entries(
+            promotion_manifest["promotion_runs"], force=args.force
+        )
+        with (output_dir / "promotion_results.json").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            json.dump(
+                _json_safe(promotion_records),
+                handle,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
 
 
 if __name__ == "__main__":

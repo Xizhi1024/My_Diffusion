@@ -74,6 +74,164 @@ ablations:
       losses.residual_wavelet.enabled: true
       losses.gabor_consistency.enabled: true
 
+  # ---- Boundary-reliable V3 screen (complete Wavelet U-Net stays off) ----
+  br_r2:
+    description: R2 frozen conditional mean plus residual bridge reference
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_f2:
+    description: Legacy F2 direct noisy-state Gabor modulation without skip injection
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: legacy
+      modules.residual_frequency.inject_wavelet: false
+      modules.residual_frequency.state_modulation: true
+      modules.residual_frequency.use_gabor_gate: true
+      modules.residual_frequency.band_scales: [1.0, 0.5, 0.25]
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_f4:
+    description: Legacy F4 skip-frequency control with legacy frequency losses
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: legacy
+      modules.residual_frequency.inject_wavelet: true
+      modules.residual_frequency.state_modulation: true
+      modules.residual_frequency.use_gabor_gate: true
+      modules.residual_frequency.band_scales: [1.0, 0.5, 0.25]
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: true
+      losses.residual_wavelet.enabled: true
+      losses.gabor_consistency.enabled: true
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_b:
+    description: Two-level Haar skip residual with analytic noise release only
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: false
+      modules.residual_frequency.use_subband_gates: false
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_c:
+    description: BR-B plus CT-PET local edge-energy soft reliability
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_subband_gates: false
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_d:
+    description: BR-C plus bounded LH-HL-HH content gates
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_e:
+    description: BR-D plus Gabor quadrature directional reliability
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: true
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_f:
+    description: Complete boundary-reliable injector plus boundary and gate-TV losses
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: true
+      modules.residual_frequency.use_gabor_gate: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: true
+      losses.frequency_gate_tv.enabled: true
+
   # ---- Full baseline (all off) ----
   baseline:
     description: Raw CT concat + standard BBDM + base MSE loss only

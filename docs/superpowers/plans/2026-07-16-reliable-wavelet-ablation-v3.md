@@ -12,16 +12,16 @@
 - [ ] Add bounded score terms; do not require unavailable organ metrics.
 - [ ] Run runner tests to GREEN.
 
-### Task 2: Add base config and eight paired presets
+### Task 2: Add base config and eight distinct presets
 
 **Files:**
 - Create: `configs/experiments/slmf_png_boundary_reliable.yaml`
 - Modify: `configs/experiments/ablations.yaml`
 - Modify: `tests/test_frequency_ablation_runner.py`
 
-- [ ] RED: presets `br_r2`, `br_f4`, `br_f4_nm`, `br_b`, `br_c`, `br_d`, `br_e`, `br_f` resolve and construct.
+- [ ] RED: presets `br_r2`, `br_f2`, `br_f4`, `br_b`, `br_c`, `br_d`, `br_e`, `br_f` resolve and construct.
 - [ ] Keep `modules.wavelet_unet.enabled=false` in every preset.
-- [ ] `br_f4` reproduces legacy F4; `br_f4_nm` changes only `state_modulation=false`.
+- [ ] `br_f2` reproduces the legacy state-modulation-only F2 control; `br_f4` reproduces legacy F4 without falsely attributing state modulation to it.
 - [ ] `br_b` enables two-level Haar plus fixed noise release.
 - [ ] `br_c` adds CT soft reliability.
 - [ ] `br_d` adds independent bounded LH/HL/HH offsets.
