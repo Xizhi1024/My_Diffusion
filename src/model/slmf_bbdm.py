@@ -210,6 +210,7 @@ class SLMFBBDM(nn.Module):
         conditional_mean_config: Optional[Dict[str, Any]] = None,
         residual_bridge_config: Optional[Dict[str, Any]] = None,
         residual_frequency_config: Optional[Dict[str, Any]] = None,
+        wavelet_unet_config: Optional[Dict[str, Any]] = None,
         meta_config: Optional[Dict[str, Any]] = None,
         segmenter_config: Optional[Dict[str, Any]] = None,
         # Inference
@@ -406,21 +407,31 @@ class SLMFBBDM(nn.Module):
 
         # ---- UNet ----
         # Input is [noisy_x, ct] plus optional previous x0 estimate.
+        wavelet_cfg = wavelet_unet_config or {}
+        self.wavelet_unet_enabled = bool(wavelet_cfg.get("enabled", False))
+        unet_class = BBDMUNet
         unet_kwargs = {
             "in_channels": 3 if self.self_conditioning else 2,
             "enable_heteroscedastic": enable_heteroscedastic,
             "ca_kv_dim": 64,
             "meta_dim": meta_dim,
         }
+        if self.wavelet_unet_enabled:
+            from .wavelet_unet import WaveletBBDMUNet
+
+            unet_class = WaveletBBDMUNet
+            unet_kwargs["mix_kernel_size"] = int(
+                wavelet_cfg.get("mix_kernel_size", 3)
+            )
         if self.initialization_seed is None:
-            self.unet = BBDMUNet(**unet_kwargs)
+            self.unet = unet_class(**unet_kwargs)
         else:
             # Optional modules are constructed before the U-Net and therefore
             # consume different amounts of RNG state across ablation variants.
             # Isolate U-Net construction so its initialization remains paired.
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(self.initialization_seed)
-                self.unet = BBDMUNet(**unet_kwargs)
+                self.unet = unet_class(**unet_kwargs)
 
         # ---- Loss stack ----
         loss_cfgs = loss_configs or {}
@@ -1035,6 +1046,9 @@ class SLMFBBDM(nn.Module):
         logs["module/residual_frequency"] = torch.tensor(
             1.0 if self.residual_frequency_enabled else 0.0, device=device
         )
+        logs["module/wavelet_unet"] = torch.tensor(
+            1.0 if self.wavelet_unet_enabled else 0.0, device=device
+        )
         logs["module/scale_adaptive_noise"] = torch.tensor(
             1.0 if getattr(self.noise_schedule, "name", "") == "scale_adaptive_noise"
             and self.noise_schedule.enabled else 0.0,
@@ -1313,6 +1327,7 @@ class SLMFBBDM(nn.Module):
             conditional_mean_config=modules_cfg.get("conditional_mean", {}),
             residual_bridge_config=modules_cfg.get("residual_bridge", {}),
             residual_frequency_config=modules_cfg.get("residual_frequency", {}),
+            wavelet_unet_config=modules_cfg.get("wavelet_unet", {}),
             meta_config=model_cfg.get("metadata", config.get("metadata", {})),
             segmenter_config=model_cfg.get("segmenter", config.get("segmenter", {})),
             self_conditioning_config=model_cfg.get("self_conditioning", {}),

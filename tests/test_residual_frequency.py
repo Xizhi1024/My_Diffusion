@@ -332,6 +332,45 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    def test_wavelet_unet_is_selected_only_when_explicitly_enabled(self):
+        from src.model.bbdm_unet import BBDMUNet
+        from src.model.slmf_bbdm import SLMFBBDM
+        from src.model.wavelet_unet import WaveletBBDMUNet
+
+        legacy = SLMFBBDM.from_config(
+            _residual_config(frequency=False, gabor=False)
+        )
+        wavelet_cfg = _residual_config(frequency=False, gabor=False)
+        wavelet_cfg["modules"]["wavelet_unet"] = {
+            "enabled": True,
+            "mix_kernel_size": 3,
+        }
+        wavelet = SLMFBBDM.from_config(wavelet_cfg)
+
+        assert isinstance(legacy.unet, BBDMUNet)
+        assert isinstance(wavelet.unet, WaveletBBDMUNet)
+
+    def test_wavelet_unet_keeps_optional_organ_and_suv_interfaces(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=False, gabor=False)
+        cfg["modules"]["wavelet_unet"] = {"enabled": True}
+        cfg["modules"]["organ_prior"] = {
+            "enabled": True,
+            "organ_channels": 6,
+        }
+        cfg["modules"]["zero_adapter"] = {"enabled": True}
+        cfg["losses"]["roi_suv"] = {"enabled": True, "weight": 0.1}
+        model = SLMFBBDM.from_config(cfg)
+        batch = _model_batch()
+        batch["organ_mask"][:, 1, 8:16, 8:16] = 1.0
+
+        loss, logs = model(batch, timesteps=torch.tensor([10]))
+
+        assert torch.isfinite(loss)
+        assert "loss/roi_suv/loss" in logs
+        assert logs["module/wavelet_unet"].item() == 1.0
+
     def test_initialization_seed_makes_unet_identical_across_variants(self):
         from src.model.slmf_bbdm import SLMFBBDM
 
