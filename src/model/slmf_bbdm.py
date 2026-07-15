@@ -194,6 +194,7 @@ class SLMFBBDM(nn.Module):
         self,
         image_size: int = 192,
         objective: str = "pred_x0",
+        initialization_seed: Optional[int] = None,
         enable_heteroscedastic: bool = True,
         heteroscedastic_logvar_min: float = -6.0,
         heteroscedastic_logvar_max: float = 2.0,
@@ -217,6 +218,7 @@ class SLMFBBDM(nn.Module):
     ):
         super().__init__()
         self.image_size = image_size
+        self.initialization_seed = initialization_seed
         if objective != "pred_x0":
             raise ValueError(f"SLMF-BBDM only supports objective='pred_x0', got '{objective}'")
         self.enable_heteroscedastic = enable_heteroscedastic
@@ -404,12 +406,21 @@ class SLMFBBDM(nn.Module):
 
         # ---- UNet ----
         # Input is [noisy_x, ct] plus optional previous x0 estimate.
-        self.unet = BBDMUNet(
-            in_channels=3 if self.self_conditioning else 2,
-            enable_heteroscedastic=enable_heteroscedastic,
-            ca_kv_dim=64,
-            meta_dim=meta_dim,
-        )
+        unet_kwargs = {
+            "in_channels": 3 if self.self_conditioning else 2,
+            "enable_heteroscedastic": enable_heteroscedastic,
+            "ca_kv_dim": 64,
+            "meta_dim": meta_dim,
+        }
+        if self.initialization_seed is None:
+            self.unet = BBDMUNet(**unet_kwargs)
+        else:
+            # Optional modules are constructed before the U-Net and therefore
+            # consume different amounts of RNG state across ablation variants.
+            # Isolate U-Net construction so its initialization remains paired.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(self.initialization_seed)
+                self.unet = BBDMUNet(**unet_kwargs)
 
         # ---- Loss stack ----
         loss_cfgs = loss_configs or {}
@@ -1289,6 +1300,7 @@ class SLMFBBDM(nn.Module):
         return cls(
             image_size=data_cfg.get("image_size", 192),
             objective=model_cfg.get("objective", "pred_x0"),
+            initialization_seed=model_cfg.get("initialization_seed"),
             enable_heteroscedastic=model_cfg.get("enable_heteroscedastic", True),
             heteroscedastic_logvar_min=model_cfg.get("heteroscedastic_logvar_min", -6.0),
             heteroscedastic_logvar_max=model_cfg.get("heteroscedastic_logvar_max", 2.0),

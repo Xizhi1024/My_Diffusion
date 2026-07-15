@@ -332,6 +332,25 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    def test_initialization_seed_makes_unet_identical_across_variants(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        residual_only = _residual_config(frequency=False, gabor=False)
+        residual_only["model"]["initialization_seed"] = 4242
+        frequency_gabor = _residual_config(frequency=True, gabor=True)
+        frequency_gabor["model"]["initialization_seed"] = 4242
+
+        torch.manual_seed(123)
+        residual_model = SLMFBBDM.from_config(residual_only)
+        torch.manual_seed(123)
+        frequency_model = SLMFBBDM.from_config(frequency_gabor)
+
+        residual_state = residual_model.unet.state_dict()
+        frequency_state = frequency_model.unet.state_dict()
+        assert residual_state.keys() == frequency_state.keys()
+        for name in residual_state:
+            assert torch.equal(residual_state[name], frequency_state[name]), name
+
     def test_frozen_mean_requires_checkpoint(self):
         from src.model.slmf_bbdm import SLMFBBDM
 
