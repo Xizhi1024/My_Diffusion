@@ -64,6 +64,9 @@ train-wandb = "python scripts/train_v2.py --config configs/experiments/slmf_full
 # 这是当前推荐的稳定无条纹 baseline 入口。启动时会运行 validate_png_baseline_config。
 train-png-baseline = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml"
 
+# PNG residual-frequency R0/R2/F1-F4 screen + artifact gates + clean top-K retraining
+train-frequency-ablations = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan.yaml --stage all"
+
 # PNG baseline 5-epoch 过拟合冒烟测试（假数据，验证管线）
 train-png-smoke = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml --override data.use_fake_data=true --override training.num_epochs=5 --override runtime.eval_interval=2 --override runtime.save_interval=5 --override runtime.sample_interval=2"
 

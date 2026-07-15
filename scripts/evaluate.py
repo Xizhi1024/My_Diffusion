@@ -46,6 +46,7 @@ from src.model.slmf_bbdm import SLMFBBDM
 from src.model.loss_terms.roi_suv import _de_collate_meta
 from src.model.trainer import (
     _compute_pet_sample_metrics,
+    _stripe_score,
     _stratified_indices,
     _to_unit_interval,
 )
@@ -54,6 +55,16 @@ from src.model.trainer import (
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+
+def compute_stripe_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
+    """Compare directional-gradient anisotropy against the target image."""
+    pred_score = _stripe_score(pred)
+    target_score = _stripe_score(target)
+    return {
+        "stripe_score": float(pred_score),
+        "target_stripe_score": float(target_score),
+        "stripe_excess": float(pred_score - target_score),
+    }
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
     return t.detach().cpu().float().numpy()
@@ -566,6 +577,7 @@ def evaluate(
                 "ssim": compute_ssim(pred_np[0], target_np[0]),
                 "suv_valid": float(has_valid_suv),
             }
+            sample_metrics.update(compute_stripe_metrics(pred_np, target_np))
 
             # Normalized-intensity lesion metrics: always emitted when a lesion
             # mask exists.  These are the PNG-baseline lesion-fidelity metrics
@@ -693,6 +705,7 @@ def print_report(summary: Dict[str, Any]) -> None:
         ("Failure Detection", ["outside_inside_peak_ratio", "pred_target_suvmax_ratio",
                                "failure_outside_peak_gt_inside", "failure_lesion_too_cold",
                                "failure_high_uncertainty", "failure_any"]),
+        ("Directional Artifacts", ["stripe_score", "target_stripe_score", "stripe_excess"]),
         ("False Hotspots", ["false_hotspot_count", "false_hotspot_density", "false_hotspot_mean_intensity"]),
     ]
 

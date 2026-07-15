@@ -195,6 +195,9 @@ def validate_png_baseline_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "metadata_enabled": _is_enabled(config.get("metadata")) or _is_enabled(model_cfg.get("metadata")),
         "segmenter_enabled": _is_enabled(config.get("segmenter")) or _is_enabled(model_cfg.get("segmenter")),
         "gabor_routes": gabor_routes,
+        "conditional_mean_enabled": _is_enabled(modules_cfg.get("conditional_mean")),
+        "residual_bridge_enabled": _is_enabled(modules_cfg.get("residual_bridge")),
+        "residual_frequency_enabled": _is_enabled(modules_cfg.get("residual_frequency")),
         "physical_suv_available": bool(eval_cfg.get("physical_suv_available", False)),
     }
 
@@ -248,6 +251,9 @@ def log_startup_status(status: Dict[str, Any]) -> None:
     print(f"  roi_suv_enabled      : {status.get('roi_suv_enabled')}")
     print(f"  metadata_enabled     : {status.get('metadata_enabled')}")
     print(f"  segmenter_enabled    : {status.get('segmenter_enabled')}")
+    print(f"  conditional_mean     : {status.get('conditional_mean_enabled')}")
+    print(f"  residual_bridge      : {status.get('residual_bridge_enabled')}")
+    print(f"  residual_frequency   : {status.get('residual_frequency_enabled')}")
     print(f"  physical_suv_available: {status.get('physical_suv_available')}")
     routes = status.get("gabor_routes", {})
     if routes:

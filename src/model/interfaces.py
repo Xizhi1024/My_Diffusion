@@ -71,6 +71,9 @@ class LossContext:
     batch: Dict[str, torch.Tensor]
     condition: ConditionBundle
     pred_logvar: Optional[torch.Tensor] = None
+    pred_residual: Optional[torch.Tensor] = None
+    target_residual: Optional[torch.Tensor] = None
+    mean_pet: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
