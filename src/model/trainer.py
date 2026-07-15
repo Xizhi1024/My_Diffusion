@@ -48,6 +48,42 @@ def _stripe_score(pred_np: np.ndarray) -> float:
     return float(energies.max() / max(energies.mean(), 1e-8))
 
 
+def _to_unit_interval(array: np.ndarray) -> np.ndarray:
+    """Convert model-space PET values from [-1, 1] to clipped [0, 1]."""
+    return np.clip((array.astype(np.float32) + 1.0) * 0.5, 0.0, 1.0)
+
+
+def _compute_pet_sample_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mask: np.ndarray,
+) -> Optional[Dict[str, float]]:
+    """Compute lesion metrics without zero-filled masked-array artefacts."""
+    valid = mask > 0.5
+    if not np.any(valid):
+        return None
+
+    pred_unit = _to_unit_interval(pred)
+    target_unit = _to_unit_interval(target)
+    outside = ~valid
+    pred_in_peak = float(pred_unit[valid].max())
+    target_in_peak = float(target_unit[valid].max())
+    out_peak = float(pred_unit[outside].max()) if np.any(outside) else 0.0
+
+    ys, xs = np.nonzero(valid)
+    peak_index = int(np.argmax(pred_unit[valid]))
+    py, px = float(ys[peak_index]), float(xs[peak_index])
+    cy, cx = float(ys.mean()), float(xs.mean())
+
+    return {
+        "lesion_peak_error_norm": abs(pred_in_peak - target_in_peak),
+        "lesion_centroid_distance": float(np.hypot(py - cy, px - cx)),
+        "outside_inside_peak_ratio": out_peak / max(pred_in_peak, 1e-6),
+        "failure": float(out_peak > pred_in_peak),
+        "lesion_roi_l1": float(np.abs(pred_unit[valid] - target_unit[valid]).mean()),
+    }
+
+
 def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     return {
         k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
@@ -431,7 +467,7 @@ class Trainer:
 
         metrics: Dict[str, float] = {}
         mae_vals, ssim_vals, stripe_vals = [], [], []
-        peak_err_vals, centroid_vals, oir_vals = [], [], []
+        peak_err_vals, centroid_vals, oir_vals, roi_l1_vals = [], [], [], []
         failure_count = 0
         B = synth.shape[0]
         for i in range(B):
@@ -447,24 +483,13 @@ class Trainer:
                 pass
             if mask is not None:
                 mi = mask[i, 0].float().cpu().numpy()
-                if mi.sum() > 0:
-                    pred_in = float((p * mi).max())
-                    tgt_in = float((t * mi).max())
-                    peak_err_vals.append(abs(pred_in - tgt_in))
-                    # centroid distance (pred peak vs mask centroid)
-                    ys, xs = np.nonzero(mi)
-                    if len(xs) > 0:
-                        cy, cx = ys.mean(), xs.mean()
-                        pm = p * mi
-                        py, px = np.unravel_index(np.argmax(pm), pm.shape)
-                        centroid_vals.append(float(np.hypot(py - cy, px - cx)))
-                    # outside/inside peak ratio
-                    outside = p * (1.0 - mi)
-                    in_peak = max(pred_in, 1e-6)
-                    out_peak = float(outside.max())
-                    oir_vals.append(out_peak / in_peak)
-                    if out_peak > pred_in:
-                        failure_count += 1
+                lesion_metrics = _compute_pet_sample_metrics(p, t, mi)
+                if lesion_metrics is not None:
+                    peak_err_vals.append(lesion_metrics["lesion_peak_error_norm"])
+                    centroid_vals.append(lesion_metrics["lesion_centroid_distance"])
+                    oir_vals.append(lesion_metrics["outside_inside_peak_ratio"])
+                    roi_l1_vals.append(lesion_metrics["lesion_roi_l1"])
+                    failure_count += int(lesion_metrics["failure"])
 
         def _mean(vals):
             return float(np.mean(vals)) if vals else float("nan")
@@ -475,13 +500,9 @@ class Trainer:
         metrics["val/lesion_peak_error_norm"] = _mean(peak_err_vals)
         metrics["val/lesion_centroid_distance"] = _mean(centroid_vals)
         metrics["val/outside_inside_peak_ratio"] = _mean(oir_vals)
-        metrics["val/failure_rate"] = float(failure_count) / max(B, 1)
-        # lesion_roi_l1 (normalised) — dense PET supervision proxy inside mask
-        if mask is not None:
-            mi_all = mask.float()
-            num = (synth - target).abs() * mi_all
-            den = mi_all.sum().clamp_min(1.0)
-            metrics["val/lesion_roi_l1"] = float(num.sum().item() / den.item())
+        metrics["val/failure_rate"] = float(failure_count) / max(len(peak_err_vals), 1)
+        metrics["val/lesion_roi_l1"] = _mean(roi_l1_vals)
+        metrics["val/lesion_sample_count"] = float(len(peak_err_vals))
         return metrics
 
     def _model_selection_scores(self, metrics: Dict[str, float]) -> Tuple[float, float, float]:
