@@ -503,6 +503,9 @@ def compute_normalized_lesion_metrics(
     target: np.ndarray,       # [1, H, W] in [-1, 1]
     lesion_mask: np.ndarray,  # [1, H, W] binary
     organ_mask: np.ndarray,   # [C, H, W] one-hot (may be all-zero for PNG)
+    topk_percent: float = 0.10,
+    min_k: int = 3,
+    max_k: int = 16,
 ) -> Dict[str, float]:
     """Lesion intensity metrics in normalised [-1, 1] space.
 
@@ -513,11 +516,38 @@ def compute_normalized_lesion_metrics(
     Never convert these values back to pseudo-SUV — that would fabricate
     physical units the PNG export does not have.
     """
+    if not 0.0 < topk_percent <= 1.0:
+        raise ValueError("topk_percent must be in (0, 1]")
+    if min_k < 1:
+        raise ValueError("min_k must be at least 1")
+    if max_k < min_k:
+        raise ValueError("max_k must be greater than or equal to min_k")
+
     nan_metrics = {
         "lesion_peak_error_norm": float("nan"),
+        "lesion_peak_signed_bias_norm": float("nan"),
+        "lesion_topq_peak_pred_norm": float("nan"),
+        "lesion_topq_peak_target_norm": float("nan"),
+        "lesion_topq_peak_signed_bias_norm": float("nan"),
+        "lesion_topq_peak_error_norm": float("nan"),
+        "lesion_peak_overestimated": float("nan"),
+        "lesion_peak_underestimated": float("nan"),
+        "lesion_topq_k": float("nan"),
+        "lesion_size": float("nan"),
         "lesion_mean_error_norm": float("nan"),
         "lesion_to_background_ratio_norm": float("nan"),
         "lesion_centroid_distance": float("nan"),
+        "lesion_core_fallback": float("nan"),
+        "lesion_peak_to_boundary_distance": float("nan"),
+        "lesion_core_topq_pred_norm": float("nan"),
+        "lesion_core_topq_target_norm": float("nan"),
+        "lesion_core_topq_error_norm": float("nan"),
+        "lesion_ring_topq_pred_norm": float("nan"),
+        "lesion_ring_topq_target_norm": float("nan"),
+        "lesion_ring_topq_error_norm": float("nan"),
+        "lesion_ring_core_ratio_pred": float("nan"),
+        "lesion_ring_core_ratio_target": float("nan"),
+        "lesion_ring_core_ratio_error": float("nan"),
     }
     lesion = lesion_mask > 0.5
     if not lesion.any():
@@ -538,14 +568,70 @@ def compute_normalized_lesion_metrics(
     pred_tbr = pred_mean / max(pred_bg, 1e-6)
     target_tbr = target_mean / max(target_bg, 1e-6)
 
-    peak_metrics = _compute_pet_sample_metrics(pred[0], target[0], lesion_mask[0])
+    peak_metrics = _compute_pet_sample_metrics(
+        pred[0],
+        target[0],
+        lesion_mask[0],
+        topk_percent=topk_percent,
+        min_k=min_k,
+        max_k=max_k,
+    )
     assert peak_metrics is not None
 
+    lesion_2d = lesion[0]
+    structure = np.ones((3, 3), dtype=bool)
+    core = binary_erosion(lesion_2d, structure=structure)
+    core_fallback = not bool(core.any())
+    if core_fallback:
+        core = lesion_2d.copy()
+    ring = binary_dilation(
+        lesion_2d, structure=np.ones((5, 5), dtype=bool)
+    ) & ~core
+
+    def _topq_mean(image: np.ndarray, region: np.ndarray) -> float:
+        values = image[0][region]
+        if values.size == 0:
+            return float("nan")
+        k = min(
+            max(int(np.ceil(values.size * topk_percent)), min_k),
+            max_k,
+            values.size,
+        )
+        return float(np.partition(values, -k)[-k:].mean())
+
+    core_pred = _topq_mean(pred_unit, core)
+    core_target = _topq_mean(target_unit, core)
+    ring_pred = _topq_mean(pred_unit, ring)
+    ring_target = _topq_mean(target_unit, ring)
+
+    boundary = lesion_2d & ~binary_erosion(lesion_2d, structure=structure)
+    lesion_yx = np.argwhere(lesion_2d)
+    peak_local_index = int(np.argmax(pred_unit[0][lesion_2d]))
+    peak_yx = lesion_yx[peak_local_index]
+    boundary_yx = np.argwhere(boundary)
+    peak_to_boundary = float(
+        np.sqrt(((boundary_yx - peak_yx) ** 2).sum(axis=1)).min()
+    )
+
+    eps = 1e-6
+    ring_core_pred = ring_pred / max(core_pred, eps)
+    ring_core_target = ring_target / max(core_target, eps)
+
     return {
-        "lesion_peak_error_norm": peak_metrics["lesion_peak_error_norm"],
+        **peak_metrics,
         "lesion_mean_error_norm": float(abs(pred_mean - target_mean)),
         "lesion_to_background_ratio_norm": float(abs(pred_tbr - target_tbr)),
-        "lesion_centroid_distance": peak_metrics["lesion_centroid_distance"],
+        "lesion_core_fallback": float(core_fallback),
+        "lesion_peak_to_boundary_distance": peak_to_boundary,
+        "lesion_core_topq_pred_norm": core_pred,
+        "lesion_core_topq_target_norm": core_target,
+        "lesion_core_topq_error_norm": abs(core_pred - core_target),
+        "lesion_ring_topq_pred_norm": ring_pred,
+        "lesion_ring_topq_target_norm": ring_target,
+        "lesion_ring_topq_error_norm": abs(ring_pred - ring_target),
+        "lesion_ring_core_ratio_pred": ring_core_pred,
+        "lesion_ring_core_ratio_target": ring_core_target,
+        "lesion_ring_core_ratio_error": abs(ring_core_pred - ring_core_target),
     }
 
 
