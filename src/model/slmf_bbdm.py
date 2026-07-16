@@ -451,7 +451,7 @@ class SLMFBBDM(nn.Module):
                         "detach_gabor_descriptor", True
                     ),
                 )
-            else:
+            elif self.residual_frequency_mode == "spectral_evidence_router":
                 from .frequency.spectral_router import (
                     SpectralEvidenceFrequencyRouter,
                 )
@@ -509,6 +509,11 @@ class SLMFBBDM(nn.Module):
                     amplitude_delta_max=frequency_cfg.get(
                         "amplitude_delta_max", 0.10
                     ),
+                )
+            else:
+                raise ValueError(
+                    "modules.residual_frequency.mode must be 'legacy', "
+                    "'boundary_reliable', or 'spectral_evidence_router'"
                 )
         self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
 
