@@ -193,6 +193,107 @@ ablations:
       losses.boundary_frequency.enabled: false
       losses.frequency_gate_tv.enabled: false
 
+  # ---- V4 peak preservation and shallow CT-reliability ablations ----
+  br_v4_d0:
+    description: BR-D control with original CT reliability and no Top-Q peak loss
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_content_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_agreement: false
+      modules.residual_frequency.ct_reliability_floor_l2: 0.0
+      modules.residual_frequency.ct_reliability_floor_l1: 0.0
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.normalized_lesion_peak.enabled: false
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_v4_d1:
+    description: BR-D plus normalized lesion Top-Q peak supervision
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_content_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_agreement: false
+      modules.residual_frequency.ct_reliability_floor_l2: 0.0
+      modules.residual_frequency.ct_reliability_floor_l1: 0.0
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.normalized_lesion_peak.enabled: true
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_v4_d3:
+    description: BR-D plus Top-Q peak loss and scale-specific soft CT floors
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_content_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_agreement: false
+      modules.residual_frequency.ct_reliability_floor_l2: 0.25
+      modules.residual_frequency.ct_reliability_floor_l1: 0.50
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.normalized_lesion_peak.enabled: true
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
+  br_v4_d4:
+    description: BR-D plus Top-Q peak loss with CT reliability restricted to L2
+    overrides:
+      modules.wavelet_unet.enabled: false
+      modules.residual_frequency.enabled: true
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.band_scales: [0.5, 0.25]
+      modules.residual_frequency.use_noise_release: true
+      modules.residual_frequency.use_ct_reliability: true
+      modules.residual_frequency.use_content_reliability: true
+      modules.residual_frequency.use_subband_gates: true
+      modules.residual_frequency.use_directional_reliability: false
+      modules.residual_frequency.use_gabor_agreement: false
+      modules.residual_frequency.ct_reliability_floor_l2: 0.0
+      modules.residual_frequency.ct_reliability_floor_l1: 1.0
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.normalized_lesion_peak.enabled: true
+      losses.residual_wavelet.enabled: false
+      losses.gabor_consistency.enabled: false
+      losses.boundary_frequency.enabled: false
+      losses.frequency_gate_tv.enabled: false
+
   br_e:
     description: BR-D plus Gabor quadrature directional reliability
     overrides:

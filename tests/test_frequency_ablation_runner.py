@@ -61,6 +61,23 @@ def test_hard_gates_compare_candidates_to_r0_reference():
     assert any("stripe_excess_mean" in reason for reason in reasons)
 
 
+def test_hard_gates_support_absolute_limits_without_reference_metric():
+    from scripts.run_frequency_ablations import passes_hard_gates
+
+    gates = {
+        "failure_any_mean": {"direction": "lower", "max_value": 0.25},
+        "ssim_mean": {"direction": "higher", "min_value": 0.90},
+    }
+    assert passes_hard_gates(
+        {"failure_any_mean": 0.20, "ssim_mean": 0.94}, {}, gates
+    )[0]
+    passed, reasons = passes_hard_gates(
+        {"failure_any_mean": 0.30, "ssim_mean": 0.89}, {}, gates
+    )
+    assert not passed
+    assert len(reasons) == 2
+
+
 def test_composite_score_prefers_lesion_fidelity_without_ignoring_image_quality():
     from scripts.run_frequency_ablations import composite_score
 
@@ -92,6 +109,16 @@ def test_composite_score_rewards_boundary_and_directional_fidelity():
         anatomy_edge_gradient_mae_norm_mean=0.18,
         directional_spectrum_error_norm_mean=0.12,
     )
+    assert composite_score(good) > composite_score(bad)
+
+
+def test_v4_composite_score_uses_robust_topq_peak_when_available():
+    from scripts.run_frequency_ablations import composite_score
+
+    common = _metrics(lesion_peak_error_norm_mean=0.05)
+    good = {**common, "lesion_topq_peak_error_norm_mean": 0.02}
+    bad = {**common, "lesion_topq_peak_error_norm_mean": 0.20}
+
     assert composite_score(good) > composite_score(bad)
 
 
@@ -306,6 +333,221 @@ def test_v3_promotion_command_explicitly_disables_early_stopping():
     assert "training.num_epochs=300" in command
     assert "runtime.eval_interval=20" in command
     assert "runtime.early_stopping.enabled=false" in command
+
+
+def test_manifest_merges_variant_overrides_and_requires_final_checkpoint():
+    from scripts.run_frequency_ablations import build_execution_manifest
+
+    plan = {
+        "base_config": "base.yaml",
+        "ablation_config": "ablations.yaml",
+        "output_dir": "results/v4",
+        "common_train_overrides": {"model.initialization_seed": 4242},
+        "variants": [{
+            "id": "G2",
+            "preset": "br_v4_d3",
+            "overrides": {"modules.residual_frequency.use_gabor_agreement": True},
+        }],
+        "promote": {
+            "epochs": 300,
+            "eval_interval": 20,
+            "max_samples": 64,
+            "seed": 42,
+            "mc_steps": 20,
+            "experiment_prefix": "br_v4_full",
+            "require_final_checkpoint": True,
+        },
+    }
+    manifest = build_execution_manifest(
+        plan, python="python", stage="promote", promoted_ids=["G2"]
+    )
+    run = manifest["promotion_runs"][0]
+    command = " ".join(run["train_command"])
+
+    assert "model.initialization_seed=4242" in command
+    assert "modules.residual_frequency.use_gabor_agreement=true" in command
+    assert run["completion_checkpoint"].endswith("ckpt_epoch0300.pt")
+
+
+def test_run_entries_rejects_training_without_required_final_checkpoint(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from scripts import run_frequency_ablations as runner
+
+    best = tmp_path / "ckpt_best_combined.pt"
+    final = tmp_path / "ckpt_epoch0300.pt"
+    result = tmp_path / "result.json"
+
+    def fake_execute(command):
+        best.write_bytes(b"best")
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    entry = {
+        "id": "G2",
+        "preset": "br_v4_d3",
+        "experiment": "br_v4_full_g2",
+        "checkpoint": str(best),
+        "completion_checkpoint": str(final),
+        "result": str(result),
+        "train_command": ["train"],
+        "eval_command": ["evaluate"],
+    }
+    result.write_text(json.dumps(_metrics()), encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="final checkpoint"):
+        runner._run_entries([entry], force=False)
+
+
+def test_v4_plan_has_two_fixed_64_sample_stages_and_exact_promotions():
+    import yaml
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/boundary_reliable_ablation_plan_v4.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert plan["output_dir"] == "results/boundary_reliable_ablations_v4"
+    assert [row["id"] for row in plan["stage_a"]["variants"]] == [
+        "D0", "D1", "D3", "D4"
+    ]
+    assert plan["stage_a"]["max_samples"] == 64
+    assert plan["stage_b"]["max_samples"] == 64
+    assert plan["promote"]["epochs"] == 300
+    assert plan["promote"]["early_stopping"] is False
+    assert plan["promote"]["require_final_checkpoint"] is True
+    assert plan["stage_b"]["top_k"] == 2
+
+
+@pytest.mark.parametrize(
+    ("preset", "peak", "floor_l2", "floor_l1"),
+    [
+        ("br_v4_d0", False, 0.0, 0.0),
+        ("br_v4_d1", True, 0.0, 0.0),
+        ("br_v4_d3", True, 0.25, 0.50),
+        ("br_v4_d4", True, 0.0, 1.0),
+    ],
+)
+def test_v4_d_presets_change_only_peak_and_ct_floor_routes(
+    preset, peak, floor_l2, floor_l1
+):
+    from src.model.config_utils import load_full_config
+    from src.model.slmf_bbdm import SLMFBBDM
+
+    cfg = load_full_config(
+        "configs/experiments/slmf_png_boundary_reliable_v4.yaml",
+        ablation=preset,
+        ablation_config_path="configs/experiments/ablations.yaml",
+        overrides=["data.image_size=32", "runtime.eval_sampling_steps=2"],
+    )
+    model = SLMFBBDM.from_config(cfg)
+
+    assert model.loss_terms["normalized_lesion_peak"].enabled is peak
+    assert model.residual_preconditioner.ct_reliability_floors.tolist() == pytest.approx(
+        [floor_l2, floor_l1]
+    )
+    assert model.residual_preconditioner.use_gabor_agreement is False
+    assert model.residual_preconditioner.use_directional_reliability is False
+
+
+def test_v4_stage_b_templates_inherit_selected_d_and_keep_g_routes_distinct():
+    import yaml
+
+    from scripts.run_boundary_reliable_v4 import build_stage_b_variants
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/boundary_reliable_ablation_plan_v4.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    variants = build_stage_b_variants(plan, selected_d_id="D4")
+
+    assert [row["id"] for row in variants] == ["G0", "G1", "G2"]
+    assert {row["preset"] for row in variants} == {"br_v4_d4"}
+    routes = {row["id"]: row["overrides"] for row in variants}
+    assert routes["G0"]["modules.residual_frequency.use_directional_reliability"] is False
+    assert routes["G0"]["modules.residual_frequency.use_gabor_agreement"] is False
+    assert routes["G1"]["modules.residual_frequency.use_directional_reliability"] is True
+    assert routes["G1"]["modules.residual_frequency.use_gabor_agreement"] is False
+    assert routes["G2"]["modules.residual_frequency.use_directional_reliability"] is False
+    assert routes["G2"]["modules.residual_frequency.use_gabor_agreement"] is True
+
+
+def test_v4_dry_run_builds_four_stage_a_and_three_dynamic_stage_b_runs():
+    import yaml
+
+    from scripts.run_boundary_reliable_v4 import build_v4_dry_run_manifest
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/boundary_reliable_ablation_plan_v4.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest = build_v4_dry_run_manifest(plan, python="python")
+
+    assert len(manifest["stage_a_runs"]) == 4
+    assert len(manifest["stage_b_runs"]) == 3
+    assert len(manifest["promotion_runs"]) == 2
+    paths = str(manifest)
+    assert "boundary_reliable_ablations_v4" in paths
+    assert "boundary_reliable_ablations_v3" not in paths
+
+
+def test_paired_report_is_deterministic_and_handles_small_intersections(tmp_path):
+    import json
+
+    from scripts.compare_v4_results import compare_result_pair
+
+    left = {
+        "per_patient": {
+            f"p{i}": {"lesion_topq_peak_error_norm_mean": float(i) / 100.0}
+            for i in range(5)
+        }
+    }
+    right = {
+        "per_patient": {
+            f"p{i}": {"lesion_topq_peak_error_norm_mean": float(i + 1) / 100.0}
+            for i in range(5)
+        }
+    }
+    left_path = tmp_path / "left.json"
+    right_path = tmp_path / "right.json"
+    left_path.write_text(json.dumps(left), encoding="utf-8")
+    right_path.write_text(json.dumps(right), encoding="utf-8")
+
+    first = compare_result_pair(
+        left_path,
+        right_path,
+        {"lesion_topq_peak_error_norm_mean": "lower"},
+        seed=42,
+        resamples=10_000,
+    )
+    second = compare_result_pair(
+        left_path,
+        right_path,
+        {"lesion_topq_peak_error_norm_mean": "lower"},
+        seed=42,
+        resamples=10_000,
+    )
+    row = first["metrics"]["lesion_topq_peak_error_norm_mean"]
+
+    assert first == second
+    assert row["paired_patients"] == 5
+    assert row["wins"] == 5
+    assert row["losses"] == 0
+    assert row["median_difference"] == pytest.approx(-0.01)
+    assert len(row["bootstrap_95_ci"]) == 2
+
+    right["per_patient"] = {"p0": right["per_patient"]["p0"]}
+    right_path.write_text(json.dumps(right), encoding="utf-8")
+    small = compare_result_pair(
+        left_path,
+        right_path,
+        {"lesion_topq_peak_error_norm_mean": "lower"},
+    )
+    assert small["metrics"]["lesion_topq_peak_error_norm_mean"]["bootstrap_95_ci"] is None
 
 
 def test_checkpoint_epoch_requires_integer_epoch_metadata(tmp_path):

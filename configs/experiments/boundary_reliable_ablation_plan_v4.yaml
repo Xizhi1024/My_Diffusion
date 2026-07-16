@@ -1,0 +1,134 @@
+base_config: configs/experiments/slmf_png_boundary_reliable_v4.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/boundary_reliable_ablations_v4
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+stage_a:
+  reference_id: D0
+  top_k: 1
+  experiment_prefix: br_v4_stage_a
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - {id: D0, preset: br_v4_d0}
+    - {id: D1, preset: br_v4_d1}
+    - {id: D3, preset: br_v4_d3}
+    - {id: D4, preset: br_v4_d4}
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.15
+    lesion_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.20
+    failure_any_mean:
+      direction: lower
+      max_value: 0.50
+      max_delta: 0.0625
+    false_hotspot_density_mean:
+      direction: lower
+      max_ratio: 1.25
+      epsilon: 1e-6
+    stripe_excess_mean:
+      direction: lower
+      max_value: 0.20
+      max_delta: 0.05
+    ssim_mean:
+      direction: higher
+      min_value: 0.85
+      max_delta: 0.03
+
+stage_b:
+  reference_id: G0
+  top_k: 2
+  dry_run_selected_d: D3
+  experiment_prefix: br_v4_stage_b
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - id: G0
+      overrides:
+        modules.residual_frequency.use_directional_reliability: false
+        modules.residual_frequency.use_gabor_agreement: false
+    - id: G1
+      overrides:
+        modules.residual_frequency.use_directional_reliability: true
+        modules.residual_frequency.use_gabor_agreement: false
+    - id: G2
+      overrides:
+        modules.residual_frequency.use_directional_reliability: false
+        modules.residual_frequency.use_gabor_agreement: true
+        modules.residual_frequency.gabor_agreement_alpha: 0.10
+        modules.residual_frequency.gabor_agreement_l2: false
+        modules.residual_frequency.gabor_agreement_l1: true
+        modules.residual_frequency.detach_gabor_descriptor: true
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.15
+    lesion_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.20
+    failure_any_mean:
+      direction: lower
+      max_value: 0.50
+      max_delta: 0.0625
+    false_hotspot_density_mean:
+      direction: lower
+      max_ratio: 1.25
+      epsilon: 1e-6
+    stripe_excess_mean:
+      direction: lower
+      max_value: 0.20
+      max_delta: 0.05
+    ssim_mean:
+      direction: higher
+      min_value: 0.85
+      max_delta: 0.03
+
+promote:
+  experiment_prefix: br_v4_full
+  epochs: 300
+  eval_interval: 20
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+
+paired_comparison:
+  seed: 42
+  resamples: 10000
+  metrics:
+    lesion_topq_peak_error_norm_mean: lower
+    lesion_peak_error_norm_mean: lower
+    lesion_mean_error_norm_mean: lower
+    lesion_centroid_distance_mean: lower
+    lesion_boundary_gradient_mae_norm_mean: lower
+    anatomy_edge_gradient_mae_norm_mean: lower
+    directional_spectrum_error_norm_mean: lower
+    failure_any_mean: lower
+    false_hotspot_density_mean: lower
+    stripe_excess_mean: lower
+    mae_mean: lower
+    ssim_mean: higher

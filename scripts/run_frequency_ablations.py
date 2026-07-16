@@ -37,7 +37,6 @@ def passes_hard_gates(
     for name, rule in gates.items():
         try:
             candidate = metric_value(metrics, name)
-            baseline = metric_value(reference, name)
         except (KeyError, TypeError, ValueError) as exc:
             reasons.append(str(exc))
             continue
@@ -46,10 +45,20 @@ def passes_hard_gates(
         epsilon = float(rule.get("epsilon", 0.0))
         if direction == "lower":
             limits = []
+            if "max_value" in rule:
+                limits.append(float(rule["max_value"]))
             if "max_delta" in rule:
-                limits.append(baseline + float(rule["max_delta"]))
+                try:
+                    baseline = metric_value(reference, name)
+                    limits.append(baseline + float(rule["max_delta"]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    reasons.append(str(exc))
             if "max_ratio" in rule:
-                limits.append(baseline * float(rule["max_ratio"]) + epsilon)
+                try:
+                    baseline = metric_value(reference, name)
+                    limits.append(baseline * float(rule["max_ratio"]) + epsilon)
+                except (KeyError, TypeError, ValueError) as exc:
+                    reasons.append(str(exc))
             if not limits:
                 raise ValueError(f"Lower-is-better gate {name!r} has no limit")
             limit = min(limits)
@@ -57,10 +66,20 @@ def passes_hard_gates(
                 reasons.append(f"{name}={candidate:.6g} exceeds limit {limit:.6g}")
         elif direction == "higher":
             limits = []
+            if "min_value" in rule:
+                limits.append(float(rule["min_value"]))
             if "max_delta" in rule:
-                limits.append(baseline - float(rule["max_delta"]))
+                try:
+                    baseline = metric_value(reference, name)
+                    limits.append(baseline - float(rule["max_delta"]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    reasons.append(str(exc))
             if "min_ratio" in rule:
-                limits.append(baseline * float(rule["min_ratio"]) - epsilon)
+                try:
+                    baseline = metric_value(reference, name)
+                    limits.append(baseline * float(rule["min_ratio"]) - epsilon)
+                except (KeyError, TypeError, ValueError) as exc:
+                    reasons.append(str(exc))
             if not limits:
                 raise ValueError(f"Higher-is-better gate {name!r} has no limit")
             limit = max(limits)
@@ -90,9 +109,19 @@ def composite_score(metrics: Mapping[str, Any]) -> float:
         metrics, "directional_spectrum_error_norm_mean"
     )
 
-    lesion = -(
-        peak + 0.02 * centroid + 0.50 * failure + 0.20 * lesion_boundary
-    )
+    if "lesion_topq_peak_error_norm_mean" in metrics:
+        topq_peak = metric_value(metrics, "lesion_topq_peak_error_norm_mean")
+        lesion = -(
+            topq_peak
+            + 0.50 * peak
+            + 0.02 * centroid
+            + 0.50 * failure
+            + 0.20 * lesion_boundary
+        )
+    else:
+        lesion = -(
+            peak + 0.02 * centroid + 0.50 * failure + 0.20 * lesion_boundary
+        )
     image = (
         ssim
         - mae
@@ -206,6 +235,19 @@ def _normalise_overrides(
     return [str(override) for override in overrides]
 
 
+def _merge_overrides(
+    common: Mapping[str, Any] | Sequence[str] | None,
+    variant: Mapping[str, Any] | Sequence[str] | None,
+) -> Mapping[str, Any] | List[str] | None:
+    if common is None:
+        return variant
+    if variant is None:
+        return common
+    if isinstance(common, Mapping) and isinstance(variant, Mapping):
+        return {**common, **variant}
+    return [*_normalise_overrides(common), *_normalise_overrides(variant)]
+
+
 def build_mean_pretrain_command(
     *,
     python: str,
@@ -255,7 +297,7 @@ def build_eval_command(
 
 def _run_manifest_entry(
     plan: Mapping[str, Any],
-    variant: Mapping[str, str],
+    variant: Mapping[str, Any],
     settings: Mapping[str, Any],
     python: str,
     phase: str,
@@ -267,6 +309,9 @@ def _run_manifest_entry(
     checkpoint = checkpoint_dir / "ckpt_best_combined.pt"
     resolved = checkpoint_dir / "resolved_config.yaml"
     result = output_dir / f"{variant_id.lower()}.json"
+    completion_checkpoint = None
+    if settings.get("require_final_checkpoint", False):
+        completion_checkpoint = checkpoint_dir / f"ckpt_epoch{int(settings['epochs']):04d}.pt"
     return {
         "id": variant_id,
         "preset": variant["preset"],
@@ -274,6 +319,9 @@ def _run_manifest_entry(
         "checkpoint": str(checkpoint),
         "resolved_config": str(resolved),
         "result": str(result),
+        "completion_checkpoint": (
+            str(completion_checkpoint) if completion_checkpoint is not None else None
+        ),
         "train_command": build_train_command(
             python=python,
             config=str(plan["base_config"]),
@@ -284,7 +332,9 @@ def _run_manifest_entry(
             seed=int(settings["seed"]),
             eval_interval=int(settings["eval_interval"]),
             early_stopping_enabled=bool(settings.get("early_stopping", False)),
-            extra_overrides=plan.get("common_train_overrides"),
+            extra_overrides=_merge_overrides(
+                plan.get("common_train_overrides"), variant.get("overrides")
+            ),
         ),
         "eval_command": build_eval_command(
             python=python,
@@ -415,15 +465,27 @@ def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict
     records = []
     for entry in entries:
         checkpoint = Path(entry["checkpoint"])
+        completion_path_value = entry.get("completion_checkpoint")
+        completion_checkpoint = (
+            Path(str(completion_path_value)) if completion_path_value else None
+        )
         result = Path(entry["result"])
         result.parent.mkdir(parents=True, exist_ok=True)
-        if force or not checkpoint.exists():
+        training_complete = checkpoint.exists() and (
+            completion_checkpoint is None or completion_checkpoint.exists()
+        )
+        if force or not training_complete:
             _execute(entry["train_command"])
         else:
-            print(f"[skip train] checkpoint exists: {checkpoint}")
+            print(f"[skip train] required checkpoints exist: {checkpoint}")
         if not checkpoint.exists():
             raise FileNotFoundError(
                 f"Training did not produce {checkpoint}; check eval_interval and best_checkpoint settings"
+            )
+        if completion_checkpoint is not None and not completion_checkpoint.exists():
+            raise FileNotFoundError(
+                "Training stopped before the required final checkpoint was written: "
+                f"{completion_checkpoint}"
             )
         if force or not result.exists():
             _execute(entry["eval_command"])
@@ -459,6 +521,7 @@ def _write_rankings(output_dir: Path, promoted: Sequence[str], ranked: Sequence[
 
     metric_names = [
         "lesion_peak_error_norm_mean",
+        "lesion_topq_peak_error_norm_mean",
         "lesion_centroid_distance_mean",
         "failure_any_mean",
         "false_hotspot_density_mean",
