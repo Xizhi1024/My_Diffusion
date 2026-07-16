@@ -94,6 +94,7 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         snr_temperature: float = 2.0,
         cross_temperature: float = 1.0,
         content_hidden_channels: int = 16,
+        ct_reliability_floors: Sequence[float] = (0.0, 0.0),
     ) -> None:
         super().__init__()
         if len(output_channels) != 4:
@@ -110,6 +111,10 @@ class BoundaryReliableFrequencyInjector(nn.Module):
             raise ValueError("content_hidden_channels must be positive")
         if gabor_orientations <= 0:
             raise ValueError("gabor_orientations must be positive")
+        if len(ct_reliability_floors) != 2 or any(
+            not 0.0 <= float(floor) <= 1.0 for floor in ct_reliability_floors
+        ):
+            raise ValueError("ct_reliability_floors must contain L2/L1 values in [0, 1]")
 
         self.output_channels = tuple(int(channel) for channel in output_channels)
         self.use_noise_release = bool(use_noise_release)
@@ -124,6 +129,10 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         self.cross_temperature = float(cross_temperature)
         self.register_buffer(
             "band_scales", torch.tensor(tuple(band_scales), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "ct_reliability_floors",
+            torch.tensor(tuple(ct_reliability_floors), dtype=torch.float32),
         )
 
         # Native levels L2/L1 plus pure high-frequency reconstruction at L0.
@@ -187,14 +196,27 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         self,
         residual_details: HaarDetails,
         ct_details: HaarDetails,
+        level_index: int = 0,
     ) -> torch.Tensor:
         """Compare normalized local energy, never signed cross-modal values."""
+        if level_index not in (0, 1):
+            raise ValueError("level_index must identify native L2 or L1")
         residual_energy = self._normalized_local_energy(residual_details)
         if not self.use_ct_reliability:
             return torch.ones_like(residual_energy)
         ct_energy = self._normalized_local_energy(ct_details)
         distance = (residual_energy - ct_energy).abs()
-        return torch.exp(-distance / self.cross_temperature).clamp(0.0, 1.0)
+        reliability = torch.exp(-distance / self.cross_temperature).clamp(0.0, 1.0)
+        floor = self.ct_reliability_floors[level_index].to(reliability)
+        return self.apply_reliability_floor(reliability, floor)
+
+    @staticmethod
+    def apply_reliability_floor(
+        reliability: torch.Tensor,
+        floor: torch.Tensor | float,
+    ) -> torch.Tensor:
+        """Map reliability from [0, 1] to [floor, 1] without reversing it."""
+        return floor + (1.0 - floor) * reliability
 
     def directional_reliability(
         self,
@@ -257,7 +279,11 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         noise_gate: torch.Tensor,
         gabor_orientation: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        cross = self.cross_modal_reliability(residual_details, ct_details)
+        cross = self.cross_modal_reliability(
+            residual_details,
+            ct_details,
+            level_index=level_index,
+        )
         content = self._content_reliability(
             level_index, residual_details, ct_details, noise_gate
         )[:, :, None, None]

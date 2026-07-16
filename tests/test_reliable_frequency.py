@@ -108,6 +108,70 @@ def test_ct_soft_reliability_uses_energy_not_signed_coefficients():
     assert positive.max() <= 1
 
 
+def test_ct_reliability_floor_is_monotonic_and_preserves_exact_endpoints():
+    module = _module(ct_reliability_floors=(0.25, 0.50))
+    raw = torch.tensor([0.0, 0.4, 1.0])
+
+    floored = module.apply_reliability_floor(raw, 0.50)
+
+    assert torch.allclose(floored, torch.tensor([0.50, 0.70, 1.00]))
+    assert torch.all(floored[1:] >= floored[:-1])
+
+
+def test_ct_reliability_uses_separate_native_level_floors():
+    residual_details = tuple(torch.randn(1, 1, 8, 8) for _ in range(3))
+    ct_details = tuple(torch.randn(1, 1, 8, 8) for _ in range(3))
+    raw_module = _module(ct_reliability_floors=(0.0, 0.0))
+    floor_module = _module(ct_reliability_floors=(0.25, 0.50))
+
+    raw_l2 = raw_module.cross_modal_reliability(
+        residual_details, ct_details, level_index=0
+    )
+    raw_l1 = raw_module.cross_modal_reliability(
+        residual_details, ct_details, level_index=1
+    )
+    floor_l2 = floor_module.cross_modal_reliability(
+        residual_details, ct_details, level_index=0
+    )
+    floor_l1 = floor_module.cross_modal_reliability(
+        residual_details, ct_details, level_index=1
+    )
+
+    assert torch.allclose(floor_l2, 0.25 + 0.75 * raw_l2)
+    assert torch.allclose(floor_l1, 0.50 + 0.50 * raw_l1)
+
+
+def test_l1_floor_one_removes_ct_attenuation_without_disabling_l2_ct_gate():
+    residual = torch.randn(1, 1, 32, 32)
+    ct_a = torch.zeros_like(residual)
+    ct_b = torch.randn_like(residual) * 8.0
+    from src.model.noise.base import BBDMBridgeSchedule
+
+    module = _module(
+        ct_reliability_floors=(0.0, 1.0),
+        use_content_reliability=False,
+    )
+    schedule = BBDMBridgeSchedule(num_train_timesteps=1000)
+    timestep = torch.tensor([100])
+
+    _, diag_a = module(residual, timestep, schedule, ct_a)
+    _, diag_b = module(residual, timestep, schedule, ct_b)
+
+    assert torch.allclose(diag_a["gates_l1"], diag_b["gates_l1"])
+    assert not torch.allclose(diag_a["gates_l2"], diag_b["gates_l2"])
+
+
+def test_ct_reliability_floor_rejects_invalid_configuration():
+    import pytest
+
+    with pytest.raises(ValueError):
+        _module(ct_reliability_floors=(0.0,))
+    with pytest.raises(ValueError):
+        _module(ct_reliability_floors=(-0.1, 0.5))
+    with pytest.raises(ValueError):
+        _module(ct_reliability_floors=(0.5, 1.1))
+
+
 def test_shared_mode_has_one_gate_but_subband_mode_can_separate_lh_hl_hh():
     residual = torch.randn(1, 1, 32, 32)
     ct = torch.zeros_like(residual)

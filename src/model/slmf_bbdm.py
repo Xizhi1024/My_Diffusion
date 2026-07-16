@@ -415,6 +415,10 @@ class SLMFBBDM(nn.Module):
                     content_hidden_channels=frequency_cfg.get(
                         "content_hidden_channels", 16
                     ),
+                    ct_reliability_floors=(
+                        frequency_cfg.get("ct_reliability_floor_l2", 0.0),
+                        frequency_cfg.get("ct_reliability_floor_l1", 0.0),
+                    ),
                 )
         self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
 
