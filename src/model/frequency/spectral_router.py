@@ -176,16 +176,22 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         reference: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         steps = int(schedule.num_train_timesteps)
-        normalized_timestep = timesteps.to(
-            device=reference.device, dtype=reference.dtype
-        ) / max(steps - 1, 1)
-        m = schedule.m_t[timesteps].to(reference)
-        sigma = schedule.sigma_t[timesteps].to(reference)
-        signal = (1.0 - m) * self.band_scales[level_index].to(reference)
+        normalized_timestep = (
+            timesteps.to(device=reference.device, dtype=torch.float32)
+            / max(steps - 1, 1)
+        ).clamp(0.0, 1.0)
+        m = schedule.m_t[timesteps].to(device=reference.device, dtype=torch.float32)
+        sigma = schedule.sigma_t[timesteps].to(
+            device=reference.device, dtype=torch.float32
+        )
+        signal = (1.0 - m) * self.band_scales[level_index].to(
+            device=reference.device, dtype=torch.float32
+        )
         log_snr = torch.log(
             signal.square().clamp_min(1e-8) / sigma.square().clamp_min(1e-8)
         ).clamp(-20.0, 20.0)
-        return normalized_timestep, log_snr / 20.0
+        normalized_log_snr = (log_snr / 20.0).clamp(-1.0, 1.0)
+        return normalized_timestep.to(reference), normalized_log_snr.to(reference)
 
     def _dct_evidence(
         self, details: torch.Tensor

@@ -194,6 +194,48 @@ def test_router_half_precision_preserves_reference_dtype_and_stays_finite():
     assert all(torch.isfinite(value).all() for value in diagnostics.values())
 
 
+def test_router_half_precision_is_finite_at_bridge_endpoints():
+    module = _router().half()
+    residual = torch.zeros(2, 1, 32, 32, dtype=torch.float16)
+    ct = torch.ones_like(residual)
+    schedule = _BridgeSchedule()
+
+    injections, diagnostics = module(
+        residual,
+        torch.tensor([0, schedule.num_train_timesteps - 1]),
+        schedule,
+        ct,
+    )
+
+    assert all(torch.isfinite(value).all() for value in injections)
+    assert all(torch.count_nonzero(value).item() == 0 for value in injections)
+    for key in (
+        "routes_l2",
+        "routes_l1",
+        "gates_l2",
+        "gates_l1",
+        "noise_reliability",
+        "route_temporal_smoothness",
+    ):
+        assert torch.isfinite(diagnostics[key]).all(), key
+    assert torch.allclose(
+        diagnostics["routes_l2"].sum(dim=-1),
+        torch.ones(2, 3, dtype=torch.float16),
+    )
+    assert torch.allclose(
+        diagnostics["routes_l1"].sum(dim=-1),
+        torch.ones(2, 3, dtype=torch.float16),
+    )
+    assert diagnostics["routes_l2"][..., 2].mean() > 0.89
+    assert diagnostics["routes_l1"][..., 2].mean() > 0.89
+    assert diagnostics["gates_l2"].min() >= 0
+    assert diagnostics["gates_l2"].max() <= module.gate_max
+    assert diagnostics["gates_l1"].min() >= 0
+    assert diagnostics["gates_l1"].max() <= module.gate_max
+    assert diagnostics["noise_reliability"].min() >= 0
+    assert diagnostics["noise_reliability"].max() <= 1
+
+
 def test_router_normalizes_optional_gabor_evidence_to_reference_dtype():
     module = _router().half()
     residual = torch.randn(2, 1, 32, 32, dtype=torch.float16)
