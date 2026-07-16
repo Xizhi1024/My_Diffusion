@@ -70,6 +70,10 @@ train-frequency-ablations = "python scripts/run_frequency_ablations.py --plan co
 # V2: pretrain one shared PET mean, freeze it, then screen and promote variants
 train-frequency-ablations-v2 = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan_v2.yaml --stage all"
 
+# V5: two-stage spectral-evidence/router screen and exact 300-epoch promotion.
+train-spectral-router-v5 = "python scripts/run_spectral_router_v5.py --plan configs/experiments/spectral_router_ablation_plan_v5.yaml --stage all"
+dry-run-spectral-router-v5 = "python scripts/run_spectral_router_v5.py --plan configs/experiments/spectral_router_ablation_plan_v5.yaml --stage all --dry-run"
+
 # PNG baseline 5-epoch 过拟合冒烟测试（假数据，验证管线）
 train-png-smoke = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml --override data.use_fake_data=true --override training.num_epochs=5 --override runtime.eval_interval=2 --override runtime.save_interval=5 --override runtime.sample_interval=2"
 

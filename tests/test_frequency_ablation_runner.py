@@ -495,6 +495,231 @@ def test_v4_dry_run_builds_four_stage_a_and_three_dynamic_stage_b_runs():
     assert "boundary_reliable_ablations_v3" not in paths
 
 
+def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
+    import yaml
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert plan["base_config"] == (
+        "configs/experiments/slmf_png_spectral_router_v5.yaml"
+    )
+    assert plan["ablation_config"] == "configs/experiments/ablations.yaml"
+    assert plan["output_dir"] == "results/spectral_router_ablations_v5"
+    assert plan["mean_pretrain"] == {
+        "enabled": False,
+        "checkpoint": "checkpoints/freq_mean_pretrain_v2/mean_best.pt",
+    }
+    assert plan["common_train_overrides"] == {
+        "model.initialization_seed": 4242,
+        "modules.conditional_mean.checkpoint": (
+            "checkpoints/freq_mean_pretrain_v2/mean_best.pt"
+        ),
+        "modules.conditional_mean.freeze": True,
+        "modules.conditional_mean.loss_weight": 0.0,
+    }
+
+    stage_a = plan["stage_a"]
+    assert stage_a["reference_id"] == "S0"
+    assert stage_a["top_k"] == 1
+    assert stage_a["dry_run_selected_evidence"] == "S3"
+    assert [row["id"] for row in stage_a["variants"]] == ["S0", "S1", "S2", "S3"]
+    assert [row["preset"] for row in stage_a["variants"]] == [
+        "sr_v5_s0",
+        "sr_v5_s1",
+        "sr_v5_s2",
+        "sr_v5_s3",
+    ]
+
+    stage_b = plan["stage_b"]
+    assert stage_b["reference_id"] == "T0"
+    assert stage_b["top_k"] == 2
+    assert [row["id"] for row in stage_b["variants"]] == ["N0", "T0", "C0", "C1"]
+    assert all(
+        row["overrides"]["modules.residual_frequency.mode"]
+        == "spectral_evidence_router"
+        for row in stage_b["variants"]
+    )
+    expected_gates = {
+        "lesion_topq_peak_error_norm_mean": {
+            "direction": "lower",
+            "max_value": 0.080,
+        },
+        "lesion_peak_error_norm_mean": {"direction": "lower", "max_value": 0.20},
+        "lesion_centroid_distance_mean": {
+            "direction": "lower",
+            "max_value": 3.15,
+        },
+        "directional_spectrum_error_norm_mean": {
+            "direction": "lower",
+            "max_value": 0.0095,
+        },
+        "failure_any_mean": {
+            "direction": "lower",
+            "max_value": 0.0625,
+            "max_delta": 0.0625,
+        },
+        "false_hotspot_density_mean": {
+            "direction": "lower",
+            "max_value": 0.00014,
+            "max_ratio": 1.25,
+            "epsilon": 1e-6,
+        },
+        "stripe_excess_mean": {
+            "direction": "lower",
+            "max_value": 0.20,
+            "max_delta": 0.05,
+        },
+        "mae_mean": {"direction": "lower", "max_value": 0.0365},
+        "ssim_mean": {
+            "direction": "higher",
+            "min_value": 0.947,
+            "max_delta": 0.03,
+        },
+    }
+    assert stage_b["hard_gates"] == expected_gates
+
+    for stage in (stage_a, stage_b):
+        assert stage["epochs"] == 50
+        assert stage["eval_interval"] == 10
+        assert stage["split"] == "val"
+        assert stage["max_samples"] == 64
+        assert stage["seed"] == 42
+        assert stage["mc_steps"] == 20
+        assert stage["early_stopping"] is False
+
+    promote = plan["promote"]
+    assert promote == {
+        "experiment_prefix": "sr_v5_full",
+        "epochs": 300,
+        "eval_interval": 20,
+        "split": "val",
+        "max_samples": 64,
+        "seed": 42,
+        "mc_steps": 20,
+        "early_stopping": False,
+        "require_final_checkpoint": True,
+    }
+    assert plan["paired_comparison"] == {
+        "seed": 42,
+        "resamples": 10000,
+        "metrics": {
+            "lesion_topq_peak_error_norm_mean": "lower",
+            "lesion_peak_error_norm_mean": "lower",
+            "lesion_mean_error_norm_mean": "lower",
+            "lesion_centroid_distance_mean": "lower",
+            "lesion_boundary_gradient_mae_norm_mean": "lower",
+            "anatomy_edge_gradient_mae_norm_mean": "lower",
+            "directional_spectrum_error_norm_mean": "lower",
+            "failure_any_mean": "lower",
+            "false_hotspot_density_mean": "lower",
+            "stripe_excess_mean": "lower",
+            "mae_mean": "lower",
+            "ssim_mean": "higher",
+        },
+    }
+
+
+def test_v5_stage_b_variants_inherit_evidence_and_keep_four_routes_distinct():
+    import yaml
+
+    from scripts.run_spectral_router_v5 import build_stage_b_variants
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    variants = build_stage_b_variants(plan, selected_evidence_id="S3")
+
+    assert [row["id"] for row in variants] == ["N0", "T0", "C0", "C1"]
+    assert {row["preset"] for row in variants} == {"sr_v5_s3"}
+    assert {row["inherited_evidence"] for row in variants} == {"S3"}
+    routes = {row["id"]: row["overrides"] for row in variants}
+    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 4
+    assert all(
+        route["modules.residual_frequency.mode"] == "spectral_evidence_router"
+        for route in routes.values()
+    )
+    assert routes["N0"][
+        "modules.residual_frequency.cross_level_router.enabled"
+    ] is True
+    assert routes["N0"][
+        "modules.residual_frequency.cross_level_router.hard_all_null"
+    ] is True
+    assert routes["T0"][
+        "modules.residual_frequency.cross_level_router.enabled"
+    ] is False
+    assert routes["C0"]["modules.residual_frequency.dct_descriptor.enabled"] is False
+    assert routes["C0"][
+        "modules.residual_frequency.gabor_descriptor.enabled"
+    ] is False
+    assert routes["C0"][
+        "modules.residual_frequency.cross_level_router.enabled"
+    ] is True
+    assert routes["C1"][
+        "modules.residual_frequency.cross_level_router.enabled"
+    ] is True
+
+
+def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
+    import yaml
+
+    from scripts.run_spectral_router_v5 import build_v5_dry_run_manifest
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest = build_v5_dry_run_manifest(plan, python="python")
+
+    assert manifest["selected_evidence_template"] == "S3"
+    assert len(manifest["stage_a_runs"]) == 4
+    assert len(manifest["stage_b_runs"]) == 4
+    assert len(manifest["promotion_runs"]) == 2
+    assert [row["id"] for row in manifest["stage_a_runs"]] == [
+        "S0",
+        "S1",
+        "S2",
+        "S3",
+    ]
+    assert [row["id"] for row in manifest["stage_b_runs"]] == [
+        "N0",
+        "T0",
+        "C0",
+        "C1",
+    ]
+    manifest_text = str(manifest)
+    assert "spectral_router_ablations_v5" in manifest_text
+    assert "boundary_reliable_ablations_v4" not in manifest_text
+    assert "boundary_reliable_ablations_v3" not in manifest_text
+    for run in (
+        manifest["stage_a_runs"]
+        + manifest["stage_b_runs"]
+        + manifest["promotion_runs"]
+    ):
+        train_text = " ".join(run["train_command"])
+        eval_text = " ".join(run["eval_command"])
+        assert "model.initialization_seed=4242" in train_text
+        assert (
+            "modules.conditional_mean.checkpoint="
+            "checkpoints/freq_mean_pretrain_v2/mean_best.pt"
+        ) in train_text
+        assert "modules.conditional_mean.freeze=true" in train_text
+        assert "--max-samples 64" in eval_text
+        assert "--seed 42" in eval_text
+        assert "--mc-steps 20" in eval_text
+    for run in manifest["promotion_runs"]:
+        train_text = " ".join(run["train_command"])
+        assert "training.num_epochs=300" in train_text
+        assert run["checkpoint"] == run["completion_checkpoint"]
+        assert run["checkpoint"].endswith("ckpt_epoch0300.pt")
+
+
 @pytest.mark.parametrize(
     ("preset", "mode", "dct_enabled", "gabor_enabled"),
     [

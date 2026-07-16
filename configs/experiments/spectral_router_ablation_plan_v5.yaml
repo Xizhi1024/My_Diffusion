@@ -1,0 +1,150 @@
+base_config: configs/experiments/slmf_png_spectral_router_v5.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/spectral_router_ablations_v5
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+stage_a:
+  reference_id: S0
+  top_k: 1
+  dry_run_selected_evidence: S3
+  experiment_prefix: sr_v5_stage_a
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - {id: S0, preset: sr_v5_s0}
+    - {id: S1, preset: sr_v5_s1}
+    - {id: S2, preset: sr_v5_s2}
+    - {id: S3, preset: sr_v5_s3}
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.15
+    lesion_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.20
+    failure_any_mean:
+      direction: lower
+      max_value: 0.50
+      max_delta: 0.0625
+    false_hotspot_density_mean:
+      direction: lower
+      max_ratio: 1.25
+      epsilon: 0.000001
+    stripe_excess_mean:
+      direction: lower
+      max_value: 0.20
+      max_delta: 0.05
+    ssim_mean:
+      direction: higher
+      min_value: 0.85
+      max_delta: 0.03
+
+stage_b:
+  reference_id: T0
+  top_k: 2
+  experiment_prefix: sr_v5_stage_b
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - id: N0
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: true
+    - id: T0
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: false
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+    - id: C0
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.dct_descriptor.enabled: false
+        modules.residual_frequency.gabor_descriptor.enabled: false
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+    - id: C1
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.080
+    lesion_peak_error_norm_mean:
+      direction: lower
+      max_value: 0.20
+    lesion_centroid_distance_mean:
+      direction: lower
+      max_value: 3.15
+    directional_spectrum_error_norm_mean:
+      direction: lower
+      max_value: 0.0095
+    failure_any_mean:
+      direction: lower
+      max_value: 0.0625
+      max_delta: 0.0625
+    false_hotspot_density_mean:
+      direction: lower
+      max_value: 0.00014
+      max_ratio: 1.25
+      epsilon: 0.000001
+    stripe_excess_mean:
+      direction: lower
+      max_value: 0.20
+      max_delta: 0.05
+    mae_mean:
+      direction: lower
+      max_value: 0.0365
+    ssim_mean:
+      direction: higher
+      min_value: 0.947
+      max_delta: 0.03
+
+promote:
+  experiment_prefix: sr_v5_full
+  epochs: 300
+  eval_interval: 20
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+
+paired_comparison:
+  seed: 42
+  resamples: 10000
+  metrics:
+    lesion_topq_peak_error_norm_mean: lower
+    lesion_peak_error_norm_mean: lower
+    lesion_mean_error_norm_mean: lower
+    lesion_centroid_distance_mean: lower
+    lesion_boundary_gradient_mae_norm_mean: lower
+    anatomy_edge_gradient_mae_norm_mean: lower
+    directional_spectrum_error_norm_mean: lower
+    failure_any_mean: lower
+    false_hotspot_density_mean: lower
+    stripe_excess_mean: lower
+    mae_mean: lower
+    ssim_mean: higher
