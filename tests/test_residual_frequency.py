@@ -465,6 +465,33 @@ class TestResidualBBDMIntegration:
         assert "frequency/gate_tv" in logs
         assert torch.isfinite(logs["frequency/gate_tv"])
 
+    def test_safe_gabor_route_passes_orientation_and_anisotropy(self, monkeypatch):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _residual_config(frequency=True, gabor=True)
+        cfg["modules"]["residual_frequency"].update({
+            "mode": "boundary_reliable",
+            "band_scales": [0.5, 0.25],
+            "use_directional_reliability": False,
+            "use_gabor_agreement": True,
+            "gabor_agreement_alpha": 0.10,
+        })
+        model = SLMFBBDM.from_config(cfg)
+        injector = model.residual_preconditioner
+        original_forward = injector.forward
+        captured = {}
+
+        def _capture(*args, **kwargs):
+            captured.update(kwargs)
+            return original_forward(*args, **kwargs)
+
+        monkeypatch.setattr(injector, "forward", _capture)
+        loss, _ = model(_model_batch(), timesteps=torch.tensor([25]))
+
+        assert torch.isfinite(loss)
+        assert captured["gabor_orientation"].shape[1] == 4
+        assert captured["gabor_anisotropy"].shape == (1, 1, 32, 32)
+
     def test_legacy_state_modulation_can_be_disabled_without_disabling_skips(
         self, monkeypatch
     ):

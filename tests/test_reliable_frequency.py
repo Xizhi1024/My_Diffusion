@@ -229,6 +229,99 @@ def test_gabor_quadrature_energy_only_changes_directional_reliability():
     assert not any("gabor" in name and "head" in name for name, _ in module.named_modules())
 
 
+def test_gabor_agreement_is_bounded_and_rewards_matching_band_distributions():
+    module = _module(use_gabor_agreement=True)
+    q_g = torch.tensor([[[[1.0]], [[0.0]], [[0.0]]]])
+    q_same = q_g.clone()
+    q_different = torch.tensor([[[[0.0]], [[1.0]], [[0.0]]]])
+
+    same = module.gabor_agreement(q_g, q_same)
+    different = module.gabor_agreement(q_g, q_different)
+
+    assert same.shape == (1, 1, 1, 1)
+    assert torch.all((same >= 0) & (same <= 1))
+    assert torch.all((different >= 0) & (different <= 1))
+    assert torch.allclose(same, torch.ones_like(same))
+    assert torch.all(different < same)
+
+
+def test_gabor_agreement_reliability_is_shared_bounded_and_confidence_gated():
+    module = _module(
+        use_gabor_agreement=True,
+        gabor_agreement_alpha=0.10,
+        gabor_agreement_l1=True,
+    )
+    orientation = torch.zeros(1, 8, 16, 16)
+    orientation[:, 0] = 4.0
+    anisotropy = torch.ones(1, 1, 16, 16)
+    details = (
+        torch.zeros(1, 1, 16, 16),
+        torch.ones(1, 1, 16, 16),
+        torch.zeros(1, 1, 16, 16),
+    )
+
+    reliability = module.gabor_agreement_reliability(
+        orientation,
+        anisotropy,
+        details,
+        level_index=1,
+    )
+    no_confidence = module.gabor_agreement_reliability(
+        orientation,
+        torch.zeros_like(anisotropy),
+        details,
+        level_index=1,
+    )
+
+    assert reliability.shape == (1, 1, 16, 16)
+    assert reliability.min() >= 0.90
+    assert reliability.max() <= 1.00
+    assert torch.allclose(no_confidence, torch.ones_like(no_confidence))
+
+
+def test_gabor_agreement_defaults_to_l1_only_and_detaches_descriptor():
+    module = _module(
+        use_gabor_agreement=True,
+        gabor_agreement_alpha=0.10,
+        gabor_agreement_l2=False,
+        gabor_agreement_l1=True,
+        detach_gabor_descriptor=True,
+    )
+    orientation = torch.rand(1, 8, 16, 16, requires_grad=True)
+    anisotropy = torch.ones(1, 1, 16, 16, requires_grad=True)
+    details = tuple(
+        torch.rand(1, 1, 16, 16, requires_grad=True) for _ in range(3)
+    )
+
+    l2 = module.gabor_agreement_reliability(
+        orientation,
+        anisotropy,
+        details,
+        level_index=0,
+    )
+    l1 = module.gabor_agreement_reliability(
+        orientation,
+        anisotropy,
+        details,
+        level_index=1,
+    )
+    l1.sum().backward()
+
+    assert torch.allclose(l2, torch.ones_like(l2))
+    assert orientation.grad is None
+    assert anisotropy.grad is None
+    assert all(detail.grad is not None for detail in details)
+
+
+def test_gabor_agreement_rejects_invalid_configuration():
+    import pytest
+
+    with pytest.raises(ValueError):
+        _module(use_gabor_agreement=True, gabor_agreement_alpha=-0.1)
+    with pytest.raises(ValueError):
+        _module(use_gabor_agreement=True, gabor_agreement_alpha=0.6)
+
+
 def test_zero_initialized_skip_residuals_are_exact_noops_but_learnable():
     residual, ct, timesteps, schedule, orientation = _inputs()
     module = _module(

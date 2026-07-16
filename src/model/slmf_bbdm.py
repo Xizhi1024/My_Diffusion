@@ -419,6 +419,21 @@ class SLMFBBDM(nn.Module):
                         frequency_cfg.get("ct_reliability_floor_l2", 0.0),
                         frequency_cfg.get("ct_reliability_floor_l1", 0.0),
                     ),
+                    use_gabor_agreement=frequency_cfg.get(
+                        "use_gabor_agreement", False
+                    ),
+                    gabor_agreement_alpha=frequency_cfg.get(
+                        "gabor_agreement_alpha", 0.10
+                    ),
+                    gabor_agreement_l2=frequency_cfg.get(
+                        "gabor_agreement_l2", False
+                    ),
+                    gabor_agreement_l1=frequency_cfg.get(
+                        "gabor_agreement_l1", True
+                    ),
+                    detach_gabor_descriptor=frequency_cfg.get(
+                        "detach_gabor_descriptor", True
+                    ),
                 )
         self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
 
@@ -851,12 +866,19 @@ class SLMFBBDM(nn.Module):
         if timesteps is None or noisy_residual is None or self.residual_preconditioner is None:
             raise ValueError("Residual-frequency injection requires noisy_residual and timesteps")
         if self.residual_frequency_mode == "boundary_reliable":
+            frequency_kwargs = {
+                "gabor_orientation": condition.maps.get("gabor_orientation"),
+            }
+            if self.residual_preconditioner.use_gabor_agreement:
+                frequency_kwargs["gabor_anisotropy"] = condition.maps.get(
+                    "gabor_anisotropy"
+                )
             injections, diagnostics = self.residual_preconditioner(
                 noisy_residual,
                 timesteps,
                 self.noise_schedule,
                 condition.maps["ct"],
-                gabor_orientation=condition.maps.get("gabor_orientation"),
+                **frequency_kwargs,
             )
             self._last_frequency_diagnostics = diagnostics
             condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]

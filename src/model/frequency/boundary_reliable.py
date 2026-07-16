@@ -95,6 +95,11 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         cross_temperature: float = 1.0,
         content_hidden_channels: int = 16,
         ct_reliability_floors: Sequence[float] = (0.0, 0.0),
+        use_gabor_agreement: bool = False,
+        gabor_agreement_alpha: float = 0.10,
+        gabor_agreement_l2: bool = False,
+        gabor_agreement_l1: bool = True,
+        detach_gabor_descriptor: bool = True,
     ) -> None:
         super().__init__()
         if len(output_channels) != 4:
@@ -115,6 +120,8 @@ class BoundaryReliableFrequencyInjector(nn.Module):
             not 0.0 <= float(floor) <= 1.0 for floor in ct_reliability_floors
         ):
             raise ValueError("ct_reliability_floors must contain L2/L1 values in [0, 1]")
+        if not 0.0 <= gabor_agreement_alpha <= 0.5:
+            raise ValueError("gabor_agreement_alpha must be in [0, 0.5]")
 
         self.output_channels = tuple(int(channel) for channel in output_channels)
         self.use_noise_release = bool(use_noise_release)
@@ -122,6 +129,13 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         self.use_content_reliability = bool(use_content_reliability)
         self.use_subband_gates = bool(use_subband_gates)
         self.use_directional_reliability = bool(use_directional_reliability)
+        self.use_gabor_agreement = bool(use_gabor_agreement)
+        self.gabor_agreement_alpha = float(gabor_agreement_alpha)
+        self.gabor_agreement_levels = (
+            bool(gabor_agreement_l2),
+            bool(gabor_agreement_l1),
+        )
+        self.detach_gabor_descriptor = bool(detach_gabor_descriptor)
         self.gabor_orientations = int(gabor_orientations)
         self.gate_max = float(gate_max)
         self.snr_center = float(snr_center)
@@ -232,6 +246,18 @@ class BoundaryReliableFrequencyInjector(nn.Module):
             raise ValueError(
                 "Gabor orientation channel count does not match gabor_orientations"
             )
+        directional = self._orientation_band_energy(orientation_energy, size)
+        maximum = directional.amax(dim=1, keepdim=True)
+        normalized = directional / maximum.clamp_min(1e-6)
+        reliability = 0.5 + 0.5 * normalized
+        no_energy = maximum <= 1e-6
+        return torch.where(no_energy.expand_as(reliability), torch.ones_like(reliability), reliability)
+
+    def _orientation_band_energy(
+        self,
+        orientation_energy: torch.Tensor,
+        size: tuple[int, int],
+    ) -> torch.Tensor:
         resized = F.interpolate(
             orientation_energy.abs(), size=size, mode="bilinear", align_corners=False
         )
@@ -247,12 +273,60 @@ class BoundaryReliableFrequencyInjector(nn.Module):
             dim=0,
         )
         weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        directional = torch.einsum("bohw,ko->bkhw", resized, weights)
-        maximum = directional.amax(dim=1, keepdim=True)
-        normalized = directional / maximum.clamp_min(1e-6)
-        reliability = 0.5 + 0.5 * normalized
-        no_energy = maximum <= 1e-6
-        return torch.where(no_energy.expand_as(reliability), torch.ones_like(reliability), reliability)
+        return torch.einsum("bohw,ko->bkhw", resized, weights)
+
+    @staticmethod
+    def gabor_agreement(q_g: torch.Tensor, q_h: torch.Tensor) -> torch.Tensor:
+        """Return bounded Bhattacharyya agreement for three-band maps."""
+        if q_g.shape != q_h.shape or q_g.ndim != 4 or q_g.shape[1] != 3:
+            raise ValueError("q_g and q_h must have matching [B,3,H,W] shapes")
+        q_g = q_g.clamp_min(0.0)
+        q_h = q_h.clamp_min(0.0)
+        q_g = q_g / q_g.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        q_h = q_h / q_h.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return torch.sqrt(q_g * q_h).sum(dim=1, keepdim=True).clamp(0.0, 1.0)
+
+    def gabor_agreement_reliability(
+        self,
+        orientation_energy: Optional[torch.Tensor],
+        anisotropy: Optional[torch.Tensor],
+        residual_details: HaarDetails,
+        level_index: int,
+    ) -> torch.Tensor:
+        """Return one shared Gabor reliability map for a native Haar level."""
+        if level_index not in (0, 1):
+            raise ValueError("level_index must identify native L2 or L1")
+        reference = residual_details[0]
+        ones = reference.new_ones(reference.shape[0], 1, *reference.shape[-2:])
+        if (
+            not self.use_gabor_agreement
+            or not self.gabor_agreement_levels[level_index]
+            or orientation_energy is None
+            or anisotropy is None
+        ):
+            return ones
+        if orientation_energy.ndim != 4 or orientation_energy.shape[1] != self.gabor_orientations:
+            raise ValueError("Gabor orientation energy has incompatible shape")
+        if anisotropy.ndim != 4 or anisotropy.shape[1] != 1:
+            raise ValueError("Gabor anisotropy must have shape [B,1,H,W]")
+        if self.detach_gabor_descriptor:
+            orientation_energy = orientation_energy.detach()
+            anisotropy = anisotropy.detach()
+
+        size = reference.shape[-2:]
+        q_g = self._orientation_band_energy(orientation_energy, size)
+        q_h = F.avg_pool2d(
+            _stack_details(residual_details).abs(),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+        agreement = self.gabor_agreement(q_g, q_h)
+        confidence = F.interpolate(
+            anisotropy.abs(), size=size, mode="bilinear", align_corners=False
+        ).clamp(0.0, 1.0)
+        reliability = 1.0 - self.gabor_agreement_alpha * confidence * (1.0 - agreement)
+        return reliability.clamp(1.0 - self.gabor_agreement_alpha, 1.0)
 
     def _content_reliability(
         self,
@@ -278,6 +352,7 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         ct_details: HaarDetails,
         noise_gate: torch.Tensor,
         gabor_orientation: Optional[torch.Tensor],
+        gabor_anisotropy: Optional[torch.Tensor],
     ) -> torch.Tensor:
         cross = self.cross_modal_reliability(
             residual_details,
@@ -293,13 +368,19 @@ class BoundaryReliableFrequencyInjector(nn.Module):
             )
         else:
             direction = torch.ones_like(cross)
+        agreement = self.gabor_agreement_reliability(
+            gabor_orientation,
+            gabor_anisotropy,
+            residual_details,
+            level_index,
+        )
 
         if not self.use_subband_gates:
             cross = cross.mean(dim=1, keepdim=True).expand_as(cross)
             direction = direction.mean(dim=1, keepdim=True).expand_as(direction)
 
         gate = self.gate_max * noise_gate[:, None, None, None]
-        gate = gate * cross * content * direction
+        gate = gate * cross * content * direction * agreement
         return gate.clamp(0.0, self.gate_max)
 
     def forward(
@@ -309,6 +390,7 @@ class BoundaryReliableFrequencyInjector(nn.Module):
         schedule,
         ct: torch.Tensor,
         gabor_orientation: Optional[torch.Tensor] = None,
+        gabor_anisotropy: Optional[torch.Tensor] = None,
     ) -> tuple[list[torch.Tensor], Dict[str, torch.Tensor]]:
         if noisy_state.shape != ct.shape:
             raise ValueError("noisy state and CT must have identical [B,1,H,W] shapes")
@@ -321,10 +403,20 @@ class BoundaryReliableFrequencyInjector(nn.Module):
 
         # Native order follows [L2, L1].
         gates_l2 = self._level_gates(
-            0, residual_details2, ct_details2, noise[:, 0], gabor_orientation
+            0,
+            residual_details2,
+            ct_details2,
+            noise[:, 0],
+            gabor_orientation,
+            gabor_anisotropy,
         )
         gates_l1 = self._level_gates(
-            1, residual_details1, ct_details1, noise[:, 1], gabor_orientation
+            1,
+            residual_details1,
+            ct_details1,
+            noise[:, 1],
+            gabor_orientation,
+            gabor_anisotropy,
         )
 
         scale_l2 = self.band_scales[0].to(noisy_state)
