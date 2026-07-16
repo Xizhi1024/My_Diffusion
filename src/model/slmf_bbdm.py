@@ -456,6 +456,15 @@ class SLMFBBDM(nn.Module):
                     SpectralEvidenceFrequencyRouter,
                 )
 
+                dct_enabled = bool(dct_descriptor_cfg.get("enabled", True))
+                if dct_enabled and (
+                    dct_descriptor_cfg.get("pooled_size", 8) != 8
+                    or dct_descriptor_cfg.get("selected_frequencies", 12) != 12
+                ):
+                    raise ValueError(
+                        "V5 selected DCT requires pooled_size=8 "
+                        "and selected_frequencies=12"
+                    )
                 band_scales = tuple(
                     frequency_cfg.get("band_scales", [0.5, 0.25])[-2:]
                 )
@@ -492,7 +501,7 @@ class SLMFBBDM(nn.Module):
                         "hidden_channels",
                         frequency_cfg.get("router_hidden_channels", 32),
                     ),
-                    dct_enabled=dct_descriptor_cfg.get("enabled", True),
+                    dct_enabled=dct_enabled,
                     gabor_enabled=gabor_descriptor_cfg.get("enabled", True),
                     cross_level_enabled=cross_level_router_cfg.get(
                         "enabled", True

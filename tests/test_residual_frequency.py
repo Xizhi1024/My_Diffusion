@@ -358,6 +358,43 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    @pytest.mark.parametrize(
+        ("setting", "invalid_value"),
+        (("pooled_size", 4), ("selected_frequencies", 6)),
+    )
+    def test_v5_rejects_noncanonical_selected_dct_configuration(
+        self, setting, invalid_value
+    ):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _enable_v5(_residual_config(frequency=True, gabor=True))
+        cfg["modules"]["residual_frequency"]["dct_descriptor"][setting] = (
+            invalid_value
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "V5 selected DCT requires pooled_size=8 "
+                "and selected_frequencies=12"
+            ),
+        ):
+            SLMFBBDM.from_config(cfg)
+
+    def test_v5_disabled_dct_ignores_selected_dct_settings(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _enable_v5(_residual_config(frequency=True, gabor=True))
+        cfg["modules"]["residual_frequency"]["dct_descriptor"] = {
+            "enabled": False,
+            "pooled_size": 4,
+            "selected_frequencies": 6,
+        }
+
+        model = SLMFBBDM.from_config(cfg)
+
+        assert model.residual_preconditioner.dct_descriptor is None
+
     def test_model_constructs_v5_and_routes_only_inference_available_maps(self):
         from src.model.frequency.spectral_router import (
             SpectralEvidenceFrequencyRouter,
