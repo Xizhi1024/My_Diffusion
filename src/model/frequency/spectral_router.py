@@ -176,7 +176,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         reference: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         steps = int(schedule.num_train_timesteps)
-        normalized_timestep = timesteps.to(reference).float() / max(steps - 1, 1)
+        normalized_timestep = timesteps.to(
+            device=reference.device, dtype=reference.dtype
+        ) / max(steps - 1, 1)
         m = schedule.m_t[timesteps].to(reference)
         sigma = schedule.sigma_t[timesteps].to(reference)
         signal = (1.0 - m) * self.band_scales[level_index].to(reference)
@@ -230,12 +232,20 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         if gabor_feat is not None:
             if gabor_feat.ndim != 4 or gabor_feat.shape[0] != batch:
                 raise ValueError("Gabor scale features must have shape [B,C,H,W]")
+            gabor_feat = gabor_feat.to(
+                device=residual_distribution.device,
+                dtype=residual_distribution.dtype,
+            )
             scale = torch.tanh(torch.log1p(gabor_feat.abs().mean(dim=(1, 2, 3))))
             scale_energy = scale[:, None].expand(-1, 3)
 
         if gabor_anisotropy is not None:
             if gabor_anisotropy.ndim != 4 or gabor_anisotropy.shape[:2] != (batch, 1):
                 raise ValueError("Gabor anisotropy must have shape [B,1,H,W]")
+            gabor_anisotropy = gabor_anisotropy.to(
+                device=residual_distribution.device,
+                dtype=residual_distribution.dtype,
+            )
             anisotropy = gabor_anisotropy.abs().mean(dim=(1, 2, 3)).clamp(0.0, 1.0)
             anisotropy_energy = anisotropy[:, None].expand(-1, 3)
 
@@ -246,6 +256,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 or gabor_orientation.shape[1] != self.gabor_orientations
             ):
                 raise ValueError("Gabor orientation energy has incompatible shape")
+            gabor_orientation = gabor_orientation.to(
+                device=residual_distribution.device,
+                dtype=residual_distribution.dtype,
+            )
             oriented = self._orientation_band_energy(gabor_orientation, size)
             orientation_energy = oriented.mean(dim=(-2, -1))
             orientation_energy = orientation_energy / orientation_energy.sum(

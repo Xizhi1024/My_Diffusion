@@ -177,6 +177,44 @@ def test_hard_all_null_short_circuits_before_descriptors_and_projection():
     assert torch.equal(diagnostics["routes_l1"], expected_routes)
 
 
+def test_router_half_precision_preserves_reference_dtype_and_stays_finite():
+    module = _router().half()
+    residual = torch.randn(2, 1, 32, 32, dtype=torch.float16)
+    ct = torch.randn_like(residual)
+
+    injections, diagnostics = module(
+        residual,
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        ct,
+    )
+
+    assert all(value.dtype == torch.float16 for value in injections)
+    assert all(torch.isfinite(value).all() for value in injections)
+    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+
+
+def test_router_normalizes_optional_gabor_evidence_to_reference_dtype():
+    module = _router().half()
+    residual = torch.randn(2, 1, 32, 32, dtype=torch.float16)
+    ct = torch.randn_like(residual)
+
+    injections, diagnostics = module(
+        residual,
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        ct,
+        gabor_orientation=torch.rand(2, 8, 32, 32, dtype=torch.float32),
+        gabor_anisotropy=torch.rand(2, 1, 32, 32, dtype=torch.float64),
+        gabor_feat=torch.rand(2, 16, 32, 32, dtype=torch.float32),
+    )
+
+    assert all(value.dtype == torch.float16 for value in injections)
+    assert diagnostics["gabor_haar_agreement"].dtype == torch.float16
+    assert diagnostics["gabor_dct_agreement"].dtype == torch.float16
+    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+
+
 def test_router_receives_gradients_after_zero_projection_learns():
     module = _router()
     optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
@@ -198,3 +236,4 @@ def test_router_receives_gradients_after_zero_projection_learns():
     ]
     assert route_grads
     assert all(torch.isfinite(grad).all() for grad in route_grads)
+    assert any(torch.count_nonzero(grad).item() > 0 for grad in route_grads)
