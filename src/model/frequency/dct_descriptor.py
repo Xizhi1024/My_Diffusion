@@ -62,9 +62,15 @@ class SelectedDCTDescriptor(nn.Module):
         pooled = F.adaptive_avg_pool2d(
             energy, output_size=(self.pooled_size, self.pooled_size)
         )
+        pooled_scale = pooled.abs().mean(dim=(-2, -1)).unsqueeze(-1)
+        pooled = pooled - pooled.mean(dim=(-2, -1), keepdim=True)
         basis = self.basis.to(device=details.device, dtype=details.dtype)
         coefficients = torch.einsum("bchw,khw->bck", pooled, basis).abs()
-        coefficients = coefficients / coefficients.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        coefficient_sum = coefficients.sum(dim=-1, keepdim=True)
+        dtype_info = torch.finfo(coefficients.dtype)
+        normalization_floor = pooled_scale * math.sqrt(dtype_info.eps)
+        denominator = torch.maximum(coefficient_sum, normalization_floor)
+        coefficients = coefficients / denominator.clamp_min(dtype_info.tiny)
         weights = self.frequency_weights().to(details)
         descriptor = coefficients * weights.view(1, 1, -1)
         return descriptor, {

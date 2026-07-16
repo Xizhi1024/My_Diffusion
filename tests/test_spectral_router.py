@@ -18,6 +18,34 @@ def test_selected_dct_descriptor_is_finite_normalized_and_trainable():
     descriptor.sum().backward()
     assert details.grad is not None
     assert torch.isfinite(details.grad).all()
+    assert module.weight_offsets.grad is not None
+    assert torch.isfinite(module.weight_offsets.grad).all()
+
+
+def test_selected_dct_descriptor_returns_zero_for_constant_input():
+    from src.model.frequency.dct_descriptor import SelectedDCTDescriptor
+
+    module = SelectedDCTDescriptor(pooled_size=8, selected_frequencies=12)
+    descriptor, _ = module(torch.ones(1, 3, 8, 8))
+
+    torch.testing.assert_close(
+        descriptor,
+        torch.zeros_like(descriptor),
+        atol=torch.finfo(descriptor.dtype).eps,
+        rtol=0.0,
+    )
+
+
+def test_selected_dct_descriptor_does_not_amplify_near_constant_input():
+    from src.model.frequency.dct_descriptor import SelectedDCTDescriptor
+
+    module = SelectedDCTDescriptor(pooled_size=8, selected_frequencies=12)
+    details = torch.ones(1, 3, 8, 8)
+    details[..., 0, 0] += 4 * torch.finfo(details.dtype).eps
+    descriptor, _ = module(details)
+
+    assert torch.isfinite(descriptor).all()
+    assert descriptor.abs().sum().item() < 1e-3
 
 
 def test_selected_dct_descriptor_starts_at_declared_prior():
