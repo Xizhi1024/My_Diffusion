@@ -70,6 +70,32 @@ def _residual_config(*, frequency=True, gabor=True, mean_weight=1.0):
     }
 
 
+def _enable_v5(cfg):
+    frequency = cfg["modules"]["residual_frequency"]
+    frequency.update({
+        "mode": "spectral_evidence_router",
+        "dct_descriptor": {
+            "enabled": True,
+            "pooled_size": 8,
+            "selected_frequencies": 12,
+        },
+        "gabor_descriptor": {"enabled": True},
+        "cross_level_router": {
+            "enabled": True,
+            "hard_all_null": False,
+            "initial_null_probability": 0.90,
+        },
+    })
+    cfg["losses"]["spectral_router_regularization"] = {
+        "enabled": True,
+        "weight": 1.0,
+        "temporal_weight": 1e-4,
+        "dct_weight": 1e-4,
+        "gabor_weight": 1e-4,
+    }
+    return cfg
+
+
 def _model_batch(batch_size=1, size=32):
     return {
         "ct": torch.randn(batch_size, 1, size, size),
@@ -332,6 +358,36 @@ class TestResidualFrequencyPreconditioner:
 
 
 class TestResidualBBDMIntegration:
+    def test_model_constructs_v5_and_routes_only_inference_available_maps(self):
+        from src.model.frequency.spectral_router import (
+            SpectralEvidenceFrequencyRouter,
+        )
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        model = SLMFBBDM.from_config(
+            _enable_v5(_residual_config(frequency=True, gabor=True))
+        )
+        assert isinstance(
+            model.residual_preconditioner, SpectralEvidenceFrequencyRouter
+        )
+
+        loss, logs = model(_model_batch(), timesteps=torch.tensor([50]))
+
+        assert torch.isfinite(loss)
+        assert "frequency/route_l2_null" in logs
+        assert "frequency/route_l1_null" in logs
+        assert "loss/spectral_router_regularization/loss" in logs
+
+    def test_v5_requires_gabor_only_when_gabor_evidence_is_enabled(self):
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _enable_v5(_residual_config(frequency=True, gabor=False))
+        with pytest.raises(ValueError, match="Gabor evidence requires"):
+            SLMFBBDM.from_config(cfg)
+
+        cfg["modules"]["residual_frequency"]["gabor_descriptor"]["enabled"] = False
+        SLMFBBDM.from_config(cfg)
+
     def test_boundary_reliable_mode_constructs_without_noisy_state_modulation(self):
         from src.model.frequency.boundary_reliable import (
             BoundaryReliableFrequencyInjector,

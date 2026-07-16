@@ -12,3 +12,4 @@ from .lesion_roi import LesionROIL1Loss, OutsidePeakRankingLoss
 from .boundary_frequency import BoundaryFrequencyLoss
 from .frequency_gate_tv import FrequencyGateTVLoss
 from .normalized_lesion_peak import NormalizedLesionPeakLoss
+from .spectral_router import SpectralRouterRegularizationLoss

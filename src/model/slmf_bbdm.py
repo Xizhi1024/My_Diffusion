@@ -294,6 +294,9 @@ class SLMFBBDM(nn.Module):
         self.residual_bridge_enabled = bool(residual_cfg.get("enabled", False))
         self.residual_frequency_enabled = bool(frequency_cfg.get("enabled", False))
         self.residual_frequency_mode = str(frequency_cfg.get("mode", "legacy"))
+        dct_descriptor_cfg = frequency_cfg.get("dct_descriptor", {})
+        gabor_descriptor_cfg = frequency_cfg.get("gabor_descriptor", {})
+        cross_level_router_cfg = frequency_cfg.get("cross_level_router", {})
         self.mean_checkpoint = mean_cfg.get("checkpoint")
         self.mean_frozen = bool(mean_cfg.get("freeze", False))
         self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
@@ -310,10 +313,14 @@ class SLMFBBDM(nn.Module):
             raise ValueError("modules.residual_bridge requires the bbdm_bridge noise schedule")
         if self.residual_frequency_enabled and not self.residual_bridge_enabled:
             raise ValueError("modules.residual_frequency requires modules.residual_bridge.enabled=true")
-        if self.residual_frequency_mode not in {"legacy", "boundary_reliable"}:
+        if self.residual_frequency_mode not in {
+            "legacy",
+            "boundary_reliable",
+            "spectral_evidence_router",
+        }:
             raise ValueError(
-                "modules.residual_frequency.mode must be 'legacy' or "
-                "'boundary_reliable'"
+                "modules.residual_frequency.mode must be 'legacy', "
+                "'boundary_reliable', or 'spectral_evidence_router'"
             )
         use_gabor_gate = bool(frequency_cfg.get("use_gabor_gate", False))
         use_directional_reliability = bool(
@@ -327,6 +334,15 @@ class SLMFBBDM(nn.Module):
             )
         ) and not self.gabor_routes.get("enabled", False):
             raise ValueError("Residual-frequency Gabor gating requires modules.gabor.enabled=true")
+        if (
+            self.residual_frequency_enabled
+            and self.residual_frequency_mode == "spectral_evidence_router"
+            and bool(gabor_descriptor_cfg.get("enabled", True))
+            and not self.gabor_routes.get("enabled", False)
+        ):
+            raise ValueError(
+                "Gabor evidence requires modules.gabor.enabled=true"
+            )
         configured_losses = loss_configs or {}
         residual_wavelet_cfg = configured_losses.get("residual_wavelet", {})
         if residual_wavelet_cfg.get("enabled", False) and not self.residual_bridge_enabled:
@@ -392,7 +408,7 @@ class SLMFBBDM(nn.Module):
                     gate_strength=frequency_cfg.get("gate_strength", 0.1),
                     state_modulation=frequency_cfg.get("state_modulation", True),
                 )
-            else:
+            elif self.residual_frequency_mode == "boundary_reliable":
                 from .frequency.boundary_reliable import (
                     BoundaryReliableFrequencyInjector,
                 )
@@ -433,6 +449,65 @@ class SLMFBBDM(nn.Module):
                     ),
                     detach_gabor_descriptor=frequency_cfg.get(
                         "detach_gabor_descriptor", True
+                    ),
+                )
+            else:
+                from .frequency.spectral_router import (
+                    SpectralEvidenceFrequencyRouter,
+                )
+
+                band_scales = tuple(
+                    frequency_cfg.get("band_scales", [0.5, 0.25])[-2:]
+                )
+                self.residual_preconditioner = SpectralEvidenceFrequencyRouter(
+                    output_channels=tuple(
+                        frequency_cfg.get(
+                            "output_channels", [256, 256, 128, 64]
+                        )
+                    ),
+                    band_scales=band_scales,
+                    use_noise_release=frequency_cfg.get("use_noise_release", True),
+                    use_ct_reliability=frequency_cfg.get(
+                        "use_ct_reliability", True
+                    ),
+                    use_content_reliability=frequency_cfg.get(
+                        "use_content_reliability", True
+                    ),
+                    use_subband_gates=frequency_cfg.get(
+                        "use_subband_gates", True
+                    ),
+                    gabor_orientations=gabor_orientations,
+                    gate_max=frequency_cfg.get("gate_max", 0.25),
+                    snr_center=frequency_cfg.get("snr_center", 0.0),
+                    snr_temperature=frequency_cfg.get("snr_temperature", 2.0),
+                    cross_temperature=frequency_cfg.get("cross_temperature", 1.0),
+                    content_hidden_channels=frequency_cfg.get(
+                        "content_hidden_channels", 16
+                    ),
+                    ct_reliability_floors=(
+                        frequency_cfg.get("ct_reliability_floor_l2", 0.25),
+                        frequency_cfg.get("ct_reliability_floor_l1", 0.50),
+                    ),
+                    hidden_channels=cross_level_router_cfg.get(
+                        "hidden_channels",
+                        frequency_cfg.get("router_hidden_channels", 32),
+                    ),
+                    dct_enabled=dct_descriptor_cfg.get("enabled", True),
+                    gabor_enabled=gabor_descriptor_cfg.get("enabled", True),
+                    cross_level_enabled=cross_level_router_cfg.get(
+                        "enabled", True
+                    ),
+                    hard_all_null=cross_level_router_cfg.get(
+                        "hard_all_null", False
+                    ),
+                    initial_null_probability=cross_level_router_cfg.get(
+                        "initial_null_probability", 0.90
+                    ),
+                    amplitude_delta_min=frequency_cfg.get(
+                        "amplitude_delta_min", -0.05
+                    ),
+                    amplitude_delta_max=frequency_cfg.get(
+                        "amplitude_delta_max", 0.10
                     ),
                 )
         self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
@@ -671,6 +746,17 @@ class SLMFBBDM(nn.Module):
                 enabled=enabled,
                 weight=weight,
             )
+        elif name == "spectral_router_regularization":
+            from .loss_terms.spectral_router import (
+                SpectralRouterRegularizationLoss,
+            )
+            return SpectralRouterRegularizationLoss(
+                enabled=enabled,
+                weight=weight,
+                temporal_weight=cfg.get("temporal_weight", 1e-4),
+                dct_weight=cfg.get("dct_weight", 1e-4),
+                gabor_weight=cfg.get("gabor_weight", 1e-4),
+            )
         elif name == "boundary_frequency":
             from .loss_terms.boundary_frequency import BoundaryFrequencyLoss
             return BoundaryFrequencyLoss(
@@ -865,7 +951,31 @@ class SLMFBBDM(nn.Module):
             return []
         if timesteps is None or noisy_residual is None or self.residual_preconditioner is None:
             raise ValueError("Residual-frequency injection requires noisy_residual and timesteps")
-        if self.residual_frequency_mode == "boundary_reliable":
+        if self.residual_frequency_mode == "spectral_evidence_router":
+            injections, diagnostics = self.residual_preconditioner(
+                noisy_residual,
+                timesteps,
+                self.noise_schedule,
+                condition.maps["ct"],
+                gabor_feat=condition.maps.get("gabor_feat"),
+                gabor_orientation=condition.maps.get("gabor_orientation"),
+                gabor_anisotropy=condition.maps.get("gabor_anisotropy"),
+            )
+            self._last_frequency_diagnostics = diagnostics
+            condition.scalars["spectral_route_temporal_smoothness"] = diagnostics[
+                "route_temporal_smoothness"
+            ]
+            condition.scalars["spectral_dct_weight_offset"] = diagnostics[
+                "dct_weight_offset"
+            ]
+            gabor_prior = self.priors["gabor"] if "gabor" in self.priors else None
+            condition.scalars["spectral_gabor_parameter_offset"] = (
+                gabor_prior.parameter_offset_energy()
+                if gabor_prior is not None
+                and hasattr(gabor_prior, "parameter_offset_energy")
+                else noisy_residual.new_zeros(())
+            )
+        elif self.residual_frequency_mode == "boundary_reliable":
             frequency_kwargs = {
                 "gabor_orientation": condition.maps.get("gabor_orientation"),
             }
@@ -1185,6 +1295,21 @@ class SLMFBBDM(nn.Module):
             gate_tv = self._last_frequency_diagnostics.get("gate_tv")
             if gate_tv is not None:
                 logs["frequency/gate_tv"] = gate_tv.detach()
+        elif self.residual_frequency_mode == "spectral_evidence_router":
+            destinations = ("native", "shallow", "null")
+            for level in (2, 1):
+                routes = self._last_frequency_diagnostics.get(f"routes_l{level}")
+                if routes is not None:
+                    for index, destination in enumerate(destinations):
+                        logs[f"frequency/route_l{level}_{destination}"] = (
+                            routes[..., index].mean().detach()
+                        )
+                gates = self._last_frequency_diagnostics.get(f"gates_l{level}")
+                if gates is not None:
+                    for index, band in enumerate(("lh", "hl", "hh")):
+                        logs[f"frequency/gate_l{level}_{band}"] = (
+                            gates[:, index].mean().detach()
+                        )
         logs["module/wavelet_unet"] = torch.tensor(
             1.0 if self.wavelet_unet_enabled else 0.0, device=device
         )

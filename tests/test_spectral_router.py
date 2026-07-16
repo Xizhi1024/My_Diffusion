@@ -1,6 +1,24 @@
 import torch
 
 
+def test_gabor_parameter_offset_energy_is_zero_positive_and_trainable():
+    from src.model.priors.gabor import GaborPrior
+
+    prior = GaborPrior(scales=2, orientations=4, kernel_size=9)
+    initial = prior.parameter_offset_energy()
+    assert initial.ndim == 0
+    assert initial.item() == 0.0
+
+    with torch.no_grad():
+        prior.log_frequency[0] = 0.5
+    energy = prior.parameter_offset_energy()
+    assert energy.item() > 0.0
+
+    energy.backward()
+    assert prior.log_frequency.grad is not None
+    assert torch.isfinite(prior.log_frequency.grad).all()
+
+
 def test_selected_dct_descriptor_is_finite_normalized_and_trainable():
     from src.model.frequency.dct_descriptor import SelectedDCTDescriptor
 

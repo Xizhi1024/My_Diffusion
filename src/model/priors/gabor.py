@@ -98,6 +98,17 @@ class GaborPrior(PriorModule):
             "gamma": gamma,
         }
 
+    def parameter_offset_energy(self) -> torch.Tensor:
+        trainable = (
+            self.log_frequency,
+            self.theta_raw,
+            self.log_sigma,
+            self.gamma_raw,
+        )
+        return torch.stack(
+            [parameter.square().mean() for parameter in trainable]
+        ).mean()
+
     def _build_quadrature_kernels(
         self,
         dtype: torch.dtype,
