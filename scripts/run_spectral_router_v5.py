@@ -195,8 +195,12 @@ def _write_promotion_outputs(
         for row in promotion_records
     }
     stage_b_reference = output_dir / "stage_b" / f"{reference_id.lower()}.json"
-    if stage_b_reference.exists():
-        result_paths[f"{reference_id}_stage_b"] = stage_b_reference
+    if not stage_b_reference.is_file():
+        raise FileNotFoundError(
+            f"Stage B {reference_id} result is required for final paired "
+            f"comparison: {stage_b_reference}"
+        )
+    result_paths[f"{reference_id}_stage_b"] = stage_b_reference
     comparison_cfg = plan.get("paired_comparison", {})
     paired = compare_all_results(
         result_paths,

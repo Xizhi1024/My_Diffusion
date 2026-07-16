@@ -763,6 +763,65 @@ def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
         assert run["checkpoint"].endswith("ckpt_epoch0300.pt")
 
 
+def test_v5_final_comparison_requires_stage_b_t0_result(tmp_path):
+    from scripts.run_spectral_router_v5 import _write_promotion_outputs
+
+    plan = {
+        "output_dir": str(tmp_path),
+        "stage_b": {"reference_id": "T0", "hard_gates": {}},
+        "paired_comparison": {"metrics": {}},
+    }
+    stage_b_decision = {"ranked": [{"id": "T0", "metrics": {}}]}
+
+    with pytest.raises(FileNotFoundError, match="T0"):
+        _write_promotion_outputs(
+            plan,
+            [{"id": "C1", "metrics": {}}],
+            stage_b_decision,
+        )
+
+
+def test_v5_final_comparison_includes_stage_b_t0_and_promoted_results(tmp_path):
+    import json
+
+    from scripts.run_spectral_router_v5 import _write_promotion_outputs
+
+    plan = {
+        "output_dir": str(tmp_path),
+        "stage_b": {"reference_id": "T0", "hard_gates": {}},
+        "paired_comparison": {
+            "seed": 42,
+            "resamples": 10,
+            "metrics": {"score": "lower"},
+        },
+    }
+    stage_b_decision = {"ranked": [{"id": "T0", "metrics": {}}]}
+    per_patient = {"p0": {"score": 1.0}, "p1": {"score": 2.0}}
+    stage_b_dir = tmp_path / "stage_b"
+    promote_dir = tmp_path / "promote"
+    stage_b_dir.mkdir()
+    promote_dir.mkdir()
+    (stage_b_dir / "t0.json").write_text(
+        json.dumps({"per_patient": per_patient}), encoding="utf-8"
+    )
+    (promote_dir / "c1.json").write_text(
+        json.dumps({"per_patient": per_patient}), encoding="utf-8"
+    )
+
+    _write_promotion_outputs(
+        plan,
+        [{"id": "C1", "metrics": {}}],
+        stage_b_decision,
+    )
+
+    report = json.loads(
+        (tmp_path / "paired_comparison.json").read_text(encoding="utf-8")
+    )
+    assert [
+        {row["left_id"], row["right_id"]} for row in report["comparisons"]
+    ] == [{"C1", "T0_stage_b"}]
+
+
 @pytest.mark.parametrize(
     ("preset", "mode", "dct_enabled", "gabor_enabled"),
     [
