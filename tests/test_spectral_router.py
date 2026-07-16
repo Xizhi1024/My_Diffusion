@@ -73,3 +73,27 @@ def test_selected_dct_descriptor_rejects_invalid_configuration():
             pass
         else:
             raise AssertionError(f"configuration should fail: {kwargs}")
+
+
+def test_bounded_amplitude_head_starts_neutral_and_respects_limits():
+    from src.model.frequency.spectral_router import BoundedAmplitudeHead
+
+    head = BoundedAmplitudeHead(16, hidden_channels=8, minimum=-0.05, maximum=0.10)
+    evidence = torch.randn(4, 16)
+    initial = head(evidence)
+    assert torch.allclose(initial, torch.zeros_like(initial), atol=1e-7)
+    with torch.no_grad():
+        head.final.weight.fill_(100.0)
+    bounded = head(evidence)
+    assert bounded.min() >= -0.05
+    assert bounded.max() <= 0.10
+
+
+def test_conservative_route_head_is_null_biased_and_sums_to_one():
+    from src.model.frequency.spectral_router import ConservativeRouteHead
+
+    head = ConservativeRouteHead(16, hidden_channels=8, initial_null_probability=0.90)
+    probabilities = head(torch.randn(6, 16))
+    assert probabilities.shape == (6, 3)
+    assert torch.allclose(probabilities.sum(dim=-1), torch.ones(6), atol=1e-6)
+    assert torch.allclose(probabilities[:, 2], torch.full((6,), 0.90), atol=1e-6)
