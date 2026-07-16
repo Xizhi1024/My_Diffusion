@@ -495,6 +495,68 @@ def test_v4_dry_run_builds_four_stage_a_and_three_dynamic_stage_b_runs():
     assert "boundary_reliable_ablations_v3" not in paths
 
 
+@pytest.mark.parametrize(
+    ("preset", "mode", "dct_enabled", "gabor_enabled"),
+    [
+        ("sr_v5_s0", "boundary_reliable", False, False),
+        ("sr_v5_s1", "spectral_evidence_router", False, True),
+        ("sr_v5_s2", "spectral_evidence_router", True, False),
+        ("sr_v5_s3", "spectral_evidence_router", True, True),
+    ],
+)
+def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
+    preset, mode, dct_enabled, gabor_enabled
+):
+    import torch
+
+    from src.model.config_utils import load_full_config
+    from src.model.slmf_bbdm import SLMFBBDM
+
+    cfg = load_full_config(
+        "configs/experiments/slmf_png_spectral_router_v5.yaml",
+        ablation=preset,
+        ablation_config_path="configs/experiments/ablations.yaml",
+        overrides=["data.image_size=32", "runtime.eval_sampling_steps=2"],
+    )
+    model = SLMFBBDM.from_config(cfg)
+    frequency = cfg["modules"]["residual_frequency"]
+
+    assert model.residual_frequency_mode == mode
+    assert frequency["dct_descriptor"]["enabled"] is dct_enabled
+    assert frequency["gabor_descriptor"]["enabled"] is gabor_enabled
+    assert frequency["cross_level_router"]["enabled"] is False
+    assert cfg["losses"]["spectral_router_regularization"]["enabled"] is (
+        mode == "spectral_evidence_router"
+    )
+    if mode == "spectral_evidence_router":
+        assert model.residual_preconditioner.dct_enabled is dct_enabled
+        assert model.residual_preconditioner.gabor_enabled is gabor_enabled
+        assert model.residual_preconditioner.cross_level_enabled is False
+    else:
+        assert model.residual_preconditioner.use_gabor_agreement is False
+        assert model.residual_preconditioner.use_directional_reliability is False
+
+    direct_routes = (
+        "inject_adapter",
+        "use_for_noise",
+        "use_for_hotspot",
+        "use_for_loss",
+    )
+    for route in direct_routes:
+        assert cfg["modules"]["gabor"][route] is False
+    assert cfg["losses"]["normalized_lesion_peak"]["enabled"] is True
+    assert cfg["losses"]["frequency_gate_tv"]["enabled"] is True
+
+    batch = {
+        "ct": torch.randn(1, 1, 32, 32),
+        "pet": torch.randn(1, 1, 32, 32),
+        "mask": torch.zeros(1, 1, 32, 32),
+    }
+    batch["mask"][:, :, 14:18, 14:18] = 1
+    loss, _ = model(batch, timesteps=torch.tensor([250]))
+    assert torch.isfinite(loss)
+
+
 def test_paired_report_is_deterministic_and_handles_small_intersections(tmp_path):
     import json
 

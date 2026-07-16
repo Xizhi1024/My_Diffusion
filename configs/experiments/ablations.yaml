@@ -449,3 +449,54 @@ ablations:
       losses.hotspot_prior.enabled: false
       model.enable_heteroscedastic: false
       modules.condition_dropout.enabled: false
+
+  # ---- V5 spectral-evidence router factor screen ----
+  sr_v5_s0:
+    description: S0 boundary-reliable G0 control without spectral evidence
+    overrides:
+      modules.residual_frequency.mode: boundary_reliable
+      modules.residual_frequency.use_gabor_agreement: false
+      modules.residual_frequency.dct_descriptor.enabled: false
+      modules.residual_frequency.gabor_descriptor.enabled: false
+      modules.residual_frequency.cross_level_router.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+      losses.spectral_router_regularization.enabled: false
+
+  sr_v5_s1:
+    description: S1 spectral router with Gabor evidence only
+    overrides:
+      modules.residual_frequency.mode: spectral_evidence_router
+      modules.residual_frequency.dct_descriptor.enabled: false
+      modules.residual_frequency.gabor_descriptor.enabled: true
+      modules.residual_frequency.cross_level_router.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+
+  sr_v5_s2:
+    description: S2 spectral router with selected-DCT evidence only
+    overrides:
+      modules.residual_frequency.mode: spectral_evidence_router
+      modules.residual_frequency.dct_descriptor.enabled: true
+      modules.residual_frequency.gabor_descriptor.enabled: false
+      modules.residual_frequency.cross_level_router.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
+
+  sr_v5_s3:
+    description: S3 spectral router with selected-DCT and Gabor evidence
+    overrides:
+      modules.residual_frequency.mode: spectral_evidence_router
+      modules.residual_frequency.dct_descriptor.enabled: true
+      modules.residual_frequency.gabor_descriptor.enabled: true
+      modules.residual_frequency.cross_level_router.enabled: false
+      modules.gabor.inject_adapter: false
+      modules.gabor.use_for_noise: false
+      modules.gabor.use_for_hotspot: false
+      modules.gabor.use_for_loss: false
