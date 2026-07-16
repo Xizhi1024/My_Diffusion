@@ -15,14 +15,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.compare_v4_results import compare_all_results
-from scripts.run_boundary_reliable_v4 import _load_decision, _run_stage
+from scripts.run_boundary_reliable_v4 import (
+    _load_decision,
+    _run_stage as _shared_run_stage,
+)
 from scripts.run_frequency_ablations import (
     _json_safe,
     _require_planned_mean_checkpoint,
     _run_entries,
     _run_manifest_entry,
     _write_rankings,
-    composite_score,
+    checkpoint_epoch,
     passes_hard_gates,
 )
 
@@ -32,6 +35,24 @@ CROSS_ENABLED_KEY = "modules.residual_frequency.cross_level_router.enabled"
 HARD_NULL_KEY = "modules.residual_frequency.cross_level_router.hard_all_null"
 DCT_ENABLED_KEY = "modules.residual_frequency.dct_descriptor.enabled"
 GABOR_ENABLED_KEY = "modules.residual_frequency.gabor_descriptor.enabled"
+
+
+def _evidence_slug(evidence_id: str) -> str:
+    return f"evidence-{evidence_id.lower()}"
+
+
+def _evidence_phase(phase: str, evidence_id: str) -> str:
+    return str(Path(phase) / _evidence_slug(evidence_id))
+
+
+def _evidence_settings(
+    settings: Mapping[str, Any], evidence_id: str
+) -> Dict[str, Any]:
+    adapted = dict(settings)
+    adapted["experiment_prefix"] = (
+        f"{settings['experiment_prefix']}_{_evidence_slug(evidence_id)}"
+    )
+    return adapted
 
 
 def _stage_a_variant(
@@ -89,7 +110,9 @@ def build_stage_b_variants(
     return variants
 
 
-def _exact_final_checkpoint(entry: Mapping[str, Any]) -> Dict[str, Any]:
+def _exact_final_checkpoint(
+    entry: Mapping[str, Any], *, expected_epoch: int
+) -> Dict[str, Any]:
     exact_entry = dict(entry)
     completion_checkpoint = exact_entry.get("completion_checkpoint")
     if not completion_checkpoint:
@@ -99,7 +122,28 @@ def _exact_final_checkpoint(entry: Mapping[str, Any]) -> Dict[str, Any]:
     checkpoint_index = eval_command.index("--checkpoint") + 1
     eval_command[checkpoint_index] = str(completion_checkpoint)
     exact_entry["eval_command"] = eval_command
+    exact_entry["required_checkpoint_epoch"] = expected_epoch
     return exact_entry
+
+
+def validate_checkpoint_epoch(
+    path: str | Path, *, expected_epoch: int = 300
+) -> int:
+    """Require checkpoint metadata to identify the exact requested epoch."""
+    actual_epoch = checkpoint_epoch(Path(path))
+    if actual_epoch != expected_epoch:
+        raise ValueError(
+            f"Checkpoint {path} expected exact epoch {expected_epoch}, "
+            f"found {actual_epoch}"
+        )
+    return actual_epoch
+
+
+def _validate_promotion_checkpoint(
+    checkpoint: Path, entry: Mapping[str, Any]
+) -> int:
+    expected_epoch = int(entry.get("required_checkpoint_epoch", 300))
+    return validate_checkpoint_epoch(checkpoint, expected_epoch=expected_epoch)
 
 
 def _build_entries(
@@ -108,45 +152,207 @@ def _build_entries(
     settings: Mapping[str, Any],
     python: str,
     phase: str,
+    *,
+    evidence_id: str | None = None,
 ) -> list[Dict[str, Any]]:
+    effective_settings = settings
+    effective_phase = phase
+    if evidence_id is not None:
+        _stage_a_variant(plan, evidence_id)
+        effective_settings = _evidence_settings(settings, evidence_id)
+        effective_phase = _evidence_phase(phase, evidence_id)
     entries = [
-        _run_manifest_entry(plan, variant, settings, python, phase)
+        _run_manifest_entry(
+            plan, variant, effective_settings, python, effective_phase
+        )
         for variant in variants
     ]
+    for entry in entries:
+        entry["selected_evidence_id"] = evidence_id
     if phase == "promote":
-        return [_exact_final_checkpoint(entry) for entry in entries]
+        expected_epoch = int(settings["epochs"])
+        return [
+            _exact_final_checkpoint(entry, expected_epoch=expected_epoch)
+            for entry in entries
+        ]
     return entries
 
 
 def build_v5_dry_run_manifest(
-    plan: Mapping[str, Any], *, python: str
+    plan: Mapping[str, Any],
+    *,
+    python: str,
+    stage: str = "all",
+    selected_evidence_id: str | None = None,
 ) -> Dict[str, Any]:
     """Build a deterministic two-stage V5 manifest without prior results."""
+    if stage not in {"stage-a", "stage-b", "promote", "all"}:
+        raise ValueError(f"Unknown V5 stage {stage!r}")
     selected_evidence = str(
-        plan["stage_a"].get("dry_run_selected_evidence", "S3")
+        selected_evidence_id
+        or plan["stage_a"].get("dry_run_selected_evidence", "S3")
     )
     stage_b_variants = build_stage_b_variants(plan, selected_evidence)
     promotion_count = min(int(plan["stage_b"].get("top_k", 2)), 2)
+    reference_id = str(plan["stage_b"]["reference_id"])
+    eligible_promotion_variants = [
+        row for row in stage_b_variants if row["id"] != reference_id
+    ][:promotion_count]
     return {
         "selected_evidence_template": selected_evidence,
-        "stage_a_runs": _build_entries(
-            plan,
-            plan["stage_a"]["variants"],
-            plan["stage_a"],
-            python,
-            "stage_a",
+        "stage_a_runs": (
+            _build_entries(
+                plan,
+                plan["stage_a"]["variants"],
+                plan["stage_a"],
+                python,
+                "stage_a",
+            )
+            if stage in {"stage-a", "all"}
+            else []
         ),
-        "stage_b_runs": _build_entries(
-            plan, stage_b_variants, plan["stage_b"], python, "stage_b"
+        "stage_b_runs": (
+            _build_entries(
+                plan,
+                stage_b_variants,
+                plan["stage_b"],
+                python,
+                "stage_b",
+                evidence_id=selected_evidence,
+            )
+            if stage in {"stage-b", "all"}
+            else []
         ),
-        "promotion_runs": _build_entries(
-            plan,
-            stage_b_variants[:promotion_count],
-            plan["promote"],
-            python,
-            "promote",
+        "promotion_runs": (
+            _build_entries(
+                plan,
+                eligible_promotion_variants,
+                plan["promote"],
+                python,
+                "promote",
+                evidence_id=selected_evidence,
+            )
+            if stage in {"promote", "all"}
+            else []
         ),
     }
+
+
+def _select_eligible_stage_b_routes(
+    ranked: Sequence[Mapping[str, Any]],
+    *,
+    reference_id: str,
+    top_k: int,
+) -> list[str]:
+    """Filter the shared gate/score ranking to promotable V5 routes."""
+    limit = min(max(int(top_k), 0), 2)
+    return [
+        str(row["id"])
+        for row in ranked
+        if row["id"] != reference_id and bool(row["gate_passed"])
+    ][:limit]
+
+
+def _record_evidence_provenance(
+    decision_dir: Path, evidence_id: str
+) -> None:
+    decision_path = decision_dir / "promotion_decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    decision["selected_evidence_id"] = evidence_id
+    decision_path.write_text(
+        json.dumps(_json_safe(decision), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _run_v5_stage(
+    plan: Mapping[str, Any],
+    variants: Sequence[Mapping[str, Any]],
+    settings: Mapping[str, Any],
+    *,
+    phase: str,
+    python: str,
+    force: bool,
+    evidence_id: str | None = None,
+) -> tuple[list[str], list[Mapping[str, Any]]]:
+    effective_phase = phase
+    effective_settings = settings
+    if evidence_id is not None:
+        _stage_a_variant(plan, evidence_id)
+        effective_phase = _evidence_phase(phase, evidence_id)
+        effective_settings = _evidence_settings(settings, evidence_id)
+    promoted, ranked = _shared_run_stage(
+        plan,
+        variants,
+        effective_settings,
+        phase=effective_phase,
+        python=python,
+        force=force,
+    )
+    if phase == "stage_b":
+        reference_id = str(settings["reference_id"])
+        promoted = _select_eligible_stage_b_routes(
+            ranked,
+            reference_id=reference_id,
+            top_k=int(settings.get("top_k", 2)),
+        )
+        decision_dir = Path(str(plan["output_dir"])) / effective_phase
+        _write_rankings(decision_dir, promoted, ranked)
+        if evidence_id is None:
+            raise ValueError("Stage B requires a selected evidence identity")
+        _record_evidence_provenance(decision_dir, evidence_id)
+        print(f"stage_b eligible routes: {promoted or '(none)'}")
+    return promoted, ranked
+
+
+def _selected_evidence_from_decision(
+    plan: Mapping[str, Any], decision: Mapping[str, Any]
+) -> str | None:
+    promoted = list(decision.get("promoted", []))
+    if not promoted:
+        return None
+    selected_id = str(promoted[0])
+    selected = _stage_a_variant(plan, selected_id)
+    ranked_row = next(
+        (row for row in decision.get("ranked", []) if row.get("id") == selected_id),
+        None,
+    )
+    if ranked_row is None or ranked_row.get("preset") != selected.get("preset"):
+        raise ValueError(
+            f"Stage A decision provenance for {selected_id} does not match the plan"
+        )
+    return selected_id
+
+
+def _load_selected_evidence(
+    plan: Mapping[str, Any], output_dir: Path
+) -> str | None:
+    return _selected_evidence_from_decision(
+        plan, _load_decision(output_dir, "stage_a")
+    )
+
+
+def _load_stage_b_decision(
+    plan: Mapping[str, Any], output_dir: Path, evidence_id: str
+) -> Mapping[str, Any]:
+    phase = _evidence_phase("stage_b", evidence_id)
+    decision = _load_decision(output_dir, phase)
+    if decision.get("selected_evidence_id") != evidence_id:
+        raise ValueError(
+            "Stage B decision evidence provenance mismatch: "
+            f"expected {evidence_id}, found "
+            f"{decision.get('selected_evidence_id')!r}"
+        )
+    expected_preset = str(_stage_a_variant(plan, evidence_id)["preset"])
+    expected_experiment_token = _evidence_slug(evidence_id)
+    for row in decision.get("ranked", []):
+        if row.get("preset") != expected_preset or expected_experiment_token not in str(
+            row.get("experiment", "")
+        ):
+            raise ValueError(
+                f"Stage B decision mixes artifacts outside {expected_experiment_token}"
+            )
+    return decision
 
 
 def _write_promotion_outputs(
@@ -157,9 +363,13 @@ def _write_promotion_outputs(
     output_dir = Path(str(plan["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
     reference_id = str(plan["stage_b"]["reference_id"])
+    if any(str(row["id"]) == reference_id for row in promotion_records):
+        raise ValueError(f"Reference route {reference_id} cannot be promoted")
     reference = next(
         row for row in stage_b_decision["ranked"] if row["id"] == reference_id
     )
+    evidence_id_value = stage_b_decision.get("selected_evidence_id")
+    evidence_id = str(evidence_id_value) if evidence_id_value else None
 
     final_rows = []
     accepted = []
@@ -190,11 +400,19 @@ def _write_promotion_outputs(
         encoding="utf-8",
     )
 
+    promote_phase = (
+        _evidence_phase("promote", evidence_id) if evidence_id else "promote"
+    )
+    stage_b_phase = (
+        _evidence_phase("stage_b", evidence_id) if evidence_id else "stage_b"
+    )
     result_paths = {
-        str(row["id"]): output_dir / "promote" / f"{str(row['id']).lower()}.json"
+        str(row["id"]): output_dir / promote_phase / f"{str(row['id']).lower()}.json"
         for row in promotion_records
     }
-    stage_b_reference = output_dir / "stage_b" / f"{reference_id.lower()}.json"
+    stage_b_reference = (
+        output_dir / stage_b_phase / f"{reference_id.lower()}.json"
+    )
     if not stage_b_reference.is_file():
         raise FileNotFoundError(
             f"Stage B {reference_id} result is required for final paired "
@@ -235,7 +453,24 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dry_run:
-        manifest = build_v5_dry_run_manifest(plan, python=sys.executable)
+        selected_evidence_id = None
+        stage_a_decision = output_dir / "stage_a" / "promotion_decision.json"
+        if args.stage in {"stage-b", "promote"} and stage_a_decision.is_file():
+            selected_evidence_id = _load_selected_evidence(plan, output_dir)
+        if args.stage == "promote" and selected_evidence_id is not None:
+            stage_b_decision = (
+                output_dir
+                / _evidence_phase("stage_b", selected_evidence_id)
+                / "promotion_decision.json"
+            )
+            if stage_b_decision.is_file():
+                _load_stage_b_decision(plan, output_dir, selected_evidence_id)
+        manifest = build_v5_dry_run_manifest(
+            plan,
+            python=sys.executable,
+            stage=args.stage,
+            selected_evidence_id=selected_evidence_id,
+        )
         destination = output_dir / "dry_run_manifest.json"
         destination.write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -248,9 +483,9 @@ def main() -> None:
         return
 
     _require_planned_mean_checkpoint(plan)
-    selected_evidence: list[str]
+    selected_evidence: list[str] = []
     if args.stage in {"stage-a", "all"}:
-        selected_evidence, _ = _run_stage(
+        selected_evidence, _ = _run_v5_stage(
             plan,
             plan["stage_a"]["variants"],
             plan["stage_a"],
@@ -260,31 +495,31 @@ def main() -> None:
         )
         if args.stage == "stage-a":
             return
-    else:
-        selected_evidence = list(
-            _load_decision(output_dir, "stage_a").get("promoted", [])
-        )
-    if not selected_evidence:
+    selected_evidence_id = _load_selected_evidence(plan, output_dir)
+    if selected_evidence and selected_evidence_id != selected_evidence[0]:
+        raise ValueError("Fresh Stage A selection does not match its decision file")
+    if selected_evidence_id is None:
         print("No Stage A evidence candidate passed; Stage B and promotion stopped.")
         return
 
-    stage_b_variants = build_stage_b_variants(plan, selected_evidence[0])
+    stage_b_variants = build_stage_b_variants(plan, selected_evidence_id)
     promoted_routes: list[str]
     if args.stage in {"stage-b", "all"}:
-        promoted_routes, _ = _run_stage(
+        promoted_routes, _ = _run_v5_stage(
             plan,
             stage_b_variants,
             plan["stage_b"],
             phase="stage_b",
             python=sys.executable,
             force=args.force,
+            evidence_id=selected_evidence_id,
         )
         if args.stage == "stage-b":
             return
-    else:
-        promoted_routes = list(
-            _load_decision(output_dir, "stage_b").get("promoted", [])
-        )
+    stage_b_decision = _load_stage_b_decision(
+        plan, output_dir, selected_evidence_id
+    )
+    promoted_routes = list(stage_b_decision.get("promoted", []))
     if not promoted_routes:
         print("No Stage B route passed; 300-epoch promotion stopped.")
         return
@@ -300,11 +535,13 @@ def main() -> None:
             plan["promote"],
             sys.executable,
             "promote",
+            evidence_id=selected_evidence_id,
         ),
         force=args.force,
+        checkpoint_validator=_validate_promotion_checkpoint,
     )
     _write_promotion_outputs(
-        plan, promotion_records, _load_decision(output_dir, "stage_b")
+        plan, promotion_records, stage_b_decision
     )
 
 

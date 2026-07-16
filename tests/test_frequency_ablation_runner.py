@@ -708,6 +708,149 @@ def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
         assert "modules.residual_frequency.gabor_descriptor.enabled" not in c1_overrides
 
 
+def test_v5_evidence_identity_namespaces_stage_b_and_promotion_artifacts():
+    import yaml
+
+    from scripts.run_spectral_router_v5 import _build_entries, build_stage_b_variants
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    manifests = {}
+    for evidence_id in ("S1", "S3"):
+        variants = build_stage_b_variants(plan, evidence_id)
+        manifests[evidence_id] = {
+            "stage_b": _build_entries(
+                plan,
+                variants,
+                plan["stage_b"],
+                "python",
+                "stage_b",
+                evidence_id=evidence_id,
+            ),
+            "promote": _build_entries(
+                plan,
+                variants[:1],
+                plan["promote"],
+                "python",
+                "promote",
+                evidence_id=evidence_id,
+            ),
+        }
+
+    for phase in ("stage_b", "promote"):
+        s1 = manifests["S1"][phase][0]
+        s3 = manifests["S3"][phase][0]
+        assert s1["id"] == s3["id"] == "N0"
+        for key in ("experiment", "checkpoint", "resolved_config", "result"):
+            assert s1[key] != s3[key]
+            assert "evidence-s1" in s1[key]
+            assert "evidence-s3" in s3[key]
+    assert (
+        manifests["S1"]["promote"][0]["completion_checkpoint"]
+        != manifests["S3"]["promote"][0]["completion_checkpoint"]
+    )
+
+
+def test_v5_stage_b_promotion_excludes_best_scoring_t0_reference():
+    from scripts.run_spectral_router_v5 import _select_eligible_stage_b_routes
+
+    ranked = [
+        {"id": "T0", "score": 10.0, "gate_passed": True},
+        {"id": "C1", "score": 9.0, "gate_passed": True},
+        {"id": "N0", "score": 8.0, "gate_passed": True},
+        {"id": "C0", "score": 7.0, "gate_passed": True},
+    ]
+
+    promoted = _select_eligible_stage_b_routes(
+        ranked, reference_id="T0", top_k=2
+    )
+
+    assert promoted == ["C1", "N0"]
+    assert "T0" not in promoted
+    assert len(promoted) <= 2
+
+
+def test_v5_exact_epoch_validation_reads_checkpoint_metadata(tmp_path):
+    import torch
+
+    from scripts.run_spectral_router_v5 import validate_checkpoint_epoch
+
+    wrong = tmp_path / "ckpt_epoch0300.pt"
+    exact = tmp_path / "another" / "ckpt_epoch0300.pt"
+    exact.parent.mkdir()
+    torch.save({"epoch": 299, "model": {"weight": torch.ones(1)}}, wrong)
+    torch.save({"epoch": 300}, exact)
+
+    with pytest.raises(ValueError, match="expected exact epoch 300.*found 299"):
+        validate_checkpoint_epoch(wrong, expected_epoch=300)
+    assert validate_checkpoint_epoch(exact, expected_epoch=300) == 300
+
+
+def test_v5_exact_epoch_validation_happens_before_evaluation(tmp_path, monkeypatch):
+    import torch
+
+    import scripts.run_frequency_ablations as shared_runner
+    from scripts.run_spectral_router_v5 import _validate_promotion_checkpoint
+
+    checkpoint = tmp_path / "ckpt_epoch0300.pt"
+    result = tmp_path / "result.json"
+    torch.save({"epoch": 120}, checkpoint)
+    entry = {
+        "id": "C1",
+        "preset": "sr_v5_s3",
+        "experiment": "sr_v5_full_evidence-s3_c1",
+        "checkpoint": str(checkpoint),
+        "completion_checkpoint": str(checkpoint),
+        "required_checkpoint_epoch": 300,
+        "result": str(result),
+        "train_command": ["train"],
+        "eval_command": ["evaluate"],
+    }
+    executed = []
+    monkeypatch.setattr(shared_runner, "_execute", executed.append)
+
+    with pytest.raises(ValueError, match="expected exact epoch 300"):
+        shared_runner._run_entries(
+            [entry],
+            force=False,
+            checkpoint_validator=_validate_promotion_checkpoint,
+        )
+
+    assert executed == []
+    assert not result.exists()
+
+
+def test_v5_stage_b_decision_rejects_mixed_evidence_provenance(tmp_path):
+    import json
+    import yaml
+
+    from scripts.run_spectral_router_v5 import _load_stage_b_decision
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    plan["output_dir"] = str(tmp_path)
+    decision_dir = tmp_path / "stage_b" / "evidence-s1"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "promotion_decision.json").write_text(
+        json.dumps({
+            "selected_evidence_id": "S3",
+            "promoted": ["C1"],
+            "ranked": [],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        _load_stage_b_decision(plan, tmp_path, "S1")
+
+
 def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
     import yaml
 
@@ -761,6 +904,35 @@ def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
         assert "training.num_epochs=300" in train_text
         assert run["checkpoint"] == run["completion_checkpoint"]
         assert run["checkpoint"].endswith("ckpt_epoch0300.pt")
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_counts"),
+    [
+        ("stage-a", (4, 0, 0)),
+        ("stage-b", (0, 4, 0)),
+        ("promote", (0, 0, 2)),
+        ("all", (4, 4, 2)),
+    ],
+)
+def test_v5_dry_run_manifest_respects_requested_stage(stage, expected_counts):
+    import yaml
+
+    from scripts.run_spectral_router_v5 import build_v5_dry_run_manifest
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    manifest = build_v5_dry_run_manifest(plan, python="python", stage=stage)
+
+    assert (
+        len(manifest["stage_a_runs"]),
+        len(manifest["stage_b_runs"]),
+        len(manifest["promotion_runs"]),
+    ) == expected_counts
 
 
 def test_v5_final_comparison_requires_stage_b_t0_result(tmp_path):

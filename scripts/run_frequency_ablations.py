@@ -14,7 +14,7 @@ import math
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 
 import yaml
 
@@ -461,7 +461,12 @@ def checkpoint_epoch(path: Path) -> int:
     return epoch
 
 
-def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict[str, Any]]:
+def _run_entries(
+    entries: Iterable[Mapping[str, Any]],
+    force: bool,
+    checkpoint_validator: Callable[[Path, Mapping[str, Any]], int | None]
+    | None = None,
+) -> List[Dict[str, Any]]:
     records = []
     for entry in entries:
         checkpoint = Path(entry["checkpoint"])
@@ -487,6 +492,9 @@ def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict
                 "Training stopped before the required final checkpoint was written: "
                 f"{completion_checkpoint}"
             )
+        validated_epoch = None
+        if checkpoint_validator is not None:
+            validated_epoch = checkpoint_validator(checkpoint, entry)
         if force or not result.exists():
             _execute(entry["eval_command"])
         else:
@@ -497,7 +505,11 @@ def _run_entries(entries: Iterable[Mapping[str, Any]], force: bool) -> List[Dict
             "id": entry["id"],
             "preset": entry["preset"],
             "experiment": entry["experiment"],
-            "checkpoint_epoch": checkpoint_epoch(checkpoint),
+            "checkpoint_epoch": (
+                validated_epoch
+                if validated_epoch is not None
+                else checkpoint_epoch(checkpoint)
+            ),
             "metrics": metrics,
         })
     return records
