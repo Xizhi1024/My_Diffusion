@@ -73,6 +73,11 @@ def build_stage_b_variants(
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = False
         else:
+            # S0 disables both descriptors, but C1 is the complete V5 route;
+            # descriptor-bearing S1-S3 continue to inherit their evidence preset.
+            if selected_evidence_id == "S0":
+                overrides[DCT_ENABLED_KEY] = True
+                overrides[GABOR_ENABLED_KEY] = True
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = False
         variants.append({

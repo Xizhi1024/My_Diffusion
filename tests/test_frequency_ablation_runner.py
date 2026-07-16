@@ -665,6 +665,49 @@ def test_v5_stage_b_variants_inherit_evidence_and_keep_four_routes_distinct():
     ] is True
 
 
+def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
+    import yaml
+
+    from scripts.run_spectral_router_v5 import build_stage_b_variants
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    variants = build_stage_b_variants(plan, selected_evidence_id="S0")
+
+    assert [row["id"] for row in variants] == ["N0", "T0", "C0", "C1"]
+    routes = {row["id"]: row["overrides"] for row in variants}
+    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 4
+    assert all(
+        route["modules.residual_frequency.mode"] == "spectral_evidence_router"
+        for route in routes.values()
+    )
+    assert routes["C0"][
+        "modules.residual_frequency.dct_descriptor.enabled"
+    ] is False
+    assert routes["C0"][
+        "modules.residual_frequency.gabor_descriptor.enabled"
+    ] is False
+    assert routes["C1"][
+        "modules.residual_frequency.dct_descriptor.enabled"
+    ] is True
+    assert routes["C1"][
+        "modules.residual_frequency.gabor_descriptor.enabled"
+    ] is True
+
+    for selected_evidence_id in ("S1", "S2", "S3"):
+        inherited = build_stage_b_variants(
+            plan, selected_evidence_id=selected_evidence_id
+        )
+        c1_overrides = next(
+            row["overrides"] for row in inherited if row["id"] == "C1"
+        )
+        assert "modules.residual_frequency.dct_descriptor.enabled" not in c1_overrides
+        assert "modules.residual_frequency.gabor_descriptor.enabled" not in c1_overrides
+
+
 def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
     import yaml
 
