@@ -57,8 +57,18 @@ def _compute_pet_sample_metrics(
     pred: np.ndarray,
     target: np.ndarray,
     mask: np.ndarray,
+    topk_percent: float = 0.10,
+    min_k: int = 3,
+    max_k: int = 16,
 ) -> Optional[Dict[str, float]]:
     """Compute lesion metrics without zero-filled masked-array artefacts."""
+    if not 0.0 < topk_percent <= 1.0:
+        raise ValueError("topk_percent must be in (0, 1]")
+    if min_k < 1:
+        raise ValueError("min_k must be at least 1")
+    if max_k < min_k:
+        raise ValueError("max_k must be greater than or equal to min_k")
+
     valid = mask > 0.5
     if not np.any(valid):
         return None
@@ -69,6 +79,18 @@ def _compute_pet_sample_metrics(
     pred_in_peak = float(pred_unit[valid].max())
     target_in_peak = float(target_unit[valid].max())
     out_peak = float(pred_unit[outside].max()) if np.any(outside) else 0.0
+    lesion_size = int(valid.sum())
+    topq_k = min(
+        max(int(np.ceil(lesion_size * topk_percent)), min_k),
+        max_k,
+        lesion_size,
+    )
+    pred_values = pred_unit[valid]
+    target_values = target_unit[valid]
+    pred_topq = float(np.partition(pred_values, -topq_k)[-topq_k:].mean())
+    target_topq = float(np.partition(target_values, -topq_k)[-topq_k:].mean())
+    peak_bias = pred_in_peak - target_in_peak
+    topq_bias = pred_topq - target_topq
 
     ys, xs = np.nonzero(valid)
     peak_index = int(np.argmax(pred_unit[valid]))
@@ -77,6 +99,15 @@ def _compute_pet_sample_metrics(
 
     return {
         "lesion_peak_error_norm": abs(pred_in_peak - target_in_peak),
+        "lesion_peak_signed_bias_norm": peak_bias,
+        "lesion_topq_peak_pred_norm": pred_topq,
+        "lesion_topq_peak_target_norm": target_topq,
+        "lesion_topq_peak_signed_bias_norm": topq_bias,
+        "lesion_topq_peak_error_norm": abs(topq_bias),
+        "lesion_peak_overestimated": float(peak_bias > 0.0),
+        "lesion_peak_underestimated": float(peak_bias < 0.0),
+        "lesion_topq_k": float(topq_k),
+        "lesion_size": float(lesion_size),
         "lesion_centroid_distance": float(np.hypot(py - cy, px - cx)),
         "outside_inside_peak_ratio": out_peak / max(pred_in_peak, 1e-6),
         "failure": float(out_peak > pred_in_peak),
@@ -540,7 +571,8 @@ class Trainer:
 
         metrics: Dict[str, float] = {}
         mae_vals, ssim_vals, stripe_vals = [], [], []
-        peak_err_vals, centroid_vals, oir_vals, roi_l1_vals = [], [], [], []
+        peak_err_vals, topq_peak_err_vals = [], []
+        centroid_vals, oir_vals, roi_l1_vals = [], [], []
         failure_count = 0
         B = synth.shape[0]
         for i in range(B):
@@ -559,6 +591,9 @@ class Trainer:
                 lesion_metrics = _compute_pet_sample_metrics(p, t, mi)
                 if lesion_metrics is not None:
                     peak_err_vals.append(lesion_metrics["lesion_peak_error_norm"])
+                    topq_peak_err_vals.append(
+                        lesion_metrics["lesion_topq_peak_error_norm"]
+                    )
                     centroid_vals.append(lesion_metrics["lesion_centroid_distance"])
                     oir_vals.append(lesion_metrics["outside_inside_peak_ratio"])
                     roi_l1_vals.append(lesion_metrics["lesion_roi_l1"])
@@ -571,6 +606,7 @@ class Trainer:
         metrics["val/ssim"] = _mean(ssim_vals)
         metrics["val/stripe_score"] = _mean(stripe_vals)
         metrics["val/lesion_peak_error_norm"] = _mean(peak_err_vals)
+        metrics["val/lesion_topq_peak_error_norm"] = _mean(topq_peak_err_vals)
         metrics["val/lesion_centroid_distance"] = _mean(centroid_vals)
         metrics["val/outside_inside_peak_ratio"] = _mean(oir_vals)
         metrics["val/failure_rate"] = float(failure_count) / max(len(peak_err_vals), 1)
@@ -590,13 +626,15 @@ class Trainer:
             return v if v == v else 0.0  # NaN→0
 
         peak = _g("val/lesion_peak_error_norm")
+        topq = metrics.get("val/lesion_topq_peak_error_norm", peak)
+        topq = topq if topq == topq else peak
         centroid = _g("val/lesion_centroid_distance")
         fail = _g("val/failure_rate")
         mae = _g("val/mae")
         ssim = _g("val/ssim")
         stripe = _g("val/stripe_score")
 
-        lesion_score = -(peak + 0.02 * centroid + fail)
+        lesion_score = -(topq + 0.5 * peak + 0.02 * centroid + 0.5 * fail)
         image_score = ssim - mae - 0.1 * max(stripe - 1.0, 0.0)
         combined = (
             self.best_combined_alpha * lesion_score

@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from scipy.ndimage import correlate
+from scipy.ndimage import binary_dilation, binary_erosion, correlate
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -64,6 +64,127 @@ def compute_stripe_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, fl
         "stripe_score": float(pred_score),
         "target_stripe_score": float(target_score),
         "stripe_excess": float(pred_score - target_score),
+    }
+
+
+def _gradient_magnitude_np(image: np.ndarray) -> np.ndarray:
+    array = np.asarray(image, dtype=np.float32).squeeze()
+    dx = np.zeros_like(array)
+    dy = np.zeros_like(array)
+    dx[:, :-1] = array[:, 1:] - array[:, :-1]
+    dy[:-1, :] = array[1:, :] - array[:-1, :]
+    return np.sqrt(dx * dx + dy * dy)
+
+
+def _boundary_ring_np(mask: np.ndarray, radius: int) -> np.ndarray:
+    binary = np.asarray(mask).squeeze() > 0.5
+    structure = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+    return binary_dilation(binary, structure=structure) & ~binary_erosion(
+        binary, structure=structure
+    )
+
+
+def _weighted_mean_np(values: np.ndarray, weight: np.ndarray) -> float:
+    denominator = float(np.asarray(weight, dtype=np.float64).sum())
+    if denominator <= 1e-12:
+        return float("nan")
+    return float((np.asarray(values, dtype=np.float64) * weight).sum() / denominator)
+
+
+def _normalized_edge_np(image: np.ndarray) -> np.ndarray:
+    edge = _gradient_magnitude_np(image)
+    maximum = float(edge.max())
+    return edge / maximum if maximum > 1e-8 else np.zeros_like(edge)
+
+
+def _gabor_orientation_spectrum(
+    image: np.ndarray,
+    orientations: int = 8,
+    kernel_size: int = 9,
+) -> np.ndarray:
+    """Fixed quadrature-Gabor energy spectrum, independent of model weights."""
+    array = np.asarray(image, dtype=np.float64).squeeze()
+    coords = np.arange(kernel_size, dtype=np.float64) - kernel_size // 2
+    yy, xx = np.meshgrid(coords, coords, indexing="ij")
+    sigma = kernel_size / 4.0
+    frequency = 0.2
+    energies = []
+    for index in range(orientations):
+        theta = index * np.pi / orientations
+        x_theta = xx * np.cos(theta) + yy * np.sin(theta)
+        y_theta = -xx * np.sin(theta) + yy * np.cos(theta)
+        envelope = np.exp(-(x_theta ** 2 + y_theta ** 2) / (2.0 * sigma ** 2))
+        phase = 2.0 * np.pi * frequency * x_theta
+        real = envelope * np.cos(phase)
+        imag = envelope * np.sin(phase)
+        real -= real.mean()
+        imag -= imag.mean()
+        real /= max(float(np.linalg.norm(real)), 1e-8)
+        imag /= max(float(np.linalg.norm(imag)), 1e-8)
+        response_real = correlate(array, real, mode="reflect")
+        response_imag = correlate(array, imag, mode="reflect")
+        energies.append(float(np.sqrt(response_real ** 2 + response_imag ** 2).mean()))
+    spectrum = np.asarray(energies, dtype=np.float64)
+    total = float(spectrum.sum())
+    return spectrum / total if total > 1e-12 else np.zeros_like(spectrum)
+
+
+def compute_directional_spectrum_error(
+    pred: np.ndarray,
+    target: np.ndarray,
+    orientations: int = 8,
+) -> float:
+    """Compare phase-insensitive direction spectra instead of enforcing isotropy."""
+    pred_spectrum = _gabor_orientation_spectrum(pred, orientations=orientations)
+    target_spectrum = _gabor_orientation_spectrum(target, orientations=orientations)
+    return float(np.abs(pred_spectrum - target_spectrum).mean())
+
+
+def compute_boundary_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    ct: np.ndarray,
+    lesion_mask: np.ndarray,
+    organ_mask: np.ndarray,
+    boundary_radius: int = 2,
+) -> Dict[str, float]:
+    """Normalized-space lesion, anatomy-consensus, and optional organ metrics."""
+    pred_2d = np.asarray(pred, dtype=np.float32).squeeze()
+    target_2d = np.asarray(target, dtype=np.float32).squeeze()
+    absolute = np.abs(pred_2d - target_2d)
+    gradient_error = np.abs(
+        _gradient_magnitude_np(pred_2d) - _gradient_magnitude_np(target_2d)
+    )
+
+    lesion = np.asarray(lesion_mask).squeeze() > 0.5
+    if lesion.any():
+        lesion_ring = _boundary_ring_np(lesion, boundary_radius)
+        lesion_intensity = _weighted_mean_np(absolute, lesion_ring)
+        lesion_gradient = _weighted_mean_np(gradient_error, lesion_ring)
+    else:
+        lesion_intensity = float("nan")
+        lesion_gradient = float("nan")
+
+    anatomy_consensus = _normalized_edge_np(ct) * _normalized_edge_np(target)
+    anatomy_gradient = _weighted_mean_np(gradient_error, anatomy_consensus)
+
+    organs = np.asarray(organ_mask)
+    organ_ring = np.zeros_like(pred_2d, dtype=bool)
+    if organs.ndim == 2:
+        organs = organs[None]
+    for channel in organs:
+        if np.any(channel > 0.5):
+            organ_ring |= _boundary_ring_np(channel, boundary_radius)
+    organ_gradient = _weighted_mean_np(gradient_error, organ_ring)
+
+    return {
+        "lesion_boundary_intensity_mae_norm": lesion_intensity,
+        "lesion_boundary_gradient_mae_norm": lesion_gradient,
+        "anatomy_edge_gradient_mae_norm": anatomy_gradient,
+        "organ_boundary_gradient_mae_norm": organ_gradient,
+        "directional_spectrum_error_norm": compute_directional_spectrum_error(
+            pred, target
+        ),
     }
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -382,6 +503,9 @@ def compute_normalized_lesion_metrics(
     target: np.ndarray,       # [1, H, W] in [-1, 1]
     lesion_mask: np.ndarray,  # [1, H, W] binary
     organ_mask: np.ndarray,   # [C, H, W] one-hot (may be all-zero for PNG)
+    topk_percent: float = 0.10,
+    min_k: int = 3,
+    max_k: int = 16,
 ) -> Dict[str, float]:
     """Lesion intensity metrics in normalised [-1, 1] space.
 
@@ -392,11 +516,38 @@ def compute_normalized_lesion_metrics(
     Never convert these values back to pseudo-SUV — that would fabricate
     physical units the PNG export does not have.
     """
+    if not 0.0 < topk_percent <= 1.0:
+        raise ValueError("topk_percent must be in (0, 1]")
+    if min_k < 1:
+        raise ValueError("min_k must be at least 1")
+    if max_k < min_k:
+        raise ValueError("max_k must be greater than or equal to min_k")
+
     nan_metrics = {
         "lesion_peak_error_norm": float("nan"),
+        "lesion_peak_signed_bias_norm": float("nan"),
+        "lesion_topq_peak_pred_norm": float("nan"),
+        "lesion_topq_peak_target_norm": float("nan"),
+        "lesion_topq_peak_signed_bias_norm": float("nan"),
+        "lesion_topq_peak_error_norm": float("nan"),
+        "lesion_peak_overestimated": float("nan"),
+        "lesion_peak_underestimated": float("nan"),
+        "lesion_topq_k": float("nan"),
+        "lesion_size": float("nan"),
         "lesion_mean_error_norm": float("nan"),
         "lesion_to_background_ratio_norm": float("nan"),
         "lesion_centroid_distance": float("nan"),
+        "lesion_core_fallback": float("nan"),
+        "lesion_peak_to_boundary_distance": float("nan"),
+        "lesion_core_topq_pred_norm": float("nan"),
+        "lesion_core_topq_target_norm": float("nan"),
+        "lesion_core_topq_error_norm": float("nan"),
+        "lesion_ring_topq_pred_norm": float("nan"),
+        "lesion_ring_topq_target_norm": float("nan"),
+        "lesion_ring_topq_error_norm": float("nan"),
+        "lesion_ring_core_ratio_pred": float("nan"),
+        "lesion_ring_core_ratio_target": float("nan"),
+        "lesion_ring_core_ratio_error": float("nan"),
     }
     lesion = lesion_mask > 0.5
     if not lesion.any():
@@ -417,14 +568,70 @@ def compute_normalized_lesion_metrics(
     pred_tbr = pred_mean / max(pred_bg, 1e-6)
     target_tbr = target_mean / max(target_bg, 1e-6)
 
-    peak_metrics = _compute_pet_sample_metrics(pred[0], target[0], lesion_mask[0])
+    peak_metrics = _compute_pet_sample_metrics(
+        pred[0],
+        target[0],
+        lesion_mask[0],
+        topk_percent=topk_percent,
+        min_k=min_k,
+        max_k=max_k,
+    )
     assert peak_metrics is not None
 
+    lesion_2d = lesion[0]
+    structure = np.ones((3, 3), dtype=bool)
+    core = binary_erosion(lesion_2d, structure=structure)
+    core_fallback = not bool(core.any())
+    if core_fallback:
+        core = lesion_2d.copy()
+    ring = binary_dilation(
+        lesion_2d, structure=np.ones((5, 5), dtype=bool)
+    ) & ~core
+
+    def _topq_mean(image: np.ndarray, region: np.ndarray) -> float:
+        values = image[0][region]
+        if values.size == 0:
+            return float("nan")
+        k = min(
+            max(int(np.ceil(values.size * topk_percent)), min_k),
+            max_k,
+            values.size,
+        )
+        return float(np.partition(values, -k)[-k:].mean())
+
+    core_pred = _topq_mean(pred_unit, core)
+    core_target = _topq_mean(target_unit, core)
+    ring_pred = _topq_mean(pred_unit, ring)
+    ring_target = _topq_mean(target_unit, ring)
+
+    boundary = lesion_2d & ~binary_erosion(lesion_2d, structure=structure)
+    lesion_yx = np.argwhere(lesion_2d)
+    peak_local_index = int(np.argmax(pred_unit[0][lesion_2d]))
+    peak_yx = lesion_yx[peak_local_index]
+    boundary_yx = np.argwhere(boundary)
+    peak_to_boundary = float(
+        np.sqrt(((boundary_yx - peak_yx) ** 2).sum(axis=1)).min()
+    )
+
+    eps = 1e-6
+    ring_core_pred = ring_pred / max(core_pred, eps)
+    ring_core_target = ring_target / max(core_target, eps)
+
     return {
-        "lesion_peak_error_norm": peak_metrics["lesion_peak_error_norm"],
+        **peak_metrics,
         "lesion_mean_error_norm": float(abs(pred_mean - target_mean)),
         "lesion_to_background_ratio_norm": float(abs(pred_tbr - target_tbr)),
-        "lesion_centroid_distance": peak_metrics["lesion_centroid_distance"],
+        "lesion_core_fallback": float(core_fallback),
+        "lesion_peak_to_boundary_distance": peak_to_boundary,
+        "lesion_core_topq_pred_norm": core_pred,
+        "lesion_core_topq_target_norm": core_target,
+        "lesion_core_topq_error_norm": abs(core_pred - core_target),
+        "lesion_ring_topq_pred_norm": ring_pred,
+        "lesion_ring_topq_target_norm": ring_target,
+        "lesion_ring_topq_error_norm": abs(ring_pred - ring_target),
+        "lesion_ring_core_ratio_pred": ring_core_pred,
+        "lesion_ring_core_ratio_target": ring_core_target,
+        "lesion_ring_core_ratio_error": abs(ring_core_pred - ring_core_target),
     }
 
 
@@ -560,6 +767,7 @@ def evaluate(
         for i in range(B):
             pred_np = _to_numpy(synth_pet[i])
             target_np = _to_numpy(target_pet[i])
+            ct_np = _to_numpy(ct[i])
             mask_np = _to_numpy(mask[i])
             organ_np = _to_numpy(organ_mask[i])
             meta = meta_samples[i] if i < len(meta_samples) else {}
@@ -578,6 +786,15 @@ def evaluate(
                 "suv_valid": float(has_valid_suv),
             }
             sample_metrics.update(compute_stripe_metrics(pred_np, target_np))
+            sample_metrics.update(
+                compute_boundary_metrics(
+                    pred_np,
+                    target_np,
+                    ct_np,
+                    mask_np,
+                    organ_np,
+                )
+            )
 
             # Normalized-intensity lesion metrics: always emitted when a lesion
             # mask exists.  These are the PNG-baseline lesion-fidelity metrics
@@ -706,6 +923,11 @@ def print_report(summary: Dict[str, Any]) -> None:
                                "failure_outside_peak_gt_inside", "failure_lesion_too_cold",
                                "failure_high_uncertainty", "failure_any"]),
         ("Directional Artifacts", ["stripe_score", "target_stripe_score", "stripe_excess"]),
+        ("Boundary Fidelity", ["lesion_boundary_intensity_mae_norm",
+                               "lesion_boundary_gradient_mae_norm",
+                               "anatomy_edge_gradient_mae_norm",
+                               "organ_boundary_gradient_mae_norm",
+                               "directional_spectrum_error_norm"]),
         ("False Hotspots", ["false_hotspot_count", "false_hotspot_density", "false_hotspot_mean_intensity"]),
     ]
 

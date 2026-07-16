@@ -40,6 +40,43 @@ def test_signed_pet_metrics_skip_empty_mask():
     assert _compute_pet_sample_metrics(pred, target, mask) is None
 
 
+def test_trainer_pet_metrics_include_robust_topq_peak():
+    pred = np.zeros((4, 4), dtype=np.float32)
+    target = np.zeros((4, 4), dtype=np.float32)
+    mask = np.ones((4, 4), dtype=np.float32)
+    pred.flat[-3:] = [0.6, 0.8, 1.0]
+    target.flat[-3:] = [0.4, 0.6, 0.8]
+
+    metrics = _compute_pet_sample_metrics(pred, target, mask)
+
+    assert metrics is not None
+    assert metrics["lesion_topq_peak_error_norm"] == pytest.approx(0.1)
+
+
+def test_checkpoint_selection_penalizes_worse_topq_peak_error():
+    trainer = object.__new__(Trainer)
+    trainer.best_combined_alpha = 0.5
+    trainer.best_stripe_penalty = 0.3
+    common = {
+        "val/mae": 0.05,
+        "val/ssim": 0.95,
+        "val/stripe_score": 1.0,
+        "val/lesion_peak_error_norm": 0.05,
+        "val/lesion_centroid_distance": 2.0,
+        "val/failure_rate": 0.0,
+    }
+
+    good = trainer._model_selection_scores(
+        {**common, "val/lesion_topq_peak_error_norm": 0.02}
+    )
+    bad = trainer._model_selection_scores(
+        {**common, "val/lesion_topq_peak_error_norm": 0.20}
+    )
+
+    assert good[0] > bad[0]
+    assert good[2] > bad[2]
+
+
 def test_stratified_indices_are_deterministic_unique_and_cover_endpoints():
     indices = _stratified_indices(total=30, count=16)
 
