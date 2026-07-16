@@ -557,6 +557,18 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
     assert torch.isfinite(loss)
 
 
+def test_v5_split_manifest_resolves_from_repo_root():
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "configs/experiments/slmf_png_spectral_router_v5.yaml"
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    split_manifest = repo_root / cfg["data"]["split_manifest"]
+
+    assert split_manifest.is_file()
+
+
 def test_paired_report_is_deterministic_and_handles_small_intersections(tmp_path):
     import json
 
