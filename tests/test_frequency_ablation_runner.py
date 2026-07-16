@@ -553,8 +553,9 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
         "mask": torch.zeros(1, 1, 32, 32),
     }
     batch["mask"][:, :, 14:18, 14:18] = 1
-    loss, _ = model(batch, timesteps=torch.tensor([250]))
+    loss, logs = model(batch, timesteps=torch.tensor([250]))
     assert torch.isfinite(loss)
+    assert logs["loss/frequency_gate_tv/available"].item() == 1
 
 
 def test_v5_split_manifest_resolves_from_repo_root():

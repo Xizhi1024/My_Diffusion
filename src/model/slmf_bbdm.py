@@ -976,6 +976,7 @@ class SLMFBBDM(nn.Module):
                 gabor_anisotropy=condition.maps.get("gabor_anisotropy"),
             )
             self._last_frequency_diagnostics = diagnostics
+            condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]
             condition.scalars["spectral_route_temporal_smoothness"] = diagnostics[
                 "route_temporal_smoothness"
             ]
