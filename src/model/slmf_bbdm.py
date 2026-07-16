@@ -614,6 +614,17 @@ class SLMFBBDM(nn.Module):
                 active_tau_max=cfg.get("active_tau_max", 0.25),
                 enabled=enabled, weight=weight,
             )
+        elif name == "normalized_lesion_peak":
+            from .loss_terms.normalized_lesion_peak import NormalizedLesionPeakLoss
+            return NormalizedLesionPeakLoss(
+                topk_percent=cfg.get("topk_percent", 0.10),
+                min_k=cfg.get("min_k", 3),
+                max_k=cfg.get("max_k", 16),
+                beta=cfg.get("beta", 0.02),
+                active_tau_max=cfg.get("active_tau_max", 0.25),
+                enabled=enabled,
+                weight=weight,
+            )
         elif name == "focal_frequency":
             from .loss_terms.frequency import FocalFrequencyLoss
             return FocalFrequencyLoss(
