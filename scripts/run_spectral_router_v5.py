@@ -257,18 +257,30 @@ def build_v5_dry_run_manifest(
     }
 
 
+# Variants that are diagnostics-only and must never be promoted to 300-epoch training.
+_NON_PROMOTABLE_IDS: frozenset[str] = frozenset({"N0", "T_legacy"})
+
+
 def _select_eligible_stage_b_routes(
     ranked: Sequence[Mapping[str, Any]],
     *,
     reference_id: str,
     top_k: int,
 ) -> list[str]:
-    """Filter the shared gate/score ranking to promotable V5 routes."""
+    """Filter the shared gate/score ranking to promotable V5 routes.
+
+    Excludes the reference architecture, diagnostic-only variants (N0, T_legacy),
+    and any variant that failed its hard gates.
+    """
     limit = min(max(int(top_k), 0), 4)
     return [
         str(row["id"])
         for row in ranked
-        if row["id"] != reference_id and bool(row["gate_passed"])
+        if (
+            row["id"] != reference_id
+            and str(row["id"]) not in _NON_PROMOTABLE_IDS
+            and bool(row["gate_passed"])
+        )
     ][:limit]
 
 

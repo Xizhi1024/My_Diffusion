@@ -1337,23 +1337,25 @@ def test_v5_t0_c1_rescue_entries_are_matched_exact_300_epoch_runs():
     )
     entries = build_rescue_entries(plan, python="python")
 
-    assert [entry["id"] for entry in entries] == ["T0", "C1"]
+    # Legacy rescue uses T_legacy (the old cross_level_enabled=false)
+    # and C1 (the learned 3-way route) for backward diagnostic compatibility.
+    assert [entry["id"] for entry in entries] == ["T_legacy", "C1"]
     assert all(entry["selected_evidence_id"] == "S3" for entry in entries)
     assert all(entry["required_checkpoint_epoch"] == 300 for entry in entries)
     assert all(
         entry["checkpoint"].endswith("ckpt_epoch0300.pt") for entry in entries
     )
-    assert entries[0]["experiment"] == "sr_v5_full_evidence-s3_t0"
+    assert entries[0]["experiment"] == "sr_v5_full_evidence-s3_t_legacy"
     assert entries[1]["experiment"] == "sr_v5_full_evidence-s3_c1"
 
-    t0_command = " ".join(entries[0]["train_command"])
+    tlegacy_command = " ".join(entries[0]["train_command"])
     c1_command = " ".join(entries[1]["train_command"])
-    for command in (t0_command, c1_command):
+    for command in (tlegacy_command, c1_command):
         assert "training.num_epochs=300" in command
         assert "training.resume_from=null" in command
         assert "training.init_from=null" in command
         assert "model.initialization_seed=4242" in command
-    assert "cross_level_router.enabled=false" in t0_command
+    assert "cross_level_router.enabled=false" in tlegacy_command
     assert "cross_level_router.enabled=true" in c1_command
 
 
@@ -1376,6 +1378,6 @@ def test_v5_t0_c1_script_executes_as_a_direct_dry_run():
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    assert "sr_v5_full_evidence-s3_t0" in completed.stdout
+    assert "sr_v5_full_evidence-s3_t_legacy" in completed.stdout
     assert "sr_v5_full_evidence-s3_c1" in completed.stdout
     assert "ckpt_epoch0300.pt" in completed.stdout

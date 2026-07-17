@@ -39,7 +39,7 @@ DEFAULT_PLAN = Path(
     "configs/experiments/spectral_router_ablation_plan_v5.yaml"
 )
 DEFAULT_EVIDENCE_ID = "S3"
-RESCUE_ROUTE_IDS = ("T0", "C1")
+RESCUE_ROUTE_IDS = ("T_legacy", "C1")  # preserved for backward diagnostic compatibility
 
 
 def load_plan(path: Path) -> dict[str, Any]:

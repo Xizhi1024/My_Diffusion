@@ -87,6 +87,41 @@ class ConservativeRouteHead(nn.Module):
         return F.softmax(self.final(self.features(evidence)), dim=-1)
 
 
+class NoNullRouteHead(nn.Module):
+    """Two-way softmax router without a null sink (native / shallow only)."""
+
+    def __init__(
+        self,
+        input_features: int,
+        hidden_channels: int,
+        initial_native_probability: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if not 0.0 < initial_native_probability < 1.0:
+            raise ValueError("initial_native_probability must be between 0 and 1")
+
+        self.features = nn.Sequential(
+            nn.Linear(input_features, hidden_channels),
+            nn.SiLU(),
+        )
+        self.final = nn.Linear(hidden_channels, 2)
+
+        prior = torch.tensor(
+            [
+                initial_native_probability,
+                1.0 - initial_native_probability,
+            ],
+            dtype=self.final.bias.dtype,
+            device=self.final.bias.device,
+        )
+        with torch.no_grad():
+            self.final.weight.zero_()
+            self.final.bias.copy_(prior.log())
+
+    def forward(self, evidence: torch.Tensor) -> torch.Tensor:
+        return F.softmax(self.final(self.features(evidence)), dim=-1)
+
+
 class BiasFreeZeroProjection(nn.Module):
     """Zero-initialized projection that stays strictly zero for zero input.
 
@@ -214,6 +249,17 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
             for _ in range(2)
         )
+        self.no_null_route_heads = nn.ModuleList(
+            NoNullRouteHead(
+                self.evidence_features,
+                hidden_channels,
+                initial_native_probability=self.fixed_prior[0]
+                / (self.fixed_prior[0] + self.fixed_prior[1])
+                if (self.fixed_prior[0] + self.fixed_prior[1]) > 0
+                else 0.5,
+            )
+            for _ in range(2)
+        )
 
         # Replace base-class _ZeroProjection heads with bias-free variants.
         # The base class stores them as self.projection_heads[0..2]; we rebuild.
@@ -281,7 +327,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         batch = evidence.shape[0]
         device = evidence.device
 
-        if policy in ("native_only", "fixed_prior", "learned_no_null"):
+        if policy in ("native_only", "fixed_prior"):
             # Fixed routes: expand batch and band dimensions
             fixed = (
                 self._fixed_routes_l2
@@ -300,7 +346,24 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             routes = vec.view(1, 1, 3).expand(batch, 3, 3)
             return routes, reference.new_zeros(())
 
-        # Learned policy: compute from evidence
+        if policy == "learned_no_null":
+            # Two-way learnable router: native vs shallow, no null sink
+            routes = self.no_null_route_heads[level_index](evidence)
+            next_timestep = (timestep + 1).clamp_max(
+                int(schedule.num_train_timesteps) - 1
+            )
+            next_evidence = evidence.clone()
+            next_evidence[:, :, self.timestep_feature_index], next_evidence[
+                :, :, self.log_snr_feature_index
+            ] = self._expanded_next_time_features(
+                next_timestep, schedule, level_index, reference
+            )
+            temporal_smoothness = (
+                routes - self.no_null_route_heads[level_index](next_evidence)
+            ).abs().mean()
+            return routes, temporal_smoothness
+
+        # Learned 3-way policy: compute from evidence
         routes = self.route_heads[level_index](evidence)
         next_timestep = (timestep + 1).clamp_max(
             int(schedule.num_train_timesteps) - 1
@@ -589,36 +652,43 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         routes_l1: torch.Tensor,
         reference: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """Compute monitoring statistics for route distributions."""
-        all_routes = torch.cat([routes_l2.flatten(0, 1), routes_l1.flatten(0, 1)], dim=0)
-        null_prob = all_routes[..., -1] if self._num_routes == 3 else torch.zeros_like(all_routes[..., 0])
-        native_prob = all_routes[..., 0]
-        shallow_prob = all_routes[..., 1] if all_routes.shape[-1] >= 2 else torch.zeros_like(native_prob)
+        """Compute per-level monitoring statistics for route distributions.
 
-        # Null statistics (only meaningful for 3-way)
-        sorted_null = null_prob.sort().values
-        n = sorted_null.numel()
-        p10 = sorted_null[int(0.10 * (n - 1))] if n > 0 else reference.new_zeros(())
-        p50 = sorted_null[int(0.50 * (n - 1))] if n > 0 else reference.new_zeros(())
-        p90 = sorted_null[int(0.90 * (n - 1))] if n > 0 else reference.new_zeros(())
-        null_mean = null_prob.mean()
-
-        # Entropy
+        Returns diagnostics keyed by level so collapse in one layer
+        (e.g. L1 null→100%) is visible independently of the other.
+        """
         eps = 1e-8
-        entropy = -(all_routes * (all_routes + eps).log()).sum(dim=-1).mean()
+        result: Dict[str, torch.Tensor] = {}
+        for level, routes in ((2, routes_l2), (1, routes_l1)):
+            flat = routes.flatten(0, 1)  # [B*3, ...]
+            prefix = f"route_l{level}"
 
-        # Active mass: P(native) + P(shallow) = 1 - P(null)
-        active_mass = (native_prob + shallow_prob).mean()
+            null_prob = flat[..., -1] if self._num_routes == 3 else torch.zeros_like(flat[..., 0])
+            native_prob = flat[..., 0]
+            shallow_prob = flat[..., 1] if flat.shape[-1] >= 2 else torch.zeros_like(native_prob)
+            active_mass = (native_prob + shallow_prob).mean()
 
-        return {
-            "route_null_mean": null_mean,
-            "route_null_p10": p10,
-            "route_null_p50": p50,
-            "route_null_p90": p90,
-            "route_entropy": entropy,
-            "route_active_mass": active_mass,
-            "route_policy": self._effective_policy,
-        }
+            # Entropy
+            entropy = -(flat * (flat + eps).log()).sum(dim=-1).mean()
+
+            result[f"{prefix}_active_mass"] = active_mass
+            result[f"{prefix}_entropy"] = entropy
+
+            if self._num_routes == 3:
+                sorted_null = null_prob.sort().values
+                n = sorted_null.numel()
+                result[f"{prefix}_null_mean"] = null_prob.mean()
+                result[f"{prefix}_null_p10"] = (
+                    sorted_null[int(0.10 * (n - 1))] if n > 0 else reference.new_zeros(())
+                )
+                result[f"{prefix}_null_p50"] = (
+                    sorted_null[int(0.50 * (n - 1))] if n > 0 else reference.new_zeros(())
+                )
+                result[f"{prefix}_null_p90"] = (
+                    sorted_null[int(0.90 * (n - 1))] if n > 0 else reference.new_zeros(())
+                )
+
+        return result
 
     def forward(
         self,
@@ -731,12 +801,13 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             self.reconstruct_l0(_split_details(shallow_l1))
         )
 
-        # Injection norms for monitoring
+        # Injection RMS per level — scale-invariant per-element energy
+        # so L0/L1/L2 are comparable despite different resolutions and channels.
         injections = [l3, l2, l1, l0]
-        injection_norms = {
-            f"injection/l{idx}_norm": inj.norm(dim=tuple(range(1, inj.dim()))).mean().detach()
-            for idx, inj in enumerate(injections)
-        }
+        injection_norms = {}
+        for idx, inj in enumerate(injections):
+            rms = inj.float().square().flatten(1).mean(dim=1).sqrt().mean().detach()
+            injection_norms[f"injection/l{idx}_rms"] = rms
 
         diagnostics.update(
             {
