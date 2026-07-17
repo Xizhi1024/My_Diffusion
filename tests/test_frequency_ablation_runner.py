@@ -1323,3 +1323,59 @@ def test_every_frequency_preset_completes_a_real_model_forward(preset):
         sampled = model.sample(batch, num_steps=2)["synthetic_pet"]
         assert sampled.shape == batch["pet"].shape
         assert torch.isfinite(sampled).all()
+
+
+def test_v5_t0_c1_rescue_entries_are_matched_exact_300_epoch_runs():
+    import yaml
+
+    from scripts.run_v5_t0_c1_300 import build_rescue_entries
+
+    plan = yaml.safe_load(
+        Path(
+            "configs/experiments/spectral_router_ablation_plan_v5.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    entries = build_rescue_entries(plan, python="python")
+
+    assert [entry["id"] for entry in entries] == ["T0", "C1"]
+    assert all(entry["selected_evidence_id"] == "S3" for entry in entries)
+    assert all(entry["required_checkpoint_epoch"] == 300 for entry in entries)
+    assert all(
+        entry["checkpoint"].endswith("ckpt_epoch0300.pt") for entry in entries
+    )
+    assert entries[0]["experiment"] == "sr_v5_full_evidence-s3_t0"
+    assert entries[1]["experiment"] == "sr_v5_full_evidence-s3_c1"
+
+    t0_command = " ".join(entries[0]["train_command"])
+    c1_command = " ".join(entries[1]["train_command"])
+    for command in (t0_command, c1_command):
+        assert "training.num_epochs=300" in command
+        assert "training.resume_from=null" in command
+        assert "training.init_from=null" in command
+        assert "model.initialization_seed=4242" in command
+    assert "cross_level_router.enabled=false" in t0_command
+    assert "cross_level_router.enabled=true" in c1_command
+
+
+def test_v5_t0_c1_one_click_pixi_tasks_are_declared():
+    pixi = Path("pixi.toml").read_text(encoding="utf-8")
+    assert 'train-spectral-router-v5-t0-c1 = "python scripts/run_v5_t0_c1_300.py"' in pixi
+    assert (
+        'dry-run-spectral-router-v5-t0-c1 = "python scripts/run_v5_t0_c1_300.py --dry-run"'
+        in pixi
+    )
+
+
+def test_v5_t0_c1_script_executes_as_a_direct_dry_run():
+    import subprocess
+
+    completed = subprocess.run(
+        [sys.executable, "scripts/run_v5_t0_c1_300.py", "--dry-run"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "sr_v5_full_evidence-s3_t0" in completed.stdout
+    assert "sr_v5_full_evidence-s3_c1" in completed.stdout
+    assert "ckpt_epoch0300.pt" in completed.stdout
