@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -653,7 +654,10 @@ def test_v5_stage_b_variants_inherit_evidence_and_keep_six_routes_distinct():
     assert {row["preset"] for row in variants} == {"sr_v5_s3"}
     assert {row["inherited_evidence"] for row in variants} == {"S3"}
     routes = {row["id"]: row["overrides"] for row in variants}
-    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 6
+    assert len({
+        json.dumps(route, sort_keys=True)
+        for route in routes.values()
+    }) == 6
     assert all(
         route["modules.residual_frequency.mode"] == "spectral_evidence_router"
         for route in routes.values()
@@ -699,7 +703,10 @@ def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
         "N0", "T_legacy", "T_native", "T_fixed", "C1", "C_no_null",
     ]
     routes = {row["id"]: row["overrides"] for row in variants}
-    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 6
+    assert len({
+        json.dumps(route, sort_keys=True)
+        for route in routes.values()
+    }) == 6
     assert all(
         route["modules.residual_frequency.mode"] == "spectral_evidence_router"
         for route in routes.values()
