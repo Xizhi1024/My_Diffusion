@@ -1363,19 +1363,27 @@ class SLMFBBDM(nn.Module):
                         logs[f"frequency/gate_l{level}_{band}"] = (
                             gates[:, index].mean().detach()
                         )
-            # Enhanced router diagnostics
-            for rkey in (
-                "route_null_mean", "route_null_p10", "route_null_p50",
-                "route_null_p90", "route_entropy", "route_active_mass",
-            ):
-                val = self._last_frequency_diagnostics.get(rkey)
-                if val is not None:
-                    logs[f"frequency/{rkey}"] = val.detach() if isinstance(val, torch.Tensor) else val
-            # Injection norms
+            # Per-level route diagnostics (entropy, active_mass, null quantiles)
+            for level in (2, 1):
+                for suffix in (
+                    "active_mass",
+                    "entropy",
+                    "null_mean",
+                    "null_p10",
+                    "null_p50",
+                    "null_p90",
+                ):
+                    key = f"route_l{level}_{suffix}"
+                    val = self._last_frequency_diagnostics.get(key)
+                    if val is not None:
+                        logs[f"frequency/{key}"] = (
+                            val.detach() if isinstance(val, torch.Tensor) else val
+                        )
+            # Injection RMS per level
             for lvl in (0, 1, 2, 3):
-                norm_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_norm")
-                if norm_val is not None:
-                    logs[f"frequency/injection_l{lvl}_norm"] = norm_val.detach()
+                rms_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_rms")
+                if rms_val is not None:
+                    logs[f"frequency/injection_l{lvl}_rms"] = rms_val.detach()
             # Gate TV
             gate_tv = self._last_frequency_diagnostics.get("gate_tv")
             if gate_tv is not None:

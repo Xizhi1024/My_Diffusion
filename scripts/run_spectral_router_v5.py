@@ -119,7 +119,7 @@ def build_stage_b_variants(
             if not policy:
                 overrides[POLICY_KEY] = "learned_no_null"
             if FIXED_PRIOR_KEY not in overrides:
-                overrides[FIXED_PRIOR_KEY] = [0.05, 0.95]
+                overrides[FIXED_PRIOR_KEY] = [0.5, 0.5]
         variants.append({
             "id": variant_id,
             "preset": str(selected["preset"]),
@@ -394,11 +394,19 @@ def _write_promotion_outputs(
     output_dir = Path(str(plan["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
     reference_id = str(plan["stage_b"]["reference_id"])
-    if any(str(row["id"]) == reference_id for row in promotion_records):
-        raise ValueError(f"Reference route {reference_id} cannot be promoted")
-    reference = next(
-        row for row in stage_b_decision["ranked"] if row["id"] == reference_id
-    )
+
+    # The reference (T_native) must be present in 300-epoch records so the
+    # final comparison is fair: candidate-300 vs T_native-300, not vs a
+    # 50-epoch Stage-B baseline.
+    promotion_by_id: Dict[str, Any] = {
+        str(row["id"]): row for row in promotion_records
+    }
+    if reference_id not in promotion_by_id:
+        raise ValueError(
+            f"Reference route {reference_id} was not trained to 300 epochs; "
+            f"it must be included in the promotion batch for a fair comparison."
+        )
+    reference = promotion_by_id[reference_id]
     evidence_id_value = stage_b_decision.get("selected_evidence_id")
     evidence_id = str(evidence_id_value) if evidence_id_value else None
 
@@ -556,6 +564,10 @@ def main() -> None:
         return
 
     promoted_ids = set(promoted_routes[:4])
+    # Always include the reference architecture (T_native) in the 300-epoch
+    # batch so the final paired comparison uses matched-budget endpoints.
+    reference_id = str(plan["stage_b"]["reference_id"])
+    promoted_ids.add(reference_id)
     promotion_variants = [
         row for row in stage_b_variants if row["id"] in promoted_ids
     ]

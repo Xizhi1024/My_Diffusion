@@ -627,10 +627,26 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "gabor_haar_agreement": current_residual.new_zeros(batch, 2, 3),
             "gabor_dct_agreement": current_residual.new_zeros(batch, 2, 3),
             "route_policy": self._effective_policy,
-            "route_null_mean": current_residual.new_zeros(()),
-            "route_entropy": current_residual.new_zeros(()),
-            "route_active_mass": current_residual.new_zeros(()),
+            # Per-level zero diagnostics (all null → entropy=0, active_mass=0)
+            "route_l2_active_mass": current_residual.new_zeros(()),
+            "route_l2_entropy": current_residual.new_zeros(()),
+            "route_l1_active_mass": current_residual.new_zeros(()),
+            "route_l1_entropy": current_residual.new_zeros(()),
         }
+        if self._num_routes == 3:
+            diagnostics.update({
+                "route_l2_null_mean": current_residual.new_zeros(()),
+                "route_l2_null_p10": current_residual.new_zeros(()),
+                "route_l2_null_p50": current_residual.new_zeros(()),
+                "route_l2_null_p90": current_residual.new_zeros(()),
+                "route_l1_null_mean": current_residual.new_zeros(()),
+                "route_l1_null_p10": current_residual.new_zeros(()),
+                "route_l1_null_p50": current_residual.new_zeros(()),
+                "route_l1_null_p90": current_residual.new_zeros(()),
+            })
+        # Injection RMS — all zero for hard-null
+        for lvl in range(4):
+            diagnostics[f"injection/l{lvl}_rms"] = current_residual.new_zeros(())
         if self._effective_policy == "legacy_off":
             diagnostics.update(self._legacy_route_diagnostics(current_residual))
         return injections, diagnostics

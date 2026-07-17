@@ -97,7 +97,7 @@ stage_b:
         modules.residual_frequency.mode: spectral_evidence_router
         modules.residual_frequency.cross_level_router.enabled: true
         modules.residual_frequency.cross_level_router.policy: learned_no_null
-        modules.residual_frequency.cross_level_router.fixed_prior: [0.05, 0.95]
+        modules.residual_frequency.cross_level_router.fixed_prior: [0.5, 0.5]
   hard_gates:
     lesion_topq_peak_error_norm_mean:
       direction: lower

@@ -104,8 +104,14 @@ def collect_trajectory(
     weights: str = "ema",
     device: Optional[str] = None,
     python: str = sys.executable,
+    whitelist_epochs: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    """Evaluate all checkpoints for one experiment and return the trajectory."""
+    """Evaluate all checkpoints for one experiment and return the trajectory.
+
+    Args:
+        whitelist_epochs: Only evaluate checkpoints whose epoch number is in
+            this list.  When None, all ``ckpt_epoch*.pt`` files are evaluated.
+    """
     checkpoints = _find_checkpoints(experiment_dir)
     trajectory: Dict[str, Any] = {
         "experiment_dir": str(experiment_dir),
@@ -113,10 +119,23 @@ def collect_trajectory(
     }
     results: Dict[str, Any] = {}
 
+    # Build whitelist from epoch labels
+    allowed_epochs: Optional[set[int]] = (
+        set(whitelist_epochs) if whitelist_epochs is not None else None
+    )
+
     # Evaluate fixed-epoch checkpoints
     for epoch_label, ckpt_path in sorted(checkpoints.items()):
         if not epoch_label.startswith("ckpt_epoch"):
             continue
+        # Filter by whitelist if set
+        if allowed_epochs is not None:
+            try:
+                epoch_num = int(epoch_label[len("ckpt_epoch"):])
+            except ValueError:
+                continue
+            if epoch_num not in allowed_epochs:
+                continue
         print(f"  Evaluating {epoch_label} ...")
         try:
             result = evaluate_checkpoint(
@@ -194,8 +213,8 @@ def main() -> None:
         help="Directory containing experiment checkpoints",
     )
     parser.add_argument(
-        "--config", type=Path, required=True,
-        help="Base experiment config YAML",
+        "--config", type=Path, default=None,
+        help="Experiment config YAML.  If omitted, {experiment-dir}/resolved_config.yaml is used.",
     )
     parser.add_argument(
         "--output-dir", type=Path,
@@ -208,20 +227,41 @@ def main() -> None:
     parser.add_argument("--mc-steps", type=int, default=20)
     parser.add_argument("--weights", default="ema")
     parser.add_argument("--device")
+    parser.add_argument(
+        "--epochs", type=int, nargs="+",
+        default=[50, 100, 150, 200, 250, 300],
+        help="Whitelist of checkpoint epochs to evaluate (default: 50 100 150 200 250 300)",
+    )
+    parser.add_argument(
+        "--config", type=Path, required=False, default=None,
+        help="Base experiment config YAML.  If omitted, {experiment-dir}/resolved_config.yaml is used.",
+    )
     args = parser.parse_args()
 
+    config_path = args.config
+    if config_path is None:
+        resolved = args.experiment_dir / "resolved_config.yaml"
+        if resolved.is_file():
+            config_path = resolved
+            print(f"Auto-detected config: {config_path}")
+        else:
+            print("ERROR: --config is required when resolved_config.yaml is not present "
+                  "in the experiment directory.", file=sys.stderr)
+            sys.exit(1)
+
     print(f"Trajectory evaluation for: {args.experiment_dir}")
-    print(f"Config: {args.config}")
+    print(f"Config: {config_path}")
 
     trajectory = collect_trajectory(
         args.experiment_dir,
-        args.config,
+        config_path,
         split=args.split,
         max_samples=args.max_samples,
         seed=args.seed,
         mc_steps=args.mc_steps,
         weights=args.weights,
         device=args.device,
+        whitelist_epochs=args.epochs,
     )
 
     experiment_name = args.experiment_dir.name
