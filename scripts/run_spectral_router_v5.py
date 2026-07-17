@@ -214,9 +214,20 @@ def build_v5_dry_run_manifest(
     stage_b_variants = build_stage_b_variants(plan, selected_evidence)
     promotion_count = min(int(plan["stage_b"].get("top_k", 3)), 4)
     reference_id = str(plan["stage_b"]["reference_id"])
-    eligible_promotion_variants = [
-        row for row in stage_b_variants if row["id"] != reference_id
+
+    # Always include the reference (T_native) in the dry-run manifest so it
+    # matches the real training budget.
+    reference_variant = next(
+        row for row in stage_b_variants if row["id"] == reference_id
+    )
+    candidate_variants = [
+        row for row in stage_b_variants
+        if (
+            row["id"] != reference_id
+            and str(row["id"]) not in _NON_PROMOTABLE_IDS
+        )
     ][:promotion_count]
+    eligible_promotion_variants = [reference_variant] + candidate_variants
     return {
         "selected_evidence_template": selected_evidence,
         "stage_a_runs": (
@@ -421,7 +432,7 @@ def _write_promotion_outputs(
             "gate_passed": passed,
             "gate_reasons": reasons,
         })
-        if passed:
+        if passed and str(row["id"]) != reference_id:
             accepted.append(row["id"])
 
     (output_dir / "final_gate_decision.json").write_text(
@@ -449,15 +460,8 @@ def _write_promotion_outputs(
         str(row["id"]): output_dir / promote_phase / f"{str(row['id']).lower()}.json"
         for row in promotion_records
     }
-    stage_b_reference = (
-        output_dir / stage_b_phase / f"{reference_id.lower()}.json"
-    )
-    if not stage_b_reference.is_file():
-        raise FileNotFoundError(
-            f"Stage B {reference_id} result is required for final paired "
-            f"comparison: {stage_b_reference}"
-        )
-    result_paths[f"{reference_id}_stage_b"] = stage_b_reference
+    # Final paired comparison uses only 300-epoch results — all entries in
+    # promotion_records (including the reference) are at the same epoch budget.
     comparison_cfg = plan.get("paired_comparison", {})
     paired = compare_all_results(
         result_paths,

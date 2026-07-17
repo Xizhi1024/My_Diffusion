@@ -213,8 +213,13 @@ def main() -> None:
         help="Directory containing experiment checkpoints",
     )
     parser.add_argument(
-        "--config", type=Path, default=None,
-        help="Experiment config YAML.  If omitted, {experiment-dir}/resolved_config.yaml is used.",
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "Experiment config YAML.  If omitted, "
+            "{experiment-dir}/resolved_config.yaml is used."
+        ),
     )
     parser.add_argument(
         "--output-dir", type=Path,
@@ -231,10 +236,6 @@ def main() -> None:
         "--epochs", type=int, nargs="+",
         default=[50, 100, 150, 200, 250, 300],
         help="Whitelist of checkpoint epochs to evaluate (default: 50 100 150 200 250 300)",
-    )
-    parser.add_argument(
-        "--config", type=Path, required=False, default=None,
-        help="Base experiment config YAML.  If omitted, {experiment-dir}/resolved_config.yaml is used.",
     )
     args = parser.parse_args()
 

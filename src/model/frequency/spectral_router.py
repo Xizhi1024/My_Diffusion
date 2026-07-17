@@ -634,15 +634,16 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "route_l1_entropy": current_residual.new_zeros(()),
         }
         if self._num_routes == 3:
+            one = current_residual.new_ones(())
             diagnostics.update({
-                "route_l2_null_mean": current_residual.new_zeros(()),
-                "route_l2_null_p10": current_residual.new_zeros(()),
-                "route_l2_null_p50": current_residual.new_zeros(()),
-                "route_l2_null_p90": current_residual.new_zeros(()),
-                "route_l1_null_mean": current_residual.new_zeros(()),
-                "route_l1_null_p10": current_residual.new_zeros(()),
-                "route_l1_null_p50": current_residual.new_zeros(()),
-                "route_l1_null_p90": current_residual.new_zeros(()),
+                "route_l2_null_mean": one,
+                "route_l2_null_p10": one,
+                "route_l2_null_p50": one,
+                "route_l2_null_p90": one,
+                "route_l1_null_mean": one,
+                "route_l1_null_p10": one,
+                "route_l1_null_p50": one,
+                "route_l1_null_p90": one,
             })
         # Injection RMS — all zero for hard-null
         for lvl in range(4):
