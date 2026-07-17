@@ -535,9 +535,11 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
     ]
 
     stage_b = plan["stage_b"]
-    assert stage_b["reference_id"] == "T0"
-    assert stage_b["top_k"] == 2
-    assert [row["id"] for row in stage_b["variants"]] == ["N0", "T0", "C0", "C1"]
+    assert stage_b["reference_id"] == "T_native"
+    assert stage_b["top_k"] == 3
+    assert [row["id"] for row in stage_b["variants"]] == [
+        "N0", "T_legacy", "T_native", "T_fixed", "C1", "C_no_null",
+    ]
     assert all(
         row["overrides"]["modules.residual_frequency.mode"]
         == "spectral_evidence_router"
@@ -602,11 +604,15 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
         "mc_steps": 20,
         "early_stopping": False,
         "require_final_checkpoint": True,
+        "trajectory_checkpoints": [50, 100, 150, 200, 250, 300],
     }
     assert plan["paired_comparison"] == {
         "seed": 42,
         "resamples": 10000,
         "metrics": {
+            "small_lesion_topq_peak_error_norm_mean": "lower",
+            "small_lesion_signed_bias_mean": "lower",
+            "small_lesion_underestimate_rate": "lower",
             "lesion_topq_peak_error_norm_mean": "lower",
             "lesion_peak_error_norm_mean": "lower",
             "lesion_mean_error_norm_mean": "lower",
@@ -623,10 +629,16 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
     }
 
 
-def test_v5_stage_b_variants_inherit_evidence_and_keep_four_routes_distinct():
+def test_v5_stage_b_variants_inherit_evidence_and_keep_six_routes_distinct():
     import yaml
 
-    from scripts.run_spectral_router_v5 import build_stage_b_variants
+    from scripts.run_spectral_router_v5 import (
+        CROSS_ENABLED_KEY,
+        FIXED_PRIOR_KEY,
+        HARD_NULL_KEY,
+        POLICY_KEY,
+        build_stage_b_variants,
+    )
 
     plan = yaml.safe_load(
         Path("configs/experiments/spectral_router_ablation_plan_v5.yaml").read_text(
@@ -635,34 +647,40 @@ def test_v5_stage_b_variants_inherit_evidence_and_keep_four_routes_distinct():
     )
     variants = build_stage_b_variants(plan, selected_evidence_id="S3")
 
-    assert [row["id"] for row in variants] == ["N0", "T0", "C0", "C1"]
+    assert [row["id"] for row in variants] == [
+        "N0", "T_legacy", "T_native", "T_fixed", "C1", "C_no_null",
+    ]
     assert {row["preset"] for row in variants} == {"sr_v5_s3"}
     assert {row["inherited_evidence"] for row in variants} == {"S3"}
     routes = {row["id"]: row["overrides"] for row in variants}
-    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 4
+    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 6
     assert all(
         route["modules.residual_frequency.mode"] == "spectral_evidence_router"
         for route in routes.values()
     )
-    assert routes["N0"][
-        "modules.residual_frequency.cross_level_router.enabled"
-    ] is True
-    assert routes["N0"][
-        "modules.residual_frequency.cross_level_router.hard_all_null"
-    ] is True
-    assert routes["T0"][
-        "modules.residual_frequency.cross_level_router.enabled"
-    ] is False
-    assert routes["C0"]["modules.residual_frequency.dct_descriptor.enabled"] is False
-    assert routes["C0"][
-        "modules.residual_frequency.gabor_descriptor.enabled"
-    ] is False
-    assert routes["C0"][
-        "modules.residual_frequency.cross_level_router.enabled"
-    ] is True
-    assert routes["C1"][
-        "modules.residual_frequency.cross_level_router.enabled"
-    ] is True
+    # N0: hard all-null
+    assert routes["N0"][CROSS_ENABLED_KEY] is True
+    assert routes["N0"][HARD_NULL_KEY] is True
+    # T_legacy: old cross_level_enabled=false
+    assert routes["T_legacy"][CROSS_ENABLED_KEY] is False
+    assert routes["T_legacy"][HARD_NULL_KEY] is False
+    # T_native: native_only policy
+    assert routes["T_native"][CROSS_ENABLED_KEY] is True
+    assert routes["T_native"][POLICY_KEY] == "native_only"
+    # T_fixed: fixed_prior policy
+    assert routes["T_fixed"][CROSS_ENABLED_KEY] is True
+    assert routes["T_fixed"][POLICY_KEY] == "fixed_prior"
+    assert routes["T_fixed"][FIXED_PRIOR_KEY] == [0.05, 0.05, 0.90]
+    # C1: learned policy with all evidence
+    assert routes["C1"][CROSS_ENABLED_KEY] is True
+    assert routes["C1"][HARD_NULL_KEY] is False
+    assert routes["C1"][POLICY_KEY] == "learned"
+    assert routes["C1"]["modules.residual_frequency.dct_descriptor.enabled"] is True
+    assert routes["C1"]["modules.residual_frequency.gabor_descriptor.enabled"] is True
+    # C_no_null: learned_no_null policy
+    assert routes["C_no_null"][CROSS_ENABLED_KEY] is True
+    assert routes["C_no_null"][POLICY_KEY] == "learned_no_null"
+    assert routes["C_no_null"][FIXED_PRIOR_KEY] == [0.5, 0.5]
 
 
 def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
@@ -677,19 +695,16 @@ def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
     )
     variants = build_stage_b_variants(plan, selected_evidence_id="S0")
 
-    assert [row["id"] for row in variants] == ["N0", "T0", "C0", "C1"]
+    assert [row["id"] for row in variants] == [
+        "N0", "T_legacy", "T_native", "T_fixed", "C1", "C_no_null",
+    ]
     routes = {row["id"]: row["overrides"] for row in variants}
-    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 4
+    assert len({tuple(sorted(route.items())) for route in routes.values()}) == 6
     assert all(
         route["modules.residual_frequency.mode"] == "spectral_evidence_router"
         for route in routes.values()
     )
-    assert routes["C0"][
-        "modules.residual_frequency.dct_descriptor.enabled"
-    ] is False
-    assert routes["C0"][
-        "modules.residual_frequency.gabor_descriptor.enabled"
-    ] is False
+    # C1 under S0 gets explicit DCT/Gabor descriptors enabled (the S0 preset disables them)
     assert routes["C1"][
         "modules.residual_frequency.dct_descriptor.enabled"
     ] is True
@@ -755,23 +770,29 @@ def test_v5_evidence_identity_namespaces_stage_b_and_promotion_artifacts():
     )
 
 
-def test_v5_stage_b_promotion_excludes_best_scoring_t0_reference():
+def test_v5_stage_b_promotion_excludes_reference_and_non_promotable_routes():
     from scripts.run_spectral_router_v5 import _select_eligible_stage_b_routes
 
     ranked = [
-        {"id": "T0", "score": 10.0, "gate_passed": True},
+        {"id": "T_native", "score": 10.0, "gate_passed": True},
         {"id": "C1", "score": 9.0, "gate_passed": True},
         {"id": "N0", "score": 8.0, "gate_passed": True},
-        {"id": "C0", "score": 7.0, "gate_passed": True},
+        {"id": "T_legacy", "score": 7.0, "gate_passed": True},
+        {"id": "T_fixed", "score": 6.0, "gate_passed": True},
+        {"id": "C_no_null", "score": 5.0, "gate_passed": True},
     ]
 
     promoted = _select_eligible_stage_b_routes(
-        ranked, reference_id="T0", top_k=2
+        ranked, reference_id="T_native", top_k=3
     )
 
-    assert promoted == ["C1", "N0"]
-    assert "T0" not in promoted
-    assert len(promoted) <= 2
+    # reference excluded, N0 and T_legacy excluded (non-promotable)
+    assert "T_native" not in promoted
+    assert "N0" not in promoted
+    assert "T_legacy" not in promoted
+    # C1, T_fixed, C_no_null are eligible
+    assert promoted == ["C1", "T_fixed", "C_no_null"]
+    assert len(promoted) <= 3
 
 
 def test_v5_exact_epoch_validation_reads_checkpoint_metadata(tmp_path):
@@ -865,8 +886,8 @@ def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
 
     assert manifest["selected_evidence_template"] == "S3"
     assert len(manifest["stage_a_runs"]) == 4
-    assert len(manifest["stage_b_runs"]) == 4
-    assert len(manifest["promotion_runs"]) == 2
+    assert len(manifest["stage_b_runs"]) == 6
+    assert len(manifest["promotion_runs"]) == 4  # T_native + up to 3 candidates
     assert [row["id"] for row in manifest["stage_a_runs"]] == [
         "S0",
         "S1",
@@ -875,10 +896,17 @@ def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
     ]
     assert [row["id"] for row in manifest["stage_b_runs"]] == [
         "N0",
-        "T0",
-        "C0",
+        "T_legacy",
+        "T_native",
+        "T_fixed",
         "C1",
+        "C_no_null",
     ]
+    # Promotion always includes T_native reference in dry-run
+    promo_ids = [row["id"] for row in manifest["promotion_runs"]]
+    assert "T_native" in promo_ids
+    assert "N0" not in promo_ids
+    assert "T_legacy" not in promo_ids
     manifest_text = str(manifest)
     assert "spectral_router_ablations_v5" in manifest_text
     assert "boundary_reliable_ablations_v4" not in manifest_text
@@ -910,9 +938,9 @@ def test_v5_dry_run_manifest_is_exact_deterministic_and_v5_only():
     ("stage", "expected_counts"),
     [
         ("stage-a", (4, 0, 0)),
-        ("stage-b", (0, 4, 0)),
-        ("promote", (0, 0, 2)),
-        ("all", (4, 4, 2)),
+        ("stage-b", (0, 6, 0)),
+        ("promote", (0, 0, 4)),
+        ("all", (4, 6, 4)),
     ],
 )
 def test_v5_dry_run_manifest_respects_requested_stage(stage, expected_counts):
@@ -935,17 +963,17 @@ def test_v5_dry_run_manifest_respects_requested_stage(stage, expected_counts):
     ) == expected_counts
 
 
-def test_v5_final_comparison_requires_stage_b_t0_result(tmp_path):
+def test_v5_final_comparison_requires_300_epoch_reference_in_promotion_records(tmp_path):
     from scripts.run_spectral_router_v5 import _write_promotion_outputs
 
     plan = {
         "output_dir": str(tmp_path),
-        "stage_b": {"reference_id": "T0", "hard_gates": {}},
+        "stage_b": {"reference_id": "T_native", "hard_gates": {}},
         "paired_comparison": {"metrics": {}},
     }
-    stage_b_decision = {"ranked": [{"id": "T0", "metrics": {}}]}
+    stage_b_decision = {"ranked": [{"id": "T_native", "metrics": {}}]}
 
-    with pytest.raises(FileNotFoundError, match="T0"):
+    with pytest.raises(ValueError, match="not trained to 300 epochs"):
         _write_promotion_outputs(
             plan,
             [{"id": "C1", "metrics": {}}],
@@ -953,45 +981,51 @@ def test_v5_final_comparison_requires_stage_b_t0_result(tmp_path):
         )
 
 
-def test_v5_final_comparison_includes_stage_b_t0_and_promoted_results(tmp_path):
+def test_v5_final_comparison_uses_300_epoch_reference_only(tmp_path):
     import json
 
     from scripts.run_spectral_router_v5 import _write_promotion_outputs
 
     plan = {
         "output_dir": str(tmp_path),
-        "stage_b": {"reference_id": "T0", "hard_gates": {}},
+        "stage_b": {"reference_id": "T_native", "hard_gates": {}},
         "paired_comparison": {
             "seed": 42,
             "resamples": 10,
             "metrics": {"score": "lower"},
         },
     }
-    stage_b_decision = {"ranked": [{"id": "T0", "metrics": {}}]}
+    stage_b_decision = {"ranked": [{"id": "T_native", "metrics": {}}]}
     per_patient = {"p0": {"score": 1.0}, "p1": {"score": 2.0}}
-    stage_b_dir = tmp_path / "stage_b"
     promote_dir = tmp_path / "promote"
-    stage_b_dir.mkdir()
     promote_dir.mkdir()
-    (stage_b_dir / "t0.json").write_text(
+    (promote_dir / "t_native.json").write_text(
         json.dumps({"per_patient": per_patient}), encoding="utf-8"
     )
     (promote_dir / "c1.json").write_text(
-        json.dumps({"per_patient": per_patient}), encoding="utf-8"
+        json.dumps({"per_patient": {"p0": {"score": 0.5}, "p1": {"score": 1.5}}}),
+        encoding="utf-8",
     )
-
-    _write_promotion_outputs(
-        plan,
-        [{"id": "C1", "metrics": {}}],
-        stage_b_decision,
-    )
+    promotion_records = [
+        {
+            "id": "T_native",
+            "metrics": {"score": {"mean": 1.0}},
+            "experiment": "sr_v5_full_evidence-s3_t_native",
+        },
+        {
+            "id": "C1",
+            "metrics": {"score": {"mean": 0.5}},
+            "experiment": "sr_v5_full_evidence-s3_c1",
+        },
+    ]
+    _write_promotion_outputs(plan, promotion_records, stage_b_decision)
 
     report = json.loads(
         (tmp_path / "paired_comparison.json").read_text(encoding="utf-8")
     )
     assert [
         {row["left_id"], row["right_id"]} for row in report["comparisons"]
-    ] == [{"C1", "T0_stage_b"}]
+    ] == [{"C1", "T_native"}]
 
 
 @pytest.mark.parametrize(
@@ -1044,7 +1078,7 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
     for route in direct_routes:
         assert cfg["modules"]["gabor"][route] is False
     assert cfg["losses"]["normalized_lesion_peak"]["enabled"] is True
-    assert cfg["losses"]["frequency_gate_tv"]["enabled"] is True
+    assert cfg["losses"]["frequency_gate_tv"]["enabled"] is False  # V5 base: gate-TV off
 
     batch = {
         "ct": torch.randn(1, 1, 32, 32),
@@ -1054,7 +1088,7 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
     batch["mask"][:, :, 14:18, 14:18] = 1
     loss, logs = model(batch, timesteps=torch.tensor([250]))
     assert torch.isfinite(loss)
-    assert logs["loss/frequency_gate_tv/available"].item() == 1
+    assert logs["loss/frequency_gate_tv/available"].item() == 0  # gate-TV disabled in V5 base
 
 
 def test_v5_split_manifest_resolves_from_repo_root():
