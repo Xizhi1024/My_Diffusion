@@ -675,12 +675,19 @@ def test_v5_stage_b_variants_inherit_evidence_and_keep_six_routes_distinct():
     assert routes["T_fixed"][CROSS_ENABLED_KEY] is True
     assert routes["T_fixed"][POLICY_KEY] == "fixed_prior"
     assert routes["T_fixed"][FIXED_PRIOR_KEY] == [0.05, 0.05, 0.90]
-    # C1: learned policy with all evidence
+    # C1: learned policy — DCT/Gabor descriptors are inherited from the
+    # Stage A evidence preset, not duplicated in overrides.
     assert routes["C1"][CROSS_ENABLED_KEY] is True
     assert routes["C1"][HARD_NULL_KEY] is False
     assert routes["C1"][POLICY_KEY] == "learned"
-    assert routes["C1"]["modules.residual_frequency.dct_descriptor.enabled"] is True
-    assert routes["C1"]["modules.residual_frequency.gabor_descriptor.enabled"] is True
+    assert (
+        "modules.residual_frequency.dct_descriptor.enabled"
+        not in routes["C1"]
+    )
+    assert (
+        "modules.residual_frequency.gabor_descriptor.enabled"
+        not in routes["C1"]
+    )
     # C_no_null: learned_no_null policy
     assert routes["C_no_null"][CROSS_ENABLED_KEY] is True
     assert routes["C_no_null"][POLICY_KEY] == "learned_no_null"
@@ -1095,7 +1102,10 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
     batch["mask"][:, :, 14:18, 14:18] = 1
     loss, logs = model(batch, timesteps=torch.tensor([250]))
     assert torch.isfinite(loss)
-    assert logs["loss/frequency_gate_tv/available"].item() == 0  # gate-TV disabled in V5 base
+    # gate-TV disabled → DisabledLossTerm; only enabled+loss keys, no "available"
+    assert logs["loss/frequency_gate_tv/enabled"].item() == 0
+    assert logs["loss/frequency_gate_tv/loss"].item() == 0
+    assert "loss/frequency_gate_tv/available" not in logs
 
 
 def test_v5_split_manifest_resolves_from_repo_root():
