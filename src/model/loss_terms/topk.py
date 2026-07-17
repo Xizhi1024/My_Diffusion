@@ -1,17 +1,21 @@
-"""Top-K Focal Lesion Loss – focuses on the brightest k% pixels.
+"""Top-K Focal Lesion Loss – per-sample target Top-K within lesion mask.
 
 For lesions occupying 0.1% of pixels, this loss is a survival necessity.
-Only the top-k% brightest pixels in the target PET contribute,
-with Focal weighting so hard-to-predict pixels get larger gradients.
+Each sample is processed independently: the brightest k pixels are selected
+from the *target* PET within the lesion mask, and the model's prediction
+at those same locations is compared against the target.  Using target
+Top-K (not independent pred/target Top-K) preserves spatial correspondence.
 
 Active only at late denoising steps (τ < active_tau_max).
 """
 
+from __future__ import annotations
+
+import math
 from typing import Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ..interfaces import LossContext, LossTerm
 from .base import smooth_tau_gate
@@ -34,40 +38,63 @@ class TopKLesionLoss(LossTerm):
         self.active_tau_max = active_tau_max
 
     def forward(self, ctx: LossContext) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if not self.enabled:
-            return (
-                torch.tensor(0.0, device=ctx.target_pet.device),
-                {f"{self.name}/enabled": torch.tensor(0.0)},
-            )
-
-        gate = smooth_tau_gate(ctx.tau, max_tau=self.active_tau_max)
-
-        # Use pred_x0 if available, else fallback to model_pred
         pred = ctx.pred_x0 if ctx.pred_x0 is not None else ctx.model_pred
         target = ctx.target_pet
-
-        # Prefer the lesion mask when present. Selecting the top-k% brightest
-        # target pixels picks large high-uptake organs (bladder/heart/brain),
-        # not sparse lesions — so the model satisfied this loss by predicting
-        # organs and the lesion signal vanished (observed loss ≈ 0.008).
         lesion = ctx.batch.get("mask")
-        if lesion is not None and lesion.sum() > 0:
-            mask = lesion.to(device=target.device, dtype=target.dtype)
-        else:
-            k = max(1, int(target[0].numel() * self.topk_percent))
-            flat_target = target.reshape(target.shape[0], -1)
-            threshold = torch.topk(flat_target, k, dim=1).values[:, -1].view(-1, 1, 1, 1)
-            mask = (target >= threshold).float()
 
-        abs_error = (pred - target).abs()
-        focal_weight = (1.0 - torch.exp(-abs_error)).pow(self.focal_gamma)
-        loss = (mask * focal_weight * abs_error).sum() / (mask.sum() + 1e-8)
+        zero = pred.sum() * 0.0
+        if not self.enabled or lesion is None:
+            return zero, {
+                f"{self.name}/loss": zero.detach(),
+                f"{self.name}/enabled": pred.new_tensor(float(self.enabled)),
+            }
 
-        # Apply tau gate across batch
-        loss = (loss * gate.mean()).mean()
+        lesion = lesion.to(device=pred.device)
+        gate = smooth_tau_gate(
+            ctx.tau.to(device=pred.device, dtype=pred.dtype),
+            max_tau=self.active_tau_max,
+        ).reshape(-1)
 
-        return loss * self.weight, {
-            f"{self.name}/loss": loss.detach(),
+        losses: list[torch.Tensor] = []
+        selected_counts: list[torch.Tensor] = []
+
+        for index in range(pred.shape[0]):
+            valid = lesion[index] > 0.5
+            target_values = target[index][valid]
+            pred_values = pred[index][valid]
+
+            if target_values.numel() == 0:
+                continue
+
+            count = int(target_values.numel())
+            k = min(
+                max(math.ceil(count * self.topk_percent), 3),
+                16,
+                count,
+            )
+
+            # Select positions from target, preserving spatial correspondence.
+            indices = torch.topk(target_values, k=k).indices
+            error = (pred_values[indices] - target_values[indices]).abs()
+
+            focal_weight = (1.0 - torch.exp(-error)).pow(self.focal_gamma)
+            sample_loss = (focal_weight * error).mean()
+            losses.append(sample_loss * gate[index])
+            selected_counts.append(pred.new_tensor(float(k)))
+
+        if not losses:
+            return zero, {
+                f"{self.name}/loss": zero.detach(),
+                f"{self.name}/enabled": pred.new_tensor(1.0),
+            }
+
+        raw_loss = torch.stack(losses).mean()
+        weighted_loss = raw_loss * self.weight
+
+        return weighted_loss, {
+            f"{self.name}/loss": raw_loss.detach(),
+            f"{self.name}/weighted_loss": weighted_loss.detach(),
             f"{self.name}/gate_mean": gate.mean().detach(),
-            f"{self.name}/enabled": torch.tensor(1.0),
+            f"{self.name}/k_mean": torch.stack(selected_counts).mean().detach(),
+            f"{self.name}/enabled": pred.new_tensor(1.0),
         }

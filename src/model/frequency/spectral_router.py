@@ -89,7 +89,24 @@ class ConservativeRouteHead(nn.Module):
 
 
 class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
-    """Route reliability-gated Haar packets using fixed-width spectral evidence."""
+    """Route reliability-gated Haar packets using fixed-width spectral evidence.
+
+    Route policies
+    --------------
+    ``native_only``    – [1,0,0] frozen, no cross-level routing (pure native).
+    ``fixed_prior``    – frozen softmax prior, e.g. [0.05,0.05,0.90].
+    ``learned``        – 3-way softmax learned from evidence (native/shallow/null).
+    ``learned_no_null``– 2-way softmax (native/shallow), no null option.
+    ``legacy_off``     – (deprecated) cross_level_enabled=False → implicit [1,0,0]/[1,1,0].
+    """
+
+    _ROUTE_POLICIES = frozenset({
+        "native_only",
+        "fixed_prior",
+        "learned",
+        "learned_no_null",
+        "legacy_off",
+    })
 
     evidence_features = 48
     dct_features = 36
@@ -111,10 +128,26 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         initial_null_probability: float = 0.90,
         amplitude_delta_min: float = -0.05,
         amplitude_delta_max: float = 0.10,
+        route_policy: str = "learned",
+        fixed_prior: Sequence[float] = (0.05, 0.05, 0.90),
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
             raise ValueError("hidden_channels must be positive")
+        if route_policy not in self._ROUTE_POLICIES:
+            raise ValueError(
+                f"route_policy must be one of {sorted(self._ROUTE_POLICIES)}, "
+                f"got {route_policy!r}"
+            )
+        if len(fixed_prior) not in (2, 3):
+            raise ValueError(
+                f"fixed_prior must have 2 or 3 entries, got {len(fixed_prior)}"
+            )
+        prior_sum = sum(fixed_prior)
+        if abs(prior_sum - 1.0) > 1e-6:
+            raise ValueError(
+                f"fixed_prior must sum to 1.0, got {prior_sum}"
+            )
         base_kwargs.pop("use_directional_reliability", None)
         base_kwargs.pop("use_gabor_agreement", None)
         super().__init__(
@@ -130,6 +163,14 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.gabor_enabled = bool(gabor_enabled)
         self.cross_level_enabled = bool(cross_level_enabled)
         self.hard_all_null = bool(hard_all_null)
+        self.route_policy = route_policy
+        self.fixed_prior = tuple(float(p) for p in fixed_prior)
+
+        # Resolve effective policy when legacy flags are used
+        effective_policy = self._resolve_policy()
+        self._effective_policy = effective_policy
+        self._num_routes = 2 if effective_policy == "learned_no_null" else 3
+
         self.dct_descriptor = (
             SelectedDCTDescriptor(pooled_size=8, selected_frequencies=12)
             if self.dct_enabled
@@ -153,6 +194,98 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             for _ in range(2)
         )
         self.l2_to_l1_projection = _ZeroProjection(1, self.output_channels[2])
+
+        # Build fixed-route buffers for non-learned policies
+        self.register_buffer(
+            "_fixed_routes_l2",
+            torch.tensor(self._fixed_route_values(), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_fixed_routes_l1",
+            torch.tensor(self._fixed_route_values(), dtype=torch.float32),
+            persistent=False,
+        )
+
+    def _resolve_policy(self) -> str:
+        """Determine the effective route policy from legacy + new configuration."""
+        # Hard-null always wins
+        if self.hard_all_null:
+            return "native_only"  # treated as zero injections downstream
+        # Explicit policy takes precedence
+        if self.route_policy != "learned":
+            return self.route_policy
+        # Legacy cross_level_enabled=False maps to legacy_off
+        if not self.cross_level_enabled:
+            return "legacy_off"
+        return "learned"
+
+    def _fixed_route_values(self) -> list[float]:
+        """Return the frozen route vector for this policy."""
+        policy = self._effective_policy
+        if policy == "native_only":
+            # 3-way: [1,0,0]
+            return [1.0, 0.0, 0.0]
+        if policy == "fixed_prior":
+            return list(self.fixed_prior)
+        if policy == "learned_no_null":
+            # 2-way: native/shallow split of the non-null budget
+            # Use the first two entries of fixed_prior, renormalized
+            n, s = self.fixed_prior[:2]
+            total = n + s
+            if total <= 0:
+                return [0.5, 0.5]
+            return [n / total, s / total]
+        # learned / legacy_off: not used as fixed
+        return [1.0, 0.0, 0.0]  # safe default
+
+    def _acquire_routes(
+        self,
+        level_index: int,
+        evidence: torch.Tensor,
+        reference: torch.Tensor,
+        timestep: torch.Tensor,
+        schedule,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (routes, temporal_smoothness) for one level."""
+        policy = self._effective_policy
+        batch = evidence.shape[0]
+        device = evidence.device
+
+        if policy in ("native_only", "fixed_prior", "learned_no_null"):
+            # Fixed routes: expand batch and band dimensions
+            fixed = (
+                self._fixed_routes_l2
+                if level_index == 0
+                else self._fixed_routes_l1
+            )
+            routes = fixed.view(1, 1, -1).expand(batch, 3, self._num_routes).to(device)
+            return routes, reference.new_zeros(())
+
+        if policy == "legacy_off":
+            # Old implicit behaviour: L2=[1,0,0], L1=[1,1,0]
+            if level_index == 0:
+                vec = reference.new_tensor([1.0, 0.0, 0.0])
+            else:
+                vec = reference.new_tensor([1.0, 1.0, 0.0])
+            routes = vec.view(1, 1, 3).expand(batch, 3, 3)
+            return routes, reference.new_zeros(())
+
+        # Learned policy: compute from evidence
+        routes = self.route_heads[level_index](evidence)
+        next_timestep = (timestep + 1).clamp_max(
+            int(schedule.num_train_timesteps) - 1
+        )
+        next_evidence = evidence.clone()
+        next_evidence[:, :, self.timestep_feature_index], next_evidence[
+            :, :, self.log_snr_feature_index
+        ] = self._expanded_next_time_features(
+            next_timestep, schedule, level_index, reference
+        )
+        temporal_smoothness = (
+            routes - self.route_heads[level_index](next_evidence)
+        ).abs().mean()
+        return routes, temporal_smoothness
 
     @staticmethod
     def _validate_inputs(current_residual: torch.Tensor, ct: torch.Tensor) -> None:
@@ -374,8 +507,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             ),
             current_residual.new_zeros(batch, self.output_channels[3], height, width),
         ]
-        routes = current_residual.new_tensor([0.0, 0.0, 1.0]).view(1, 1, 3)
-        routes = routes.expand(batch, 3, 3)
+        n_routes = 2 if self._effective_policy == "learned_no_null" else 3
+        routes = current_residual.new_zeros(batch, 3, n_routes)
+        routes[..., -1] = 1.0 if n_routes == 3 else 0.0
         diagnostics = {
             "gates_l2": current_residual.new_zeros(batch, 3, height // 4, width // 4),
             "gates_l1": current_residual.new_zeros(batch, 3, height // 2, width // 2),
@@ -388,19 +522,61 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "dct_frequency_weights": current_residual.new_zeros(12),
             "gabor_haar_agreement": current_residual.new_zeros(batch, 2, 3),
             "gabor_dct_agreement": current_residual.new_zeros(batch, 2, 3),
+            "route_policy": self._effective_policy,
+            "route_null_mean": current_residual.new_zeros(()),
+            "route_entropy": current_residual.new_zeros(()),
+            "route_active_mass": current_residual.new_zeros(()),
         }
-        if not self.cross_level_enabled:
-            diagnostics.update(self._independent_route_diagnostics(current_residual))
+        if self._effective_policy == "legacy_off":
+            diagnostics.update(self._legacy_route_diagnostics(current_residual))
         return injections, diagnostics
 
     @staticmethod
-    def _independent_route_diagnostics(reference: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _legacy_route_diagnostics(reference: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Legacy implicit route display for backward compatibility."""
         batch = reference.shape[0]
         l2 = reference.new_tensor([1.0, 0.0, 0.0]).view(1, 1, 3).expand(batch, 3, 3)
         l1 = reference.new_tensor([1.0, 1.0, 0.0]).view(1, 1, 3).expand(batch, 3, 3)
         return {
             "independent_route_weights_l2": l2,
             "independent_route_weights_l1": l1,
+        }
+
+    def _route_diagnostics(
+        self,
+        routes_l2: torch.Tensor,
+        routes_l1: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute monitoring statistics for route distributions."""
+        all_routes = torch.cat([routes_l2.flatten(0, 1), routes_l1.flatten(0, 1)], dim=0)
+        null_prob = all_routes[..., -1] if self._num_routes == 3 else torch.zeros_like(all_routes[..., 0])
+        native_prob = all_routes[..., 0]
+        shallow_prob = all_routes[..., 1] if all_routes.shape[-1] >= 2 else torch.zeros_like(native_prob)
+
+        # Null statistics (only meaningful for 3-way)
+        sorted_null = null_prob.sort().values
+        n = sorted_null.numel()
+        p10 = sorted_null[int(0.10 * (n - 1))] if n > 0 else reference.new_zeros(())
+        p50 = sorted_null[int(0.50 * (n - 1))] if n > 0 else reference.new_zeros(())
+        p90 = sorted_null[int(0.90 * (n - 1))] if n > 0 else reference.new_zeros(())
+        null_mean = null_prob.mean()
+
+        # Entropy
+        eps = 1e-8
+        entropy = -(all_routes * (all_routes + eps).log()).sum(dim=-1).mean()
+
+        # Active mass: P(native) + P(shallow) = 1 - P(null)
+        active_mass = (native_prob + shallow_prob).mean()
+
+        return {
+            "route_null_mean": null_mean,
+            "route_null_p10": p10,
+            "route_null_p50": p50,
+            "route_null_p90": p90,
+            "route_entropy": entropy,
+            "route_active_mass": active_mass,
+            "route_policy": self._effective_policy,
         }
 
     def forward(
@@ -473,34 +649,18 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         amplitude_l1 = (gates_l1 * (1.0 + delta_l1)).clamp(0.0, self.gate_max)
 
         diagnostics: Dict[str, torch.Tensor] = {}
-        if self.cross_level_enabled:
-            routes_l2 = self.route_heads[0](evidence_l2)
-            routes_l1 = self.route_heads[1](evidence_l1)
-            next_timestep = (timestep + 1).clamp_max(
-                int(schedule.num_train_timesteps) - 1
-            )
-            next_l2 = evidence_l2.clone()
-            next_l1 = evidence_l1.clone()
-            next_l2[:, :, self.timestep_feature_index], next_l2[
-                :, :, self.log_snr_feature_index
-            ] = self._expanded_next_time_features(
-                next_timestep, schedule, 0, current_residual
-            )
-            next_l1[:, :, self.timestep_feature_index], next_l1[
-                :, :, self.log_snr_feature_index
-            ] = self._expanded_next_time_features(
-                next_timestep, schedule, 1, current_residual
-            )
-            temporal_smoothness = 0.5 * (
-                (routes_l2 - self.route_heads[0](next_l2)).abs().mean()
-                + (routes_l1 - self.route_heads[1](next_l1)).abs().mean()
-            )
-        else:
-            independent = self._independent_route_diagnostics(current_residual)
-            diagnostics.update(independent)
-            routes_l2 = independent["independent_route_weights_l2"]
-            routes_l1 = independent["independent_route_weights_l1"]
-            temporal_smoothness = current_residual.new_zeros(())
+        routes_l2, temporal_l2 = self._acquire_routes(
+            0, evidence_l2, current_residual, timestep, schedule
+        )
+        routes_l1, temporal_l1 = self._acquire_routes(
+            1, evidence_l1, current_residual, timestep, schedule
+        )
+        temporal_smoothness = 0.5 * (temporal_l2 + temporal_l1)
+
+        # Update route diagnostics
+        diagnostics.update(
+            self._route_diagnostics(routes_l2, routes_l1, current_residual)
+        )
 
         scale_l2 = self.band_scales[0].to(current_residual)
         scale_l1 = self.band_scales[1].to(current_residual)
@@ -510,6 +670,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         gated_l1 = (
             torch.tanh(_stack_details(residual_details1) / scale_l1) * amplitude_l1
         )
+
+        # Route application: flexible number of routes
         native_l2 = gated_l2 * routes_l2[..., 0, None, None]
         shallow_l2 = gated_l2 * routes_l2[..., 1, None, None]
         native_l1 = gated_l1 * routes_l1[..., 0, None, None]
@@ -527,6 +689,14 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         l0 = self.projection_heads[2](
             self.reconstruct_l0(_split_details(shallow_l1))
         )
+
+        # Injection norms for monitoring
+        injections = [l3, l2, l1, l0]
+        injection_norms = {
+            f"injection/l{idx}_norm": inj.norm(dim=tuple(range(1, inj.dim()))).mean().detach()
+            for idx, inj in enumerate(injections)
+        }
+
         diagnostics.update(
             {
                 "gates_l2": amplitude_l2,
@@ -559,6 +729,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                     ),
                     dim=1,
                 ),
+                **injection_norms,
             }
         )
         return [l3, l2, l1, l0], diagnostics

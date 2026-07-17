@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Run the matched-budget V5 T0/C1 300-epoch rescue experiment."""
+"""Run the matched-budget V5 T0/C1 300-epoch rescue experiment.
+
+.. deprecated::
+    Superseded by the fair-control refactoring.  The original T0/C1 results
+    are preserved as ``results/spectral_router_ablations_v5/promote/
+    evidence-s3-legacy/``.  New fair-control groups (T_native, T_fixed, C1,
+    C_no_null) are orchestrated by the updated ``run_spectral_router_v5.py``.
+"""
 
 from __future__ import annotations
 

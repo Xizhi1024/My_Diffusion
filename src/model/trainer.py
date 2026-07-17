@@ -60,8 +60,16 @@ def _compute_pet_sample_metrics(
     topk_percent: float = 0.10,
     min_k: int = 3,
     max_k: int = 16,
+    area_quantiles: Optional[tuple[float, float]] = None,
 ) -> Optional[Dict[str, float]]:
-    """Compute lesion metrics without zero-filled masked-array artefacts."""
+    """Compute lesion metrics without zero-filled masked-array artefacts.
+
+    Args:
+        area_quantiles: Optional (Q33, Q67) lesion-area thresholds in pixels.
+            When provided, adds ``small_lesion_*`` metric variants.  Thresholds
+            should be fixed once on the validation set ground-truth masks and
+            never recomputed per experiment.
+    """
     if not 0.0 < topk_percent <= 1.0:
         raise ValueError("topk_percent must be in (0, 1]")
     if min_k < 1:
@@ -112,6 +120,49 @@ def _compute_pet_sample_metrics(
         "outside_inside_peak_ratio": out_peak / max(pred_in_peak, 1e-6),
         "failure": float(out_peak > pred_in_peak),
         "lesion_roi_l1": float(np.abs(pred_unit[valid] - target_unit[valid]).mean()),
+        # Small-lesion stratification
+        **_small_lesion_variants(
+            topq_bias, peak_bias, out_peak, pred_in_peak,
+            lesion_size, area_quantiles,
+        ),
+    }
+
+
+def _small_lesion_variants(
+    topq_bias: float,
+    peak_bias: float,
+    out_peak: float,
+    pred_in_peak: float,
+    lesion_size: int,
+    area_quantiles: Optional[tuple[float, float]],
+) -> Dict[str, float]:
+    """Compute small-lesion specific metrics when area_quantiles is set."""
+    if area_quantiles is None:
+        return {}
+    q33, q67 = area_quantiles
+    is_small = lesion_size <= q33
+    is_medium = bool(q33 < lesion_size <= q67)
+    is_large = lesion_size > q67
+
+    return {
+        "lesion_size_category": float(
+            0.0 if is_small else (1.0 if is_medium else 2.0)
+        ),
+        "small_lesion_topq_peak_error_norm": (
+            abs(topq_bias) if is_small else 0.0
+        ),
+        "small_lesion_signed_bias_norm": (
+            topq_bias if is_small else 0.0
+        ),
+        "small_lesion_underestimate": (
+            float(peak_bias < 0.0) if is_small else 0.0
+        ),
+        "small_lesion_failure": (
+            float(out_peak > pred_in_peak) if is_small else 0.0
+        ),
+        "small_lesion_count": 1.0 if is_small else 0.0,
+        "medium_lesion_count": 1.0 if is_medium else 0.0,
+        "large_lesion_count": 1.0 if is_large else 0.0,
     }
 
 

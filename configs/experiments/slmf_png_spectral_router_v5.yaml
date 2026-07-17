@@ -119,6 +119,8 @@ modules:
       hidden_channels: 32
       hard_all_null: false
       initial_null_probability: 0.90
+      policy: learned
+      fixed_prior: [0.05, 0.05, 0.90]
 
   gabor:
     enabled: true
@@ -155,19 +157,21 @@ losses:
     active_tau_max: 0.7
   topk_lesion:
     enabled: true
-    weight: 0.4
-    topk_percent: 0.01
-    active_tau_max: 0.5
+    weight: 0.15
+    topk_percent: 0.10
+    active_tau_max: 0.40
   normalized_lesion_peak:
     enabled: true
-    weight: 0.05
+    weight: 0.10
     topk_percent: 0.10
     min_k: 3
     max_k: 16
     beta: 0.02
-    active_tau_max: 0.25
+    active_tau_max: 0.40
+    cold_weight: 1.0
+    cold_tolerance: 0.02
   outside_peak_ranking:
-    enabled: true
+    enabled: false
     weight: 0.1
     margin: 0.05
     inside_radius: 3

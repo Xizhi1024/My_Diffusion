@@ -1,4 +1,8 @@
-"""Robust normalized lesion peak supervision for PNG PET targets."""
+"""Robust normalized lesion peak supervision for PNG PET targets.
+
+Matches per-sample Top-Q lesion peaks in normalized model space,
+with an asymmetric cold penalty that strongly penalizes underestimation.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +28,8 @@ class NormalizedLesionPeakLoss(LossTerm):
         max_k: int = 16,
         beta: float = 0.02,
         active_tau_max: float = 0.25,
+        cold_weight: float = 1.0,
+        cold_tolerance: float = 0.02,
         enabled: bool = True,
         weight: float = 0.05,
     ) -> None:
@@ -33,16 +39,22 @@ class NormalizedLesionPeakLoss(LossTerm):
         if min_k < 1:
             raise ValueError("min_k must be positive")
         if max_k < min_k:
-            raise ValueError("max_k must be greater than or equal to min_k")
+            raise ValueError("max_k must be >= min_k")
         if beta <= 0:
             raise ValueError("beta must be positive")
         if not 0.0 <= active_tau_max <= 1.0:
             raise ValueError("active_tau_max must be in [0, 1]")
+        if cold_weight < 0:
+            raise ValueError("cold_weight must be non-negative")
+        if cold_tolerance < 0:
+            raise ValueError("cold_tolerance must be non-negative")
         self.topk_percent = float(topk_percent)
         self.min_k = int(min_k)
         self.max_k = int(max_k)
         self.beta = float(beta)
         self.active_tau_max = float(active_tau_max)
+        self.cold_weight = float(cold_weight)
+        self.cold_tolerance = float(cold_tolerance)
 
     def forward(
         self,
@@ -75,6 +87,7 @@ class NormalizedLesionPeakLoss(LossTerm):
         pred_peaks = []
         target_peaks = []
         signed_biases = []
+        cold_penalties = []
         valid_gates = []
         selected_counts = []
         for index in range(batch_size):
@@ -91,15 +104,26 @@ class NormalizedLesionPeakLoss(LossTerm):
             )
             pred_peak = torch.topk(selected_pred, k=k).values.mean()
             target_peak = torch.topk(selected_target, k=k).values.mean()
-            sample_loss = F.smooth_l1_loss(
+
+            # Symmetric smooth-L1 loss for general peak matching
+            symmetric = F.smooth_l1_loss(
                 pred_peak,
                 target_peak,
                 beta=self.beta,
             )
+
+            # Asymmetric cold penalty: strongly penalize underestimation
+            # (pred_peak < target_peak) while tolerating small overestimation
+            cold_error = F.relu(
+                target_peak - pred_peak - self.cold_tolerance
+            )
+            sample_loss = symmetric + self.cold_weight * cold_error
+
             losses.append(sample_loss * gate[index])
             pred_peaks.append(pred_peak)
             target_peaks.append(target_peak)
             signed_biases.append(pred_peak - target_peak)
+            cold_penalties.append(cold_error)
             valid_gates.append(gate[index])
             selected_counts.append(pred.new_tensor(float(k)))
 
@@ -109,6 +133,7 @@ class NormalizedLesionPeakLoss(LossTerm):
                 f"{self.name}/pred_peak": zero.detach(),
                 f"{self.name}/target_peak": zero.detach(),
                 f"{self.name}/signed_bias": zero.detach(),
+                f"{self.name}/cold_penalty": zero.detach(),
                 f"{self.name}/gate_mean": zero.detach(),
                 f"{self.name}/valid_count": zero.detach(),
                 f"{self.name}/k_mean": zero.detach(),
@@ -121,6 +146,7 @@ class NormalizedLesionPeakLoss(LossTerm):
             f"{self.name}/pred_peak": torch.stack(pred_peaks).mean().detach(),
             f"{self.name}/target_peak": torch.stack(target_peaks).mean().detach(),
             f"{self.name}/signed_bias": torch.stack(signed_biases).mean().detach(),
+            f"{self.name}/cold_penalty": torch.stack(cold_penalties).mean().detach(),
             f"{self.name}/gate_mean": torch.stack(valid_gates).mean().detach(),
             f"{self.name}/valid_count": pred.new_tensor(float(len(losses))),
             f"{self.name}/k_mean": torch.stack(selected_counts).mean().detach(),

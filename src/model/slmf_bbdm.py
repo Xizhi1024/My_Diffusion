@@ -234,6 +234,7 @@ class SLMFBBDM(nn.Module):
         self.base_gradient_weight = base_cfg.get("gradient_weight", 0.1)
         self.min_snr_enabled = base_cfg.get("min_snr_enabled", True)
         self.min_snr_gamma = base_cfg.get("min_snr_gamma", 5.0)
+        self._min_snr_reference_mean: Optional[torch.Tensor] = None
 
         sc_cfg = self_conditioning_config or {}
         self.self_conditioning = sc_cfg.get("enabled", False)
@@ -512,6 +513,12 @@ class SLMFBBDM(nn.Module):
                     initial_null_probability=cross_level_router_cfg.get(
                         "initial_null_probability", 0.90
                     ),
+                    route_policy=cross_level_router_cfg.get(
+                        "policy", "learned"
+                    ),
+                    fixed_prior=tuple(cross_level_router_cfg.get(
+                        "fixed_prior", [0.05, 0.05, 0.90]
+                    )),
                     amplitude_delta_min=frequency_cfg.get(
                         "amplitude_delta_min", -0.05
                     ),
@@ -730,6 +737,8 @@ class SLMFBBDM(nn.Module):
                 max_k=cfg.get("max_k", 16),
                 beta=cfg.get("beta", 0.02),
                 active_tau_max=cfg.get("active_tau_max", 0.25),
+                cold_weight=cfg.get("cold_weight", 1.0),
+                cold_tolerance=cfg.get("cold_tolerance", 0.02),
                 enabled=enabled,
                 weight=weight,
             )
@@ -892,7 +901,35 @@ class SLMFBBDM(nn.Module):
             return torch.ones(timesteps.shape[0], device=ref.device, dtype=ref.dtype)
 
         gamma = torch.as_tensor(self.min_snr_gamma, device=ref.device, dtype=ref.dtype)
-        return torch.minimum(snr, gamma) / snr.clamp_min(1e-8)
+
+        # pred_x0 objective: weight = min(SNR, γ), not epsilon-prediction weight
+        weights = torch.minimum(snr, gamma)
+
+        # Normalize by the full-schedule reference mean so the average base loss
+        # magnitude stays approximately unchanged.  Compute once and cache.
+        if self._min_snr_reference_mean is None or self._min_snr_reference_mean.device != ref.device:
+            full_indices = torch.arange(
+                self.noise_schedule.num_train_timesteps,
+                device=ref.device,
+            )
+            if hasattr(self.noise_schedule, "alphas_cumprod"):
+                full_alpha = self.noise_schedule.alphas_cumprod[full_indices].to(
+                    device=ref.device, dtype=ref.dtype
+                )
+                full_snr = full_alpha / (1.0 - full_alpha).clamp_min(1e-8)
+            else:
+                full_m = self.noise_schedule.m_t[full_indices].to(
+                    device=ref.device, dtype=ref.dtype
+                )
+                full_sigma = self.noise_schedule.sigma_t[full_indices].to(
+                    device=ref.device, dtype=ref.dtype
+                )
+                full_snr = (1.0 - full_m).square() / full_sigma.square().clamp_min(1e-8)
+            full_weights = torch.minimum(full_snr, gamma)
+            self._min_snr_reference_mean = full_weights.mean().detach()
+
+        weights = weights / self._min_snr_reference_mean.clamp_min(1e-8)
+        return weights
 
     def _base_reconstruction_loss(
         self,
@@ -1315,8 +1352,9 @@ class SLMFBBDM(nn.Module):
             for level in (2, 1):
                 routes = self._last_frequency_diagnostics.get(f"routes_l{level}")
                 if routes is not None:
-                    for index, destination in enumerate(destinations):
-                        logs[f"frequency/route_l{level}_{destination}"] = (
+                    n_routes = routes.shape[-1]
+                    for index in range(min(n_routes, len(destinations))):
+                        logs[f"frequency/route_l{level}_{destinations[index]}"] = (
                             routes[..., index].mean().detach()
                         )
                 gates = self._last_frequency_diagnostics.get(f"gates_l{level}")
@@ -1325,6 +1363,30 @@ class SLMFBBDM(nn.Module):
                         logs[f"frequency/gate_l{level}_{band}"] = (
                             gates[:, index].mean().detach()
                         )
+            # Enhanced router diagnostics
+            for rkey in (
+                "route_null_mean", "route_null_p10", "route_null_p50",
+                "route_null_p90", "route_entropy", "route_active_mass",
+            ):
+                val = self._last_frequency_diagnostics.get(rkey)
+                if val is not None:
+                    logs[f"frequency/{rkey}"] = val.detach() if isinstance(val, torch.Tensor) else val
+            # Injection norms
+            for lvl in (0, 1, 2, 3):
+                norm_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_norm")
+                if norm_val is not None:
+                    logs[f"frequency/injection_l{lvl}_norm"] = norm_val.detach()
+            # Gate TV
+            gate_tv = self._last_frequency_diagnostics.get("gate_tv")
+            if gate_tv is not None:
+                logs["frequency/gate_tv"] = gate_tv.detach()
+            # Policy
+            policy = self._last_frequency_diagnostics.get("route_policy")
+            if policy is not None:
+                logs["frequency/route_policy"] = (
+                    policy if isinstance(policy, (int, float))
+                    else 0.0
+                )
         logs["module/wavelet_unet"] = torch.tensor(
             1.0 if self.wavelet_unet_enabled else 0.0, device=device
         )

@@ -54,8 +54,8 @@ stage_a:
       max_delta: 0.03
 
 stage_b:
-  reference_id: T0
-  top_k: 2
+  reference_id: T_native
+  top_k: 3
   experiment_prefix: sr_v5_stage_b
   epochs: 50
   eval_interval: 10
@@ -70,23 +70,34 @@ stage_b:
         modules.residual_frequency.mode: spectral_evidence_router
         modules.residual_frequency.cross_level_router.enabled: true
         modules.residual_frequency.cross_level_router.hard_all_null: true
-    - id: T0
+    - id: T_legacy
       overrides:
         modules.residual_frequency.mode: spectral_evidence_router
         modules.residual_frequency.cross_level_router.enabled: false
         modules.residual_frequency.cross_level_router.hard_all_null: false
-    - id: C0
+    - id: T_native
       overrides:
         modules.residual_frequency.mode: spectral_evidence_router
-        modules.residual_frequency.dct_descriptor.enabled: false
-        modules.residual_frequency.gabor_descriptor.enabled: false
         modules.residual_frequency.cross_level_router.enabled: true
-        modules.residual_frequency.cross_level_router.hard_all_null: false
+        modules.residual_frequency.cross_level_router.policy: native_only
+    - id: T_fixed
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.policy: fixed_prior
+        modules.residual_frequency.cross_level_router.fixed_prior: [0.05, 0.05, 0.90]
     - id: C1
       overrides:
         modules.residual_frequency.mode: spectral_evidence_router
         modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.policy: learned
         modules.residual_frequency.cross_level_router.hard_all_null: false
+    - id: C_no_null
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.policy: learned_no_null
+        modules.residual_frequency.cross_level_router.fixed_prior: [0.05, 0.95]
   hard_gates:
     lesion_topq_peak_error_norm_mean:
       direction: lower
@@ -131,11 +142,15 @@ promote:
   mc_steps: 20
   early_stopping: false
   require_final_checkpoint: true
+  trajectory_checkpoints: [50, 100, 150, 200, 250, 300]
 
 paired_comparison:
   seed: 42
   resamples: 10000
   metrics:
+    small_lesion_topq_peak_error_norm_mean: lower
+    small_lesion_signed_bias_mean: lower
+    small_lesion_underestimate_rate: lower
     lesion_topq_peak_error_norm_mean: lower
     lesion_peak_error_norm_mean: lower
     lesion_mean_error_norm_mean: lower

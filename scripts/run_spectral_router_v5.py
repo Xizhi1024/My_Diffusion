@@ -33,6 +33,8 @@ from scripts.run_frequency_ablations import (
 MODE_KEY = "modules.residual_frequency.mode"
 CROSS_ENABLED_KEY = "modules.residual_frequency.cross_level_router.enabled"
 HARD_NULL_KEY = "modules.residual_frequency.cross_level_router.hard_all_null"
+POLICY_KEY = "modules.residual_frequency.cross_level_router.policy"
+FIXED_PRIOR_KEY = "modules.residual_frequency.cross_level_router.fixed_prior"
 DCT_ENABLED_KEY = "modules.residual_frequency.dct_descriptor.enabled"
 GABOR_ENABLED_KEY = "modules.residual_frequency.gabor_descriptor.enabled"
 
@@ -73,34 +75,51 @@ def build_stage_b_variants(
     """Pair every V5 route with the exact Stage A evidence preset."""
     selected = _stage_a_variant(plan, selected_evidence_id)
     variants: list[Dict[str, Any]] = []
-    expected_ids = ("N0", "T0", "C0", "C1")
+    # New fair-control variant IDs (supersede old N0/T0/C0/C1)
+    expected_ids = ("N0", "T_legacy", "T_native", "T_fixed", "C1", "C_no_null")
     templates = {str(row["id"]): row for row in plan["stage_b"]["variants"]}
-    missing = [variant_id for variant_id in expected_ids if variant_id not in templates]
-    if missing:
-        raise KeyError(f"Missing Stage B route templates: {missing}")
+    available_ids = [vid for vid in expected_ids if vid in templates]
+    if not available_ids:
+        raise KeyError(f"No Stage B route templates found. Expected any of: {expected_ids}")
 
-    for variant_id in expected_ids:
+    for variant_id in available_ids:
         overrides = dict(templates[variant_id].get("overrides", {}))
         overrides[MODE_KEY] = "spectral_evidence_router"
+        # Parse policy from overrides or infer legacy defaults
+        policy = overrides.get(POLICY_KEY)
         if variant_id == "N0":
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = True
-        elif variant_id == "T0":
+        elif variant_id == "T_legacy":
             overrides[CROSS_ENABLED_KEY] = False
             overrides[HARD_NULL_KEY] = False
-        elif variant_id == "C0":
-            overrides[DCT_ENABLED_KEY] = False
-            overrides[GABOR_ENABLED_KEY] = False
+        elif variant_id == "T_native":
+            overrides[CROSS_ENABLED_KEY] = True
+            if not policy:
+                overrides[POLICY_KEY] = "native_only"
+        elif variant_id == "T_fixed":
+            overrides[CROSS_ENABLED_KEY] = True
+            if not policy:
+                overrides[POLICY_KEY] = "fixed_prior"
+            if FIXED_PRIOR_KEY not in overrides:
+                overrides[FIXED_PRIOR_KEY] = [0.05, 0.05, 0.90]
+        elif variant_id == "C1":
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = False
-        else:
+            if not policy:
+                overrides[POLICY_KEY] = "learned"
             # S0 disables both descriptors, but C1 is the complete V5 route;
             # descriptor-bearing S1-S3 continue to inherit their evidence preset.
             if selected_evidence_id == "S0":
                 overrides[DCT_ENABLED_KEY] = True
                 overrides[GABOR_ENABLED_KEY] = True
+        elif variant_id == "C_no_null":
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = False
+            if not policy:
+                overrides[POLICY_KEY] = "learned_no_null"
+            if FIXED_PRIOR_KEY not in overrides:
+                overrides[FIXED_PRIOR_KEY] = [0.05, 0.95]
         variants.append({
             "id": variant_id,
             "preset": str(selected["preset"]),
@@ -193,7 +212,7 @@ def build_v5_dry_run_manifest(
         or plan["stage_a"].get("dry_run_selected_evidence", "S3")
     )
     stage_b_variants = build_stage_b_variants(plan, selected_evidence)
-    promotion_count = min(int(plan["stage_b"].get("top_k", 2)), 2)
+    promotion_count = min(int(plan["stage_b"].get("top_k", 3)), 4)
     reference_id = str(plan["stage_b"]["reference_id"])
     eligible_promotion_variants = [
         row for row in stage_b_variants if row["id"] != reference_id
@@ -245,7 +264,7 @@ def _select_eligible_stage_b_routes(
     top_k: int,
 ) -> list[str]:
     """Filter the shared gate/score ranking to promotable V5 routes."""
-    limit = min(max(int(top_k), 0), 2)
+    limit = min(max(int(top_k), 0), 4)
     return [
         str(row["id"])
         for row in ranked
@@ -294,7 +313,7 @@ def _run_v5_stage(
         promoted = _select_eligible_stage_b_routes(
             ranked,
             reference_id=reference_id,
-            top_k=int(settings.get("top_k", 2)),
+            top_k=int(settings.get("top_k", 3)),
         )
         decision_dir = Path(str(plan["output_dir"])) / effective_phase
         _write_rankings(decision_dir, promoted, ranked)
@@ -524,7 +543,7 @@ def main() -> None:
         print("No Stage B route passed; 300-epoch promotion stopped.")
         return
 
-    promoted_ids = set(promoted_routes[:2])
+    promoted_ids = set(promoted_routes[:4])
     promotion_variants = [
         row for row in stage_b_variants if row["id"] in promoted_ids
     ]
