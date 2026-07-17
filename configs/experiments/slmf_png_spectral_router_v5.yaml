@@ -188,12 +188,12 @@ losses:
     boundary_radius: 2
     active_tau_max: 0.7
   frequency_gate_tv:
-    enabled: true
+    enabled: false
     weight: 0.001
   spectral_router_regularization:
     enabled: true
     weight: 1.0
-    temporal_weight: 1e-4
+    temporal_weight: 0.0
     dct_weight: 1e-4
     gabor_weight: 1e-4
   residual_wavelet:

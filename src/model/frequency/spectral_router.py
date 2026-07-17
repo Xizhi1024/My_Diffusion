@@ -12,7 +12,6 @@ from .boundary_reliable import (
     _split_details,
     _stack_details,
     _total_variation,
-    _ZeroProjection,
 )
 from .dct_descriptor import SelectedDCTDescriptor
 
@@ -88,6 +87,27 @@ class ConservativeRouteHead(nn.Module):
         return F.softmax(self.final(self.features(evidence)), dim=-1)
 
 
+class BiasFreeZeroProjection(nn.Module):
+    """Zero-initialized projection that stays strictly zero for zero input.
+
+    Unlike ``_ZeroProjection``, this module has **no bias** in any convolution,
+    so P(0) = 0 is guaranteed by construction even after training.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        hidden = min(32, max(8, out_channels // 4))
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1, bias=False),
+            nn.SiLU(),
+        )
+        self.final = nn.Conv2d(hidden, out_channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.final.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.final(self.features(x))
+
+
 class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     """Route reliability-gated Haar packets using fixed-width spectral evidence.
 
@@ -108,10 +128,11 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         "legacy_off",
     })
 
-    evidence_features = 48
-    dct_features = 36
+    evidence_features = 48  # 12(r_dct) + 12(ct_dct) + 12(diff) + 12(scalar)
+    dct_features = 36  # when shared across all 3 bands; per-band is 12
+    dct_per_band = 12
     scalar_features = 12
-    timestep_feature_index = dct_features + 3
+    timestep_feature_index = dct_features + 3  # kept for backward compat
     log_snr_feature_index = dct_features + 4
 
     def __init__(
@@ -193,7 +214,15 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
             for _ in range(2)
         )
-        self.l2_to_l1_projection = _ZeroProjection(1, self.output_channels[2])
+
+        # Replace base-class _ZeroProjection heads with bias-free variants.
+        # The base class stores them as self.projection_heads[0..2]; we rebuild.
+        self.projection_heads = nn.ModuleList([
+            BiasFreeZeroProjection(3, self.output_channels[1]),
+            BiasFreeZeroProjection(3, self.output_channels[2]),
+            BiasFreeZeroProjection(1, self.output_channels[3]),
+        ])
+        self.l2_to_l1_projection = BiasFreeZeroProjection(1, self.output_channels[2])
 
         # Build fixed-route buffers for non-learned policies
         self.register_buffer(
@@ -439,7 +468,12 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         residual = _stack_details(residual_details)
         ct = _stack_details(ct_details)
-        dct, dct_offset, dct_weights = self._dct_evidence(residual)
+
+        # Per-band DCT: residual, CT, and |residual - CT| difference
+        dct_r, dct_offset, dct_weights = self._dct_evidence(residual)
+        dct_c, _, _ = self._dct_evidence(ct)
+        dct_diff = (dct_r - dct_c).abs()
+
         residual_distribution = self._band_distribution(residual)
         ct_distribution = self._band_distribution(ct)
         haar_agreement = (1.0 - (residual_distribution - ct_distribution).abs()).clamp(
@@ -452,14 +486,14 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             base_gate.mean(dim=(-2, -1)) / self.gate_max
         ).clamp(0.0, 1.0)
         (
-            gabor_scale,
+            gabor_global_energy,
             gabor_orientation_energy,
             gabor_anisotropy_energy,
             gabor_haar_agreement,
             gabor_dct_agreement,
         ) = self._gabor_evidence(
             residual_distribution,
-            dct,
+            dct_r,
             residual.shape[-2:],
             gabor_feat,
             gabor_orientation,
@@ -474,7 +508,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 normalized_log_snr[:, None].expand(-1, 3),
                 noise[:, None].expand(-1, 3),
                 base_reliability,
-                gabor_scale,
+                gabor_global_energy,
                 gabor_orientation_energy,
                 gabor_anisotropy_energy,
                 gabor_haar_agreement,
@@ -482,8 +516,15 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             ),
             dim=-1,
         )
-        shared_dct = dct.flatten(1)[:, None, :].expand(-1, 3, -1)
-        evidence = torch.cat((shared_dct, scalars), dim=-1)
+        # Evidence layout: [B, 3, 48]
+        #   dct_r   (12) — residual DCT per band
+        #   dct_c   (12) — CT DCT per band
+        #   dct_diff(12) — |residual - CT| per band
+        #   scalars (12) — band distribution ×2 + agreement + time + noise + ...
+        evidence = torch.cat(
+            (dct_r, dct_c, dct_diff, scalars),
+            dim=-1,
+        )
         return evidence, {
             "dct_weight_offset": dct_offset,
             "dct_frequency_weights": dct_weights,

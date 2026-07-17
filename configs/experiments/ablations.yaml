@@ -464,6 +464,7 @@ ablations:
       modules.gabor.use_for_hotspot: false
       modules.gabor.use_for_loss: false
       losses.spectral_router_regularization.enabled: false
+      losses.frequency_gate_tv.enabled: false
 
   sr_v5_s1:
     description: S1 spectral router with Gabor evidence only
