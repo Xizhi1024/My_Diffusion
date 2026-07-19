@@ -98,6 +98,9 @@ stage_b:
         modules.residual_frequency.cross_level_router.enabled: true
         modules.residual_frequency.cross_level_router.policy: learned_no_null
         modules.residual_frequency.cross_level_router.fixed_prior: [0.5, 0.5]
+  # This is a 50-epoch route screen.  Keep absolute safety floors for lesion
+  # and failure metrics, but judge image/artifact degradation relative to the
+  # matched T_native screen reference instead of applying 300-epoch targets.
   hard_gates:
     lesion_topq_peak_error_norm_mean:
       direction: lower
@@ -107,17 +110,16 @@ stage_b:
       max_value: 0.20
     lesion_centroid_distance_mean:
       direction: lower
-      max_value: 3.15
+      max_delta: 0.25
     directional_spectrum_error_norm_mean:
       direction: lower
-      max_value: 0.0095
+      max_delta: 0.005
     failure_any_mean:
       direction: lower
       max_value: 0.0625
       max_delta: 0.0625
     false_hotspot_density_mean:
       direction: lower
-      max_value: 0.00014
       max_ratio: 1.25
       epsilon: 0.000001
     stripe_excess_mean:
@@ -126,16 +128,17 @@ stage_b:
       max_delta: 0.05
     mae_mean:
       direction: lower
-      max_value: 0.0365
+      max_delta: 0.002
     ssim_mean:
       direction: higher
-      min_value: 0.947
       max_delta: 0.03
 
 promote:
   experiment_prefix: sr_v5_full
   epochs: 300
   eval_interval: 20
+  save_interval: 50
+  sample_interval: 20
   split: val
   max_samples: 64
   seed: 42

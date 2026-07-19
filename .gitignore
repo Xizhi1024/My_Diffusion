@@ -9,6 +9,7 @@ test_results/
 notebook/
 notebook/test-2/
 .claude/
+/configs/local/
 deep-research-report.md
 *.z
 .pixi/

@@ -166,6 +166,26 @@ def test_command_builders_pin_experiment_seed_subset_ema_and_fresh_training():
     assert "training.num_epochs=50" in command_text
     assert "training.resume_from=null" in command_text
     assert "runtime.early_stopping.enabled=false" in command_text
+    assert "runtime.eval_interval=10" in command_text
+    assert "runtime.save_interval=10" in command_text
+    assert "runtime.sample_interval=10" in command_text
+
+    decoupled_train = build_train_command(
+        python="python",
+        config="base.yaml",
+        ablation_config="ablations.yaml",
+        preset="freq_f3",
+        experiment="freq_promote_f3",
+        epochs=300,
+        seed=42,
+        eval_interval=20,
+        save_interval=50,
+        sample_interval=20,
+    )
+    decoupled_text = " ".join(decoupled_train)
+    assert "runtime.eval_interval=20" in decoupled_text
+    assert "runtime.save_interval=50" in decoupled_text
+    assert "runtime.sample_interval=20" in decoupled_text
 
     evaluate = build_eval_command(
         python="python",
@@ -554,11 +574,11 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
         "lesion_peak_error_norm_mean": {"direction": "lower", "max_value": 0.20},
         "lesion_centroid_distance_mean": {
             "direction": "lower",
-            "max_value": 3.15,
+            "max_delta": 0.25,
         },
         "directional_spectrum_error_norm_mean": {
             "direction": "lower",
-            "max_value": 0.0095,
+            "max_delta": 0.005,
         },
         "failure_any_mean": {
             "direction": "lower",
@@ -567,7 +587,6 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
         },
         "false_hotspot_density_mean": {
             "direction": "lower",
-            "max_value": 0.00014,
             "max_ratio": 1.25,
             "epsilon": 1e-6,
         },
@@ -576,10 +595,9 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
             "max_value": 0.20,
             "max_delta": 0.05,
         },
-        "mae_mean": {"direction": "lower", "max_value": 0.0365},
+        "mae_mean": {"direction": "lower", "max_delta": 0.002},
         "ssim_mean": {
             "direction": "higher",
-            "min_value": 0.947,
             "max_delta": 0.03,
         },
     }
@@ -599,6 +617,8 @@ def test_v5_plan_pins_two_stages_gates_and_exact_final_promotion():
         "experiment_prefix": "sr_v5_full",
         "epochs": 300,
         "eval_interval": 20,
+        "save_interval": 50,
+        "sample_interval": 20,
         "split": "val",
         "max_samples": 64,
         "seed": 42,
@@ -694,7 +714,7 @@ def test_v5_stage_b_variants_inherit_evidence_and_keep_six_routes_distinct():
     assert routes["C_no_null"][FIXED_PRIOR_KEY] == [0.5, 0.5]
 
 
-def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
+def test_v5_stage_b_s0_keeps_identical_evidence_across_all_routes():
     import yaml
 
     from scripts.run_spectral_router_v5 import build_stage_b_variants
@@ -718,23 +738,19 @@ def test_v5_stage_b_s0_keeps_complete_c1_and_distinct_v5_routes():
         route["modules.residual_frequency.mode"] == "spectral_evidence_router"
         for route in routes.values()
     )
-    # C1 under S0 gets explicit DCT/Gabor descriptors enabled (the S0 preset disables them)
-    assert routes["C1"][
-        "modules.residual_frequency.dct_descriptor.enabled"
-    ] is True
-    assert routes["C1"][
-        "modules.residual_frequency.gabor_descriptor.enabled"
-    ] is True
-
-    for selected_evidence_id in ("S1", "S2", "S3"):
+    for selected_evidence_id in ("S0", "S1", "S2", "S3"):
         inherited = build_stage_b_variants(
             plan, selected_evidence_id=selected_evidence_id
         )
-        c1_overrides = next(
-            row["overrides"] for row in inherited if row["id"] == "C1"
-        )
-        assert "modules.residual_frequency.dct_descriptor.enabled" not in c1_overrides
-        assert "modules.residual_frequency.gabor_descriptor.enabled" not in c1_overrides
+        for row in inherited:
+            assert (
+                "modules.residual_frequency.dct_descriptor.enabled"
+                not in row["overrides"]
+            )
+            assert (
+                "modules.residual_frequency.gabor_descriptor.enabled"
+                not in row["overrides"]
+            )
 
 
 def test_v5_evidence_identity_namespaces_stage_b_and_promotion_artifacts():
@@ -807,6 +823,64 @@ def test_v5_stage_b_promotion_excludes_reference_and_non_promotable_routes():
     # C1, T_fixed, C_no_null are eligible
     assert promoted == ["C1", "T_fixed", "C_no_null"]
     assert len(promoted) <= 3
+
+
+def test_v5_promotion_always_includes_reference_and_caps_candidates():
+    from scripts.run_spectral_router_v5 import _promotion_route_ids
+
+    assert _promotion_route_ids(
+        [], reference_id="T_native", top_k=3
+    ) == {"T_native"}
+    assert _promotion_route_ids(
+        ["C1", "N0", "T_fixed", "C_no_null", "extra"],
+        reference_id="T_native",
+        top_k=3,
+    ) == {"T_native", "C1", "T_fixed", "C_no_null"}
+
+
+def test_v5_stage_b_screen_gates_use_matched_reference_for_image_quality():
+    import yaml
+
+    from scripts.run_frequency_ablations import passes_hard_gates
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_ablation_plan_v5.yaml")
+        .read_text(encoding="utf-8")
+    )
+    gates = plan["stage_b"]["hard_gates"]
+    reference = {
+        "lesion_topq_peak_error_norm_mean": 0.1230,
+        "lesion_peak_error_norm_mean": 0.0726,
+        "lesion_centroid_distance_mean": 4.1420,
+        "directional_spectrum_error_norm_mean": 0.0107,
+        "failure_any_mean": 0.3438,
+        "false_hotspot_density_mean": 0.000651,
+        "stripe_excess_mean": -0.0290,
+        "mae_mean": 0.0516,
+        "ssim_mean": 0.9058,
+    }
+    c1_like_candidate = {
+        "lesion_topq_peak_error_norm_mean": 0.0587,
+        "lesion_peak_error_norm_mean": 0.0920,
+        "lesion_centroid_distance_mean": 4.1009,
+        "directional_spectrum_error_norm_mean": 0.0152,
+        "failure_any_mean": 0.015625,
+        "false_hotspot_density_mean": 0.000588,
+        "stripe_excess_mean": 0.0198,
+        "mae_mean": 0.0419,
+        "ssim_mean": 0.9267,
+    }
+
+    passed, reasons = passes_hard_gates(
+        c1_like_candidate, reference, gates
+    )
+    assert passed is True
+    assert reasons == []
+
+    unsafe_candidate = dict(c1_like_candidate, failure_any_mean=0.25)
+    passed, reasons = passes_hard_gates(unsafe_candidate, reference, gates)
+    assert passed is False
+    assert any("failure_any_mean" in reason for reason in reasons)
 
 
 def test_v5_exact_epoch_validation_reads_checkpoint_metadata(tmp_path):
@@ -995,6 +1069,33 @@ def test_v5_final_comparison_requires_300_epoch_reference_in_promotion_records(t
         )
 
 
+def test_v5_reference_only_promotion_writes_valid_empty_comparison(tmp_path):
+    import json
+
+    from scripts.run_spectral_router_v5 import _write_promotion_outputs
+
+    plan = {
+        "output_dir": str(tmp_path),
+        "stage_b": {"reference_id": "T_native", "hard_gates": {}},
+        "paired_comparison": {"metrics": {}, "seed": 42, "resamples": 10},
+    }
+    _write_promotion_outputs(
+        plan,
+        [{"id": "T_native", "metrics": {}}],
+        {"selected_evidence_id": "S3", "promoted": []},
+    )
+
+    final_decision = json.loads(
+        (tmp_path / "final_gate_decision.json").read_text(encoding="utf-8")
+    )
+    paired = json.loads(
+        (tmp_path / "paired_comparison.json").read_text(encoding="utf-8")
+    )
+    assert final_decision["accepted"] == []
+    assert [row["id"] for row in final_decision["ranked"]] == ["T_native"]
+    assert paired["comparisons"] == []
+
+
 def test_v5_final_comparison_uses_300_epoch_reference_only(tmp_path):
     import json
 
@@ -1063,7 +1164,12 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
         "configs/experiments/slmf_png_spectral_router_v5.yaml",
         ablation=preset,
         ablation_config_path="configs/experiments/ablations.yaml",
-        overrides=["data.image_size=32", "runtime.eval_sampling_steps=2"],
+        overrides=[
+            "data.image_size=32",
+            "runtime.eval_sampling_steps=2",
+            "modules.conditional_mean.freeze=false",
+            "modules.conditional_mean.checkpoint=null",
+        ],
     )
     model = SLMFBBDM.from_config(cfg)
     frequency = cfg["modules"]["residual_frequency"]
@@ -1108,16 +1214,139 @@ def test_v5_spectral_router_presets_resolve_exact_factors_and_forward(
     assert "loss/frequency_gate_tv/available" not in logs
 
 
-def test_v5_split_manifest_resolves_from_repo_root():
+def test_v5_data_paths_are_portable_and_overrideable():
     import yaml
 
     repo_root = Path(__file__).resolve().parents[1]
     config_path = repo_root / "configs/experiments/slmf_png_spectral_router_v5.yaml"
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-    split_manifest = repo_root / cfg["data"]["split_manifest"]
+    split_manifest = Path(cfg["data"]["split_manifest"])
+    cache_dir = Path(cfg["data"]["cache_dir"])
+    assert not split_manifest.is_absolute()
+    assert not cache_dir.is_absolute()
+    assert split_manifest.suffix.lower() == ".csv"
 
-    assert split_manifest.is_file()
+    from scripts.run_spectral_router_v5 import build_v5_dry_run_manifest
+
+    plan = yaml.safe_load(
+        (repo_root / "configs/experiments/spectral_router_ablation_plan_v5.yaml")
+        .read_text(encoding="utf-8")
+    )
+    plan["common_train_overrides"].update(
+        {
+            "data.split_manifest": "/cloud/data/main_data/split_manifest.csv",
+            "data.cache_dir": "/cloud/data/cache/tensors_main",
+            "modules.conditional_mean.checkpoint": (
+                "/cloud/artifacts/freq_mean_pretrain_v2/mean_best.pt"
+            ),
+        }
+    )
+    manifest = build_v5_dry_run_manifest(plan, python="python")
+    for phase in ("stage_a_runs", "stage_b_runs", "promotion_runs"):
+        for entry in manifest[phase]:
+            command = entry["train_command"]
+            assert (
+                "data.split_manifest=/cloud/data/main_data/split_manifest.csv"
+                in command
+            )
+            assert "data.cache_dir=/cloud/data/cache/tensors_main" in command
+            assert (
+                "modules.conditional_mean.checkpoint="
+                "/cloud/artifacts/freq_mean_pretrain_v2/mean_best.pt"
+            ) in command
+
+
+def test_v5_trajectory_requires_every_whitelisted_checkpoint(
+    tmp_path, monkeypatch
+):
+    from scripts import evaluate_v5_checkpoint_trajectory as trajectory_module
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    config_path = experiment_dir / "resolved_config.yaml"
+    config_path.write_text("experiment: {name: test}\n", encoding="utf-8")
+    for epoch in (50, 100, 200, 300):
+        (experiment_dir / f"ckpt_epoch{epoch:04d}.pt").touch()
+
+    def reject_evaluation(*args, **kwargs):
+        raise AssertionError("checkpoint validation must happen before evaluation")
+
+    monkeypatch.setattr(
+        trajectory_module, "evaluate_checkpoint", reject_evaluation
+    )
+    with pytest.raises(FileNotFoundError) as exc_info:
+        trajectory_module.collect_trajectory(
+            experiment_dir,
+            config_path,
+            whitelist_epochs=[50, 100, 150, 200, 250, 300],
+        )
+
+    message = str(exc_info.value)
+    assert "ckpt_epoch0150" in message
+    assert "ckpt_epoch0250" in message
+
+
+def test_v5_trajectory_collects_exact_whitelist_and_best_checkpoints(
+    tmp_path, monkeypatch
+):
+    from scripts import evaluate_v5_checkpoint_trajectory as trajectory_module
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    config_path = experiment_dir / "resolved_config.yaml"
+    config_path.write_text("experiment: {name: test}\n", encoding="utf-8")
+    for label in (
+        "ckpt_epoch0050",
+        "ckpt_epoch0100",
+        "ckpt_epoch0150",
+        "ckpt_best_lesion",
+        "ckpt_best_combined",
+    ):
+        (experiment_dir / f"{label}.pt").touch()
+
+    evaluated = []
+
+    def fake_evaluation(config, checkpoint, **kwargs):
+        evaluated.append(checkpoint.stem)
+        return {"aggregate": {"mae_mean": 0.1}}
+
+    monkeypatch.setattr(
+        trajectory_module, "evaluate_checkpoint", fake_evaluation
+    )
+    trajectory = trajectory_module.collect_trajectory(
+        experiment_dir,
+        config_path,
+        whitelist_epochs=[50, 100],
+    )
+
+    assert set(trajectory["results"]) == {
+        "ckpt_epoch0050",
+        "ckpt_epoch0100",
+        "ckpt_best_lesion",
+        "ckpt_best_combined",
+    }
+    assert set(evaluated) == set(trajectory["results"])
+
+
+def test_v5_trajectory_cli_help_runs_from_repo_root():
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/evaluate_v5_checkpoint_trajectory.py",
+            "--help",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--experiment-dir" in completed.stdout
+    assert "--config" in completed.stdout
+    assert "--epochs" in completed.stdout
 
 
 def test_paired_report_is_deterministic_and_handles_small_intersections(tmp_path):

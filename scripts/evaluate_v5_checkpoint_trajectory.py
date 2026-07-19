@@ -9,9 +9,12 @@ Output one JSON per experiment in
 
 Usage:
     python scripts/evaluate_v5_checkpoint_trajectory.py \
-        --experiment-dir results/spectral_router_ablations_v5/promote/evidence-s3/t_native \
-        --config configs/experiments/slmf_png_spectral_router_v5.yaml \
+        --experiment-dir checkpoints/sr_v5_full_evidence-s3_t_native \
         --output-dir results/spectral_router_ablations_v5/trajectory
+
+The script auto-detects ``{experiment-dir}/resolved_config.yaml``
+so ``--config`` is not needed when the checkpoint directory follows the
+standard layout.  Epoch filtering defaults to 50/100/150/200/250/300.
 """
 
 from __future__ import annotations
@@ -40,13 +43,6 @@ def _find_checkpoints(experiment_dir: Path) -> Dict[str, Path]:
             stem = ckpt.stem  # e.g. ckpt_epoch0050, ckpt_best_lesion
             checkpoints[stem] = ckpt
     return checkpoints
-
-
-def _trajectory_epochs(plan_config: Dict[str, Any]) -> List[int]:
-    """Return the ordered checkpoint epochs to evaluate."""
-    promote = plan_config.get("promote", {})
-    raw = promote.get("trajectory_checkpoints", [50, 100, 150, 200, 250, 300])
-    return sorted(int(e) for e in raw)
 
 
 def evaluate_checkpoint(
@@ -123,6 +119,21 @@ def collect_trajectory(
     allowed_epochs: Optional[set[int]] = (
         set(whitelist_epochs) if whitelist_epochs is not None else None
     )
+
+    # Guard: fail early when required checkpoints are missing from disk
+    if allowed_epochs is not None:
+        expected_labels = {f"ckpt_epoch{e:04d}" for e in allowed_epochs}
+        found_epoch_labels = {
+            label
+            for label in checkpoints
+            if label.startswith("ckpt_epoch")
+        }
+        missing = sorted(expected_labels - found_epoch_labels)
+        if missing:
+            raise FileNotFoundError(
+                "Missing required trajectory checkpoints: "
+                + ", ".join(missing)
+            )
 
     # Evaluate fixed-epoch checkpoints
     for epoch_label, ckpt_path in sorted(checkpoints.items()):
@@ -235,7 +246,10 @@ def main() -> None:
     parser.add_argument(
         "--epochs", type=int, nargs="+",
         default=[50, 100, 150, 200, 250, 300],
-        help="Whitelist of checkpoint epochs to evaluate (default: 50 100 150 200 250 300)",
+        help=(
+            "Whitelist of checkpoint epochs to evaluate "
+            "(default: 50 100 150 200 250 300)."
+        ),
     )
     args = parser.parse_args()
 

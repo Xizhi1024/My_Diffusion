@@ -193,6 +193,46 @@ def test_hard_all_null_short_circuits_before_descriptors_and_projection():
     expected_routes = torch.tensor([[[0.0, 0.0, 1.0]]]).expand(1, 3, 3)
     assert torch.equal(diagnostics["routes_l2"], expected_routes)
     assert torch.equal(diagnostics["routes_l1"], expected_routes)
+    for level in ("l2", "l1"):
+        assert diagnostics[f"route_{level}_active_mass"].item() == 0.0
+        assert diagnostics[f"route_{level}_entropy"].item() == 0.0
+        for statistic in ("mean", "p10", "p50", "p90"):
+            assert diagnostics[f"route_{level}_null_{statistic}"].item() == 1.0
+    for level in range(4):
+        assert diagnostics[f"injection/l{level}_rms"].item() == 0.0
+
+
+def test_learned_no_null_routes_are_two_way_normalized_and_trainable():
+    module = _router(route_policy="learned_no_null", fixed_prior=(0.5, 0.5))
+    residual = torch.randn(2, 1, 32, 32)
+    injections, diagnostics = module(
+        residual,
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        torch.randn_like(residual),
+    )
+
+    assert all(torch.isfinite(value).all() for value in injections)
+    for level in ("l2", "l1"):
+        routes = diagnostics[f"routes_{level}"]
+        assert routes.shape[-1] == 2
+        assert torch.isfinite(routes).all()
+        torch.testing.assert_close(
+            routes.sum(dim=-1),
+            torch.ones_like(routes[..., 0]),
+        )
+        assert not any("null" in key for key in diagnostics if key.startswith(f"route_{level}_"))
+
+    diagnostics["routes_l2"][..., 0].mean().backward()
+    gradients = [
+        parameter.grad
+        for head in module.no_null_route_heads
+        for parameter in head.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(torch.count_nonzero(gradient).item() > 0 for gradient in gradients)
 
 
 def test_router_half_precision_preserves_reference_dtype_and_stays_finite():

@@ -184,9 +184,13 @@ def build_train_command(
     epochs: int,
     seed: int,
     eval_interval: int,
+    save_interval: int | None = None,
+    sample_interval: int | None = None,
     early_stopping_enabled: bool = False,
     extra_overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> List[str]:
+    _save = save_interval if save_interval is not None else eval_interval
+    _sample = sample_interval if sample_interval is not None else eval_interval
     overrides = [
         f"experiment.name={experiment}",
         f"experiment.seed={seed}",
@@ -195,8 +199,8 @@ def build_train_command(
         "training.init_from=null",
         f"runtime.early_stopping.enabled={'true' if early_stopping_enabled else 'false'}",
         f"runtime.eval_interval={eval_interval}",
-        f"runtime.save_interval={eval_interval}",
-        f"runtime.sample_interval={eval_interval}",
+        f"runtime.save_interval={_save}",
+        f"runtime.sample_interval={_sample}",
     ]
     overrides.extend(_normalise_overrides(extra_overrides))
     command = [
@@ -221,7 +225,7 @@ def _override_value(value: Any) -> str:
             value,
             default_flow_style=True,
             sort_keys=False,
-        ).strip()
+        ).strip().replace(", ", ",")
     return str(value)
 
 
@@ -331,6 +335,16 @@ def _run_manifest_entry(
             epochs=int(settings["epochs"]),
             seed=int(settings["seed"]),
             eval_interval=int(settings["eval_interval"]),
+            save_interval=(
+                int(settings["save_interval"])
+                if "save_interval" in settings
+                else None
+            ),
+            sample_interval=(
+                int(settings["sample_interval"])
+                if "sample_interval" in settings
+                else None
+            ),
             early_stopping_enabled=bool(settings.get("early_stopping", False)),
             extra_overrides=_merge_overrides(
                 plan.get("common_train_overrides"), variant.get("overrides")

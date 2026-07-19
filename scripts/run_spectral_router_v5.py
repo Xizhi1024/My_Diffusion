@@ -35,8 +35,6 @@ CROSS_ENABLED_KEY = "modules.residual_frequency.cross_level_router.enabled"
 HARD_NULL_KEY = "modules.residual_frequency.cross_level_router.hard_all_null"
 POLICY_KEY = "modules.residual_frequency.cross_level_router.policy"
 FIXED_PRIOR_KEY = "modules.residual_frequency.cross_level_router.fixed_prior"
-DCT_ENABLED_KEY = "modules.residual_frequency.dct_descriptor.enabled"
-GABOR_ENABLED_KEY = "modules.residual_frequency.gabor_descriptor.enabled"
 
 
 def _evidence_slug(evidence_id: str) -> str:
@@ -108,11 +106,6 @@ def build_stage_b_variants(
             overrides[HARD_NULL_KEY] = False
             if not policy:
                 overrides[POLICY_KEY] = "learned"
-            # S0 disables both descriptors, but C1 is the complete V5 route;
-            # descriptor-bearing S1-S3 continue to inherit their evidence preset.
-            if selected_evidence_id == "S0":
-                overrides[DCT_ENABLED_KEY] = True
-                overrides[GABOR_ENABLED_KEY] = True
         elif variant_id == "C_no_null":
             overrides[CROSS_ENABLED_KEY] = True
             overrides[HARD_NULL_KEY] = False
@@ -229,6 +222,7 @@ def build_v5_dry_run_manifest(
     ][:promotion_count]
     eligible_promotion_variants = [reference_variant] + candidate_variants
     return {
+        "promotion_mode": "maximum_budget",
         "selected_evidence_template": selected_evidence,
         "stage_a_runs": (
             _build_entries(
@@ -293,6 +287,27 @@ def _select_eligible_stage_b_routes(
             and bool(row["gate_passed"])
         )
     ][:limit]
+
+
+def _promotion_route_ids(
+    promoted_routes: Sequence[str],
+    *,
+    reference_id: str,
+    top_k: int,
+) -> set[str]:
+    """Return the reference plus up to ``top_k`` eligible candidates."""
+    candidate_ids: list[str] = []
+    for route_id_value in promoted_routes:
+        route_id = str(route_id_value)
+        if (
+            route_id == reference_id
+            or route_id in _NON_PROMOTABLE_IDS
+            or route_id in candidate_ids
+        ):
+            continue
+        candidate_ids.append(route_id)
+    limit = max(int(top_k), 0)
+    return {reference_id, *candidate_ids[:limit]}
 
 
 def _record_evidence_provenance(
@@ -564,14 +579,19 @@ def main() -> None:
     )
     promoted_routes = list(stage_b_decision.get("promoted", []))
     if not promoted_routes:
-        print("No Stage B route passed; 300-epoch promotion stopped.")
-        return
+        print(
+            "No Stage B candidate passed; promoting the T_native reference "
+            "alone to preserve the matched 300-epoch baseline."
+        )
 
-    promoted_ids = set(promoted_routes[:4])
     # Always include the reference architecture (T_native) in the 300-epoch
     # batch so the final paired comparison uses matched-budget endpoints.
     reference_id = str(plan["stage_b"]["reference_id"])
-    promoted_ids.add(reference_id)
+    promoted_ids = _promotion_route_ids(
+        promoted_routes,
+        reference_id=reference_id,
+        top_k=int(plan["stage_b"].get("top_k", 3)),
+    )
     promotion_variants = [
         row for row in stage_b_variants if row["id"] in promoted_ids
     ]
