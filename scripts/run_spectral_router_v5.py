@@ -433,6 +433,13 @@ def _write_promotion_outputs(
             f"it must be included in the promotion batch for a fair comparison."
         )
     reference = promotion_by_id[reference_id]
+    # Stage B is a short mechanism screen, while promotion is the matched-budget
+    # endpoint.  Allow the endpoint to keep stricter absolute gates without
+    # incorrectly applying them to the short screen.  Older plans retain their
+    # original behaviour through the Stage-B fallback.
+    final_gates = plan.get("promote", {}).get(
+        "hard_gates", plan["stage_b"]["hard_gates"]
+    )
     evidence_id_value = stage_b_decision.get("selected_evidence_id")
     evidence_id = str(evidence_id_value) if evidence_id_value else None
 
@@ -440,7 +447,7 @@ def _write_promotion_outputs(
     accepted = []
     for row in promotion_records:
         passed, reasons = passes_hard_gates(
-            row["metrics"], reference["metrics"], plan["stage_b"]["hard_gates"]
+            row["metrics"], reference["metrics"], final_gates
         )
         final_rows.append({
             **dict(row),

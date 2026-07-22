@@ -1096,6 +1096,278 @@ def test_v5_reference_only_promotion_writes_valid_empty_comparison(tmp_path):
     assert paired["comparisons"] == []
 
 
+def test_v5_promotion_can_use_stricter_endpoint_gates(tmp_path):
+    import json
+
+    from scripts.run_spectral_router_v5 import _write_promotion_outputs
+
+    plan = {
+        "output_dir": str(tmp_path),
+        "stage_b": {
+            "reference_id": "T_native",
+            "hard_gates": {"score": {"direction": "lower", "max_value": 0.8}},
+        },
+        "promote": {
+            "hard_gates": {"score": {"direction": "lower", "max_value": 0.4}}
+        },
+        "paired_comparison": {"metrics": {}, "seed": 42, "resamples": 10},
+    }
+    promote_dir = tmp_path / "promote"
+    promote_dir.mkdir()
+    for result_id in ("t_native", "c1"):
+        (promote_dir / f"{result_id}.json").write_text(
+            json.dumps({"per_patient": {}}), encoding="utf-8"
+        )
+    _write_promotion_outputs(
+        plan,
+        [
+            {"id": "T_native", "metrics": {"score": 0.5}},
+            {"id": "C1", "metrics": {"score": 0.5}},
+        ],
+        {"promoted": ["C1"]},
+    )
+
+    decision = json.loads(
+        (tmp_path / "final_gate_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["accepted"] == []
+    assert all(row["gate_passed"] is False for row in decision["ranked"])
+    assert all("limit 0.4" in row["gate_reasons"][0] for row in decision["ranked"])
+
+
+def test_v6_separates_mechanism_screen_from_endpoint_gates():
+    import yaml
+
+    plan = yaml.safe_load(
+        Path("configs/experiments/spectral_router_repair_plan_v6.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    screen_peak = plan["stage_b"]["hard_gates"][
+        "lesion_topq_peak_error_norm_mean"
+    ]
+    endpoint_peak = plan["promote"]["hard_gates"][
+        "lesion_topq_peak_error_norm_mean"
+    ]
+
+    assert screen_peak == {"direction": "lower", "max_ratio": 0.95}
+    assert endpoint_peak == {
+        "direction": "lower",
+        "max_value": 0.12,
+        "max_ratio": 0.90,
+    }
+
+
+def test_frequency_runner_can_evaluate_exact_final_checkpoint(tmp_path):
+    from scripts.run_frequency_ablations import _run_manifest_entry
+
+    plan = {
+        "base_config": "base.yaml",
+        "ablation_config": "ablations.yaml",
+        "output_dir": str(tmp_path),
+    }
+    settings = {
+        "experiment_prefix": "exact",
+        "epochs": 30,
+        "seed": 42,
+        "eval_interval": 10,
+        "max_samples": 64,
+        "mc_steps": 20,
+        "require_final_checkpoint": True,
+        "evaluate_final_checkpoint": True,
+    }
+
+    entry = _run_manifest_entry(
+        plan,
+        {"id": "CTRL", "preset": "sr_v5_s3"},
+        settings,
+        python="python",
+        phase="screen",
+    )
+
+    assert entry["checkpoint"].endswith("exact_ctrl\\ckpt_epoch0030.pt")
+    checkpoint_arg = entry["eval_command"].index("--checkpoint") + 1
+    assert entry["eval_command"][checkpoint_arg] == entry["checkpoint"]
+
+
+def test_frequency_runner_writes_optional_paired_results(tmp_path):
+    import json
+
+    from scripts.run_frequency_ablations import _write_paired_results
+
+    result_dir = tmp_path / "screen"
+    result_dir.mkdir()
+    entries = []
+    for result_id, values in (("CTRL", (1.0, 2.0)), ("COLD", (0.5, 1.5))):
+        path = result_dir / f"{result_id.lower()}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "per_patient": {
+                        "p0": {"score": values[0]},
+                        "p1": {"score": values[1]},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        entries.append({"id": result_id, "result": str(path)})
+    plan = {
+        "output_dir": str(tmp_path),
+        "paired_comparison": {
+            "seed": 42,
+            "resamples": 10,
+            "metrics": {"score": "lower"},
+        },
+    }
+
+    _write_paired_results(plan, entries, phase="screen")
+
+    report = json.loads(
+        (tmp_path / "screen_paired_comparison.json").read_text(encoding="utf-8")
+    )
+    comparison = report["comparisons"][0]
+    assert {comparison["left_id"], comparison["right_id"]} == {"CTRL", "COLD"}
+    assert comparison["metrics"]["score"]["paired_patients"] == 2
+
+
+def test_v7_cold_bias_plan_is_a_common_checkpoint_causal_screen():
+    import yaml
+
+    plan = yaml.safe_load(
+        Path(
+            "configs/experiments/spectral_router_cold_bias_plan_v7.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    variants = {row["id"]: row for row in plan["variants"]}
+    common = plan["common_train_overrides"]
+
+    assert set(variants) == {
+        "CTRL",
+        "COLD",
+        "CT_RELAX",
+        "COLD_ALIGN",
+        "COLD_RANK",
+    }
+    assert common["training.init_from"].endswith(
+        "sr_v6_confirm_evidence-s3_c1/ckpt_epoch0100.pt"
+    )
+    assert common[
+        "modules.residual_frequency.cross_level_router.native_warmup_epochs"
+    ] == 0
+    assert plan["screen"]["require_final_checkpoint"] is True
+    assert plan["screen"]["evaluate_final_checkpoint"] is True
+    assert variants["CTRL"].get("overrides") is None
+    assert variants["COLD"]["overrides"] == {
+        "losses.normalized_lesion_peak.weight": 0.20,
+        "losses.normalized_lesion_peak.cold_weight": 2.0,
+        "losses.normalized_lesion_peak.active_tau_max": 0.55,
+    }
+    assert variants["CT_RELAX"]["overrides"] == {
+        "modules.residual_frequency.ct_reliability_floor_l2": 0.10,
+        "modules.residual_frequency.ct_reliability_floor_l1": 0.25,
+    }
+    assert plan["paired_comparison"]["metrics"][
+        "small_lesion_cold_bias_norm_mean"
+    ] == "lower"
+    assert plan["promotion_hard_gates"][
+        "small_lesion_topq_peak_error_norm_mean"
+    ]["max_ratio"] == 1.0
+
+
+def test_frequency_runner_writes_optional_final_gate_results(tmp_path):
+    import json
+
+    from scripts.run_frequency_ablations import _write_final_gate_results
+
+    plan = {
+        "output_dir": str(tmp_path),
+        "reference_id": "CTRL",
+        "top_k": 1,
+        "promotion_hard_gates": {
+            "lesion_topq_peak_error_norm_mean": {
+                "direction": "lower",
+                "max_value": 0.12,
+            }
+        },
+    }
+    common_metrics = {
+        "lesion_peak_error_norm_mean": 0.10,
+        "lesion_centroid_distance_mean": 3.0,
+        "failure_any_mean": 0.10,
+        "false_hotspot_density_mean": 0.0001,
+        "stripe_excess_mean": 0.0,
+        "ssim_mean": 0.95,
+        "mae_mean": 0.02,
+        "lesion_boundary_gradient_mae_norm_mean": 0.10,
+        "anatomy_edge_gradient_mae_norm_mean": 0.05,
+        "directional_spectrum_error_norm_mean": 0.01,
+    }
+    records = [
+        {
+            "id": "CTRL",
+            "preset": "base",
+            "metrics": {
+                **common_metrics,
+                "lesion_topq_peak_error_norm_mean": 0.15,
+            },
+        },
+        {
+            "id": "GOOD",
+            "preset": "candidate",
+            "metrics": {
+                **common_metrics,
+                "lesion_topq_peak_error_norm_mean": 0.11,
+            },
+        },
+    ]
+
+    _write_final_gate_results(plan, records)
+
+    decision = json.loads(
+        (tmp_path / "final_gate_decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["accepted"] == ["GOOD"]
+    assert decision["reference_id"] == "CTRL"
+    assert (tmp_path / "promotion" / "leaderboard.csv").exists()
+
+
+def test_v8_final_calibration_uses_v7_ema_and_independent_confirmation_seed():
+    import yaml
+
+    plan = yaml.safe_load(
+        Path(
+            "configs/experiments/spectral_router_final_calibration_plan_v8.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    common = plan["common_train_overrides"]
+    variants = {row["id"]: row for row in plan["variants"]}
+
+    assert common["training.init_from"].endswith(
+        "sr_v7_confirm_cold_rank/ckpt_epoch0050.pt"
+    )
+    assert common["training.init_weights"] == "ema"
+    assert common["training.learning_rate"] == pytest.approx(2e-5)
+    assert set(variants) == {
+        "CAL_CTRL",
+        "PEAK25",
+        "PEAK_WIDE",
+        "BALANCED",
+        "TOPK18",
+    }
+    assert plan["screen"]["epochs"] == 12
+    assert plan["screen"]["seed"] == 42
+    assert plan["promote"]["epochs"] == 12
+    assert plan["promote"]["seed"] == 43
+    assert plan["hard_gates"]["lesion_topq_peak_error_norm_mean"] == {
+        "direction": "lower",
+        "max_ratio": 0.98,
+    }
+    assert plan["promotion_hard_gates"][
+        "lesion_topq_peak_error_norm_mean"
+    ] == {"direction": "lower", "max_value": 0.12}
+
+
 def test_v5_final_comparison_uses_300_epoch_reference_only(tmp_path):
     import json
 

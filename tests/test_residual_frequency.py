@@ -12,6 +12,57 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+def test_bbdm_ddim_step_preserves_inferred_noise_trajectory():
+    from src.model.noise.base import BBDMBridgeSchedule
+    from src.model.slmf_bbdm import _bbdm_ddim_step
+
+    schedule = BBDMBridgeSchedule(num_train_timesteps=100)
+    source = torch.randn(2, 1, 8, 8)
+    pred_x0 = torch.randn_like(source)
+    epsilon = torch.randn_like(source)
+    timesteps = torch.tensor([90, 60], dtype=torch.long)
+    next_timesteps = torch.tensor([70, 20], dtype=torch.long)
+
+    def _coefficients(indices):
+        m = schedule.m_t[indices].view(-1, 1, 1, 1)
+        sigma = schedule.sigma_t[indices].view(-1, 1, 1, 1)
+        return m, sigma
+
+    m_t, sigma_t = _coefficients(timesteps)
+    m_next, sigma_next = _coefficients(next_timesteps)
+    x_t = m_t * source + (1.0 - m_t) * pred_x0 + sigma_t * epsilon
+    expected = (
+        m_next * source + (1.0 - m_next) * pred_x0 + sigma_next * epsilon
+    )
+
+    actual = _bbdm_ddim_step(
+        schedule, x_t, pred_x0, source, timesteps, next_timesteps
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_bbdm_ddim_step_does_not_drop_nonzero_noise():
+    from src.model.noise.base import BBDMBridgeSchedule
+    from src.model.slmf_bbdm import _bbdm_ddim_step
+
+    schedule = BBDMBridgeSchedule(num_train_timesteps=100)
+    source = torch.zeros(1, 1, 4, 4)
+    pred_x0 = torch.zeros_like(source)
+    timesteps = torch.tensor([80], dtype=torch.long)
+    next_timesteps = torch.tensor([40], dtype=torch.long)
+    sigma_t = schedule.sigma_t[timesteps].view(1, 1, 1, 1)
+    x_t = sigma_t * torch.ones_like(source)
+
+    actual = _bbdm_ddim_step(
+        schedule, x_t, pred_x0, source, timesteps, next_timesteps
+    )
+
+    expected_sigma = schedule.sigma_t[next_timesteps].item()
+    assert actual.abs().mean().item() == pytest.approx(expected_sigma, rel=1e-5)
+    assert torch.count_nonzero(actual).item() == actual.numel()
+
+
 def _residual_config(*, frequency=True, gabor=True, mean_weight=1.0):
     return {
         "experiment": {"name": "residual_test", "seed": 42},
@@ -853,6 +904,38 @@ def _loss_context(pred_residual, target_residual, mask, condition=None):
 
 
 class TestResidualFrequencyLosses:
+    def test_spectral_router_active_mass_penalty_targets_learned_collapse(self):
+        from src.model.interfaces import ConditionBundle
+        from src.model.loss_terms.spectral_router import (
+            SpectralRouterRegularizationLoss,
+        )
+
+        prediction = torch.zeros(1, 1, 8, 8)
+        condition = ConditionBundle(scalars={
+            "spectral_route_active_mass": torch.tensor(0.10),
+            "spectral_route_is_learned": torch.tensor(1.0),
+        })
+        term = SpectralRouterRegularizationLoss(
+            temporal_weight=0.0,
+            dct_weight=0.0,
+            gabor_weight=0.0,
+            active_mass_weight=2.0,
+            active_mass_floor=0.30,
+        )
+
+        loss, logs = term(
+            _loss_context(prediction, prediction, torch.zeros_like(prediction), condition)
+        )
+
+        assert loss.item() == pytest.approx(2.0 * (0.30 - 0.10) ** 2)
+        assert logs["spectral_router_regularization/active_mass"].item() == pytest.approx(0.10)
+
+        condition.scalars["spectral_route_is_learned"] = torch.tensor(0.0)
+        diagnostic_loss, _ = term(
+            _loss_context(prediction, prediction, torch.zeros_like(prediction), condition)
+        )
+        assert diagnostic_loss.item() == 0.0
+
     def test_residual_wavelet_loss_is_lesion_weighted_and_mask_optional(self):
         from src.model.loss_terms.residual_frequency import ResidualWaveletLoss
 

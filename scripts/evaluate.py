@@ -27,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -529,6 +530,7 @@ def compute_normalized_lesion_metrics(
         "lesion_topq_peak_pred_norm": float("nan"),
         "lesion_topq_peak_target_norm": float("nan"),
         "lesion_topq_peak_signed_bias_norm": float("nan"),
+        "lesion_topq_cold_bias_norm": float("nan"),
         "lesion_topq_peak_error_norm": float("nan"),
         "lesion_peak_overestimated": float("nan"),
         "lesion_peak_underestimated": float("nan"),
@@ -619,6 +621,9 @@ def compute_normalized_lesion_metrics(
 
     return {
         **peak_metrics,
+        "lesion_topq_cold_bias_norm": max(
+            -float(peak_metrics["lesion_topq_peak_signed_bias_norm"]), 0.0
+        ),
         "lesion_mean_error_norm": float(abs(pred_mean - target_mean)),
         "lesion_to_background_ratio_norm": float(abs(pred_tbr - target_tbr)),
         "lesion_core_fallback": float(core_fallback),
@@ -715,6 +720,74 @@ def _append_calibration_summary(summary: Dict[str, Any], all_metrics: List[Dict[
         summary.update(compute_calibration_metrics(np.asarray(pred_values), np.asarray(target_values), prefix=prefix))
 
 
+def _annotate_small_lesion_metrics(
+    all_metrics: List[Dict[str, Any]],
+    quantile: float = 0.25,
+    underestimate_tolerance: float = 0.05,
+) -> Dict[str, Any]:
+    """Annotate the smallest lesion-area quantile without leaking model output.
+
+    The threshold depends only on ground-truth mask area and is shared by every
+    model evaluated on the same deterministic subset.  Derived keys are named so
+    the normal per-patient aggregation produces the fields consumed by paired
+    comparison plans.
+    """
+    if not 0.0 < quantile <= 1.0:
+        raise ValueError("small-lesion quantile must be in (0, 1]")
+    if not 0.0 <= underestimate_tolerance <= 1.0:
+        raise ValueError("small-lesion underestimate tolerance must be in [0, 1]")
+
+    areas = sorted(
+        float(row["lesion_size"])
+        for row in all_metrics
+        if isinstance(row.get("lesion_size"), (int, float))
+        and np.isfinite(float(row["lesion_size"]))
+        and float(row["lesion_size"]) > 0.0
+    )
+    if not areas:
+        return {
+            "small_lesion_quantile": float(quantile),
+            "small_lesion_underestimate_tolerance": float(
+                underestimate_tolerance
+            ),
+            "small_lesion_area_threshold": None,
+            "small_lesion_sample_count": 0,
+        }
+
+    cutoff_index = min(max(math.ceil(len(areas) * quantile) - 1, 0), len(areas) - 1)
+    threshold = float(areas[cutoff_index])
+    small_count = 0
+    for row in all_metrics:
+        area_value = row.get("lesion_size")
+        is_small = (
+            isinstance(area_value, (int, float))
+            and np.isfinite(float(area_value))
+            and 0.0 < float(area_value) <= threshold
+        )
+        row["small_lesion"] = float(is_small)
+        if not is_small:
+            continue
+        small_count += 1
+        topq_error = row.get("lesion_topq_peak_error_norm")
+        signed_bias = row.get("lesion_topq_peak_signed_bias_norm")
+        if isinstance(topq_error, (int, float)) and np.isfinite(float(topq_error)):
+            row["small_lesion_topq_peak_error_norm"] = float(topq_error)
+        if isinstance(signed_bias, (int, float)) and np.isfinite(float(signed_bias)):
+            # Positive magnitude of cold bias; lower is unambiguously better.
+            row["small_lesion_cold_bias_norm"] = max(-float(signed_bias), 0.0)
+        if isinstance(signed_bias, (int, float)) and np.isfinite(float(signed_bias)):
+            row["small_lesion_underestimate"] = float(
+                float(signed_bias) < -underestimate_tolerance
+            )
+
+    return {
+        "small_lesion_quantile": float(quantile),
+        "small_lesion_underestimate_tolerance": float(underestimate_tolerance),
+        "small_lesion_area_threshold": threshold,
+        "small_lesion_sample_count": int(small_count),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
@@ -729,6 +802,8 @@ def evaluate(
     mc_samples: int = 1,
     mc_steps: Optional[int] = None,
     failure_thresholds: Optional[Dict[str, float]] = None,
+    small_lesion_quantile: float = 0.25,
+    small_lesion_underestimate_tolerance: float = 0.05,
 ) -> Dict[str, Any]:
     """Run full evaluation over a dataloader."""
     model.eval()
@@ -856,6 +931,22 @@ def evaluate(
         if batch_idx % 10 == 0:
             print(f"  Evaluated {batch_idx + 1} batches ({len(all_metrics)} samples)")
 
+    # Derive mask-area-only small-lesion strata before global and patient-level
+    # aggregation. patient_results holds the same row objects as all_metrics.
+    small_lesion_info = _annotate_small_lesion_metrics(
+        all_metrics,
+        quantile=small_lesion_quantile,
+        underestimate_tolerance=small_lesion_underestimate_tolerance,
+    )
+    for row in all_metrics:
+        for key, value in row.items():
+            if (
+                key.startswith("small_lesion_")
+                and isinstance(value, (int, float))
+                and np.isfinite(float(value))
+            ):
+                results[key].append(float(value))
+
     # ---- Aggregate statistics ----
     summary: Dict[str, Any] = {
         "num_samples": len(all_metrics),
@@ -865,6 +956,7 @@ def evaluate(
         "physical_suv_available": bool(
             any(row.get("suv_valid", 0) > 0 for row in all_metrics)
         ),
+        **small_lesion_info,
     }
 
     for metric_name, values in results.items():
@@ -913,6 +1005,9 @@ def print_report(summary: Dict[str, Any]) -> None:
         ("Normalized-Intensity Lesion ([-1,1] space, no SUV)",
          ["lesion_peak_error_norm", "lesion_mean_error_norm",
           "lesion_to_background_ratio_norm", "lesion_centroid_distance"]),
+        ("Small-Lesion Stratum (mask-area bottom quantile)",
+         ["small_lesion_topq_peak_error_norm", "small_lesion_cold_bias_norm",
+          "small_lesion_underestimate"]),
         ("Clinical SUV (lesion ROI)", ["suv_max_error", "suv_mean_error", "tbr_error",
                                         "pred_suv_max", "target_suv_max"]),
         ("SUV Calibration", ["suv_calib_slope", "suv_calib_intercept", "suv_calib_r2",
@@ -975,6 +1070,10 @@ def main():
     ap.add_argument("--mc-steps", type=int, default=None, help="Sampling steps for evaluation/MC sampling")
     ap.add_argument("--failure-outside-margin", type=float, default=None)
     ap.add_argument("--failure-lesion-ratio", type=float, default=None)
+    ap.add_argument("--small-lesion-quantile", type=float, default=None)
+    ap.add_argument(
+        "--small-lesion-underestimate-tolerance", type=float, default=None
+    )
     ap.add_argument("--failure-uncertainty-ratio", type=float, default=None)
     ap.add_argument(
         "--allow-train-fallback",
@@ -1013,6 +1112,16 @@ def main():
         args.failure_uncertainty_ratio
         if args.failure_uncertainty_ratio is not None
         else failure_cfg.get("uncertainty_ratio_threshold", 2.0)
+    )
+    small_lesion_quantile = (
+        args.small_lesion_quantile
+        if args.small_lesion_quantile is not None
+        else eval_cfg.get("small_lesion_quantile", 0.25)
+    )
+    small_lesion_underestimate_tolerance = (
+        args.small_lesion_underestimate_tolerance
+        if args.small_lesion_underestimate_tolerance is not None
+        else eval_cfg.get("small_lesion_underestimate_tolerance", 0.05)
     )
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1081,6 +1190,10 @@ def main():
             "lesion_min_ratio": failure_lesion_ratio,
             "uncertainty_ratio_threshold": failure_uncertainty_ratio,
         },
+        small_lesion_quantile=small_lesion_quantile,
+        small_lesion_underestimate_tolerance=(
+            small_lesion_underestimate_tolerance
+        ),
     )
 
     print_report(summary)

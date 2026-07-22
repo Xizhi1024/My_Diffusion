@@ -233,6 +233,8 @@ segmenter:
 evaluation:
   mc_samples: 1
   physical_suv_available: false
+  small_lesion_quantile: 0.25
+  small_lesion_underestimate_tolerance: 0.05
   failure_detection:
     outside_margin: 0.05
     lesion_min_ratio: 0.6

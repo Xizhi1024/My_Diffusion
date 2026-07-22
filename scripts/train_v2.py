@@ -39,6 +39,25 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _select_initial_model_state(checkpoint: dict, weights: str = "raw") -> dict:
+    """Select raw or EMA model weights for optimizer-fresh fine-tuning."""
+    raw_state = checkpoint.get("model", checkpoint)
+    if weights == "raw":
+        return raw_state
+    if weights != "ema":
+        raise ValueError("training.init_weights must be 'raw' or 'ema'")
+    for key in ("ema_model", "model_ema"):
+        state = checkpoint.get(key)
+        if isinstance(state, dict):
+            return state
+    ema_state = checkpoint.get("ema")
+    if isinstance(ema_state, dict) and isinstance(ema_state.get("shadow"), dict):
+        merged = dict(raw_state)
+        merged.update(ema_state["shadow"])
+        return merged
+    raise KeyError("EMA init requested, but checkpoint contains no EMA weights")
+
+
 def _save_run_metadata(model: SLMFBBDM, config: dict, ckpt_dir: str, ablation: str | None) -> None:
     """Persist the experiment/module state needed to reproduce an ablation run."""
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -88,6 +107,7 @@ def _save_run_metadata(model: SLMFBBDM, config: dict, ckpt_dir: str, ablation: s
         "ablation": ablation,
         "training_stage": training_stage,
         "init_from": training_cfg.get("init_from"),
+        "init_weights": training_cfg.get("init_weights", "raw"),
         "resume_from": training_cfg.get("resume_from"),
         "enabled_modules": enabled_modules,
         "enabled_losses": enabled_losses,
@@ -156,9 +176,13 @@ def main():
     if init_from:
         if not os.path.exists(init_from):
             raise FileNotFoundError(f"training.init_from checkpoint not found: {init_from}")
-        print(f"Loading model weights from {init_from} (optimizer/EMA fresh)...")
+        init_weights = str(training_cfg.get("init_weights", "raw"))
+        print(
+            f"Loading {init_weights} model weights from {init_from} "
+            "(optimizer/EMA fresh)..."
+        )
         ckpt = torch.load(init_from, map_location="cpu", weights_only=True)
-        model.load_state_dict(ckpt["model"])
+        model.load_state_dict(_select_initial_model_state(ckpt, init_weights))
         print("  loaded.")
 
     enabled_priors = [n for n, p in model.priors.items() if p.enabled]

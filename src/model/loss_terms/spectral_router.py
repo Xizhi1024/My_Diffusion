@@ -19,11 +19,19 @@ class SpectralRouterRegularizationLoss(LossTerm):
         temporal_weight: float = 1e-4,
         dct_weight: float = 1e-4,
         gabor_weight: float = 1e-4,
+        active_mass_weight: float = 0.0,
+        active_mass_floor: float = 0.25,
     ) -> None:
         super().__init__(enabled=enabled, weight=weight)
         self.temporal_weight = float(temporal_weight)
         self.dct_weight = float(dct_weight)
         self.gabor_weight = float(gabor_weight)
+        self.active_mass_weight = float(active_mass_weight)
+        self.active_mass_floor = float(active_mass_floor)
+        if self.active_mass_weight < 0:
+            raise ValueError("active_mass_weight must be non-negative")
+        if not 0.0 <= self.active_mass_floor <= 1.0:
+            raise ValueError("active_mass_floor must be in [0, 1]")
 
     def forward(self, ctx: LossContext) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         zero = ctx.target_pet.new_zeros(())
@@ -40,15 +48,29 @@ class SpectralRouterRegularizationLoss(LossTerm):
         gabor = ctx.condition.scalars.get(
             "spectral_gabor_parameter_offset", zero
         ).mean()
+        active_mass = ctx.condition.scalars.get(
+            "spectral_route_active_mass", zero
+        ).mean()
+        is_learned = ctx.condition.scalars.get(
+            "spectral_route_is_learned", zero
+        ).mean()
+        active_mass_penalty = (
+            torch.relu(active_mass.new_tensor(self.active_mass_floor) - active_mass)
+            .square()
+            * is_learned
+        )
         raw = (
             self.temporal_weight * temporal
             + self.dct_weight * dct
             + self.gabor_weight * gabor
+            + self.active_mass_weight * active_mass_penalty
         )
         return self.weight * raw, {
             f"{self.name}/enabled": torch.ones_like(zero),
             f"{self.name}/temporal": temporal.detach(),
             f"{self.name}/dct": dct.detach(),
             f"{self.name}/gabor": gabor.detach(),
+            f"{self.name}/active_mass": active_mass.detach(),
+            f"{self.name}/active_mass_penalty": active_mass_penalty.detach(),
             f"{self.name}/loss": raw.detach(),
         }

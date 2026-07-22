@@ -60,8 +60,10 @@ class ConservativeRouteHead(nn.Module):
         initial_null_probability: float = 0.90,
     ) -> None:
         super().__init__()
-        if not 0.5 < initial_null_probability < 1.0:
-            raise ValueError("initial_null_probability must be between 0.5 and 1")
+        if not 0.5 <= initial_null_probability < 1.0:
+            raise ValueError(
+                "initial_null_probability must be in the interval [0.5, 1)"
+            )
 
         self.features = nn.Sequential(
             nn.Linear(input_features, hidden_channels),
@@ -186,6 +188,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         amplitude_delta_max: float = 0.10,
         route_policy: str = "learned",
         fixed_prior: Sequence[float] = (0.05, 0.05, 0.90),
+        native_warmup_epochs: int = 0,
+        routing_ramp_epochs: int = 0,
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
@@ -204,6 +208,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             raise ValueError(
                 f"fixed_prior must sum to 1.0, got {prior_sum}"
             )
+        if native_warmup_epochs < 0 or routing_ramp_epochs < 0:
+            raise ValueError("routing warmup and ramp epochs must be non-negative")
         base_kwargs.pop("use_directional_reliability", None)
         base_kwargs.pop("use_gabor_agreement", None)
         super().__init__(
@@ -221,11 +227,24 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.hard_all_null = bool(hard_all_null)
         self.route_policy = route_policy
         self.fixed_prior = tuple(float(p) for p in fixed_prior)
+        self.native_warmup_epochs = int(native_warmup_epochs)
+        self.routing_ramp_epochs = int(routing_ramp_epochs)
 
         # Resolve effective policy when legacy flags are used
         effective_policy = self._resolve_policy()
         self._effective_policy = effective_policy
         self._num_routes = 2 if effective_policy == "learned_no_null" else 3
+        initial_progress = (
+            0.0
+            if effective_policy in {"learned", "learned_no_null"}
+            and self.native_warmup_epochs > 0
+            else 1.0
+        )
+        self.register_buffer(
+            "_routing_progress",
+            torch.tensor(initial_progress, dtype=torch.float32),
+            persistent=False,
+        )
 
         self.dct_descriptor = (
             SelectedDCTDescriptor(pooled_size=8, selected_frequencies=12)
@@ -281,6 +300,42 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             torch.tensor(self._fixed_route_values(), dtype=torch.float32),
             persistent=False,
         )
+
+    @property
+    def routing_progress(self) -> float:
+        return float(self._routing_progress.item())
+
+    def set_routing_progress(self, progress: float) -> None:
+        """Blend learned routes in gradually from the native-only baseline."""
+        value = min(max(float(progress), 0.0), 1.0)
+        self._routing_progress.fill_(value)
+
+    def set_training_epoch(self, epoch: int) -> None:
+        """Apply the configured native warm-up and learned-route ramp."""
+        if self._effective_policy not in {"learned", "learned_no_null"}:
+            return
+        epoch = max(int(epoch), 0)
+        if epoch < self.native_warmup_epochs:
+            self.set_routing_progress(0.0)
+            return
+        if self.routing_ramp_epochs <= 0:
+            self.set_routing_progress(1.0)
+            return
+        progress = (epoch - self.native_warmup_epochs + 1) / self.routing_ramp_epochs
+        self.set_routing_progress(progress)
+
+    def _blend_with_native(self, routes: torch.Tensor) -> torch.Tensor:
+        if self._effective_policy not in {"learned", "learned_no_null"}:
+            return routes
+        progress_value = self.routing_progress
+        if progress_value >= 1.0:
+            return routes
+        progress = self._routing_progress.to(device=routes.device, dtype=routes.dtype)
+        native = torch.zeros_like(routes)
+        native[..., 0] = 1.0
+        if progress_value <= 0.0:
+            return native
+        return native + progress * (routes - native)
 
     def _resolve_policy(self) -> str:
         """Determine the effective route policy from legacy + new configuration."""
@@ -348,7 +403,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
         if policy == "learned_no_null":
             # Two-way learnable router: native vs shallow, no null sink
-            routes = self.no_null_route_heads[level_index](evidence)
+            routes = self._blend_with_native(
+                self.no_null_route_heads[level_index](evidence)
+            )
             next_timestep = (timestep + 1).clamp_max(
                 int(schedule.num_train_timesteps) - 1
             )
@@ -358,13 +415,14 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             ] = self._expanded_next_time_features(
                 next_timestep, schedule, level_index, reference
             )
-            temporal_smoothness = (
-                routes - self.no_null_route_heads[level_index](next_evidence)
-            ).abs().mean()
+            next_routes = self._blend_with_native(
+                self.no_null_route_heads[level_index](next_evidence)
+            )
+            temporal_smoothness = (routes - next_routes).abs().mean()
             return routes, temporal_smoothness
 
         # Learned 3-way policy: compute from evidence
-        routes = self.route_heads[level_index](evidence)
+        routes = self._blend_with_native(self.route_heads[level_index](evidence))
         next_timestep = (timestep + 1).clamp_max(
             int(schedule.num_train_timesteps) - 1
         )
@@ -374,9 +432,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         ] = self._expanded_next_time_features(
             next_timestep, schedule, level_index, reference
         )
-        temporal_smoothness = (
-            routes - self.route_heads[level_index](next_evidence)
-        ).abs().mean()
+        next_routes = self._blend_with_native(
+            self.route_heads[level_index](next_evidence)
+        )
+        temporal_smoothness = (routes - next_routes).abs().mean()
         return routes, temporal_smoothness
 
     @staticmethod
@@ -788,6 +847,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         # Update route diagnostics
         diagnostics.update(
             self._route_diagnostics(routes_l2, routes_l1, current_residual)
+        )
+        diagnostics["route_routing_progress"] = self._routing_progress.to(
+            device=current_residual.device, dtype=current_residual.dtype
         )
 
         scale_l2 = self.band_scales[0].to(current_residual)

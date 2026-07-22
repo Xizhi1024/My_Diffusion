@@ -13,6 +13,56 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.model.trainer import Trainer, _compute_pet_sample_metrics, _stratified_indices
 
 
+def test_spectral_optimizer_groups_assign_learning_rates_and_no_decay():
+    from torch import nn
+
+    from src.model.trainer import _build_optimizer
+
+    class _Preconditioner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection_heads = nn.ModuleList([nn.Linear(2, 2)])
+            self.l2_to_l1_projection = nn.Linear(2, 2)
+            self.route_heads = nn.ModuleList([nn.Linear(2, 3)])
+            self.no_null_route_heads = nn.ModuleList([nn.Linear(2, 2)])
+            self.amplitude_heads = nn.ModuleList([nn.Linear(2, 1)])
+            self.dct_descriptor = nn.Linear(2, 2)
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(2, 2)
+            self.residual_preconditioner = _Preconditioner()
+            self.priors = nn.ModuleDict({"gabor": nn.Linear(2, 2)})
+
+    model = _Model()
+    optimizer = _build_optimizer(model, {
+        "learning_rate": 1e-4,
+        "weight_decay": 0.01,
+        "optimizer_groups": {
+            "enabled": True,
+            "projection_lr": 5e-4,
+            "router_lr": 4e-4,
+            "descriptor_lr": 2e-4,
+            "no_decay_bias_and_offsets": True,
+        },
+    })
+
+    by_parameter = {}
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            assert id(parameter) not in by_parameter
+            by_parameter[id(parameter)] = group
+    assert len(by_parameter) == len(list(model.parameters()))
+    assert by_parameter[id(model.backbone.weight)]["lr"] == pytest.approx(1e-4)
+    assert by_parameter[id(model.residual_preconditioner.projection_heads[0].weight)]["lr"] == pytest.approx(5e-4)
+    assert by_parameter[id(model.residual_preconditioner.route_heads[0].weight)]["lr"] == pytest.approx(4e-4)
+    assert by_parameter[id(model.residual_preconditioner.dct_descriptor.weight)]["lr"] == pytest.approx(2e-4)
+    assert by_parameter[id(model.priors["gabor"].weight)]["lr"] == pytest.approx(2e-4)
+    assert by_parameter[id(model.backbone.bias)]["weight_decay"] == 0.0
+    assert by_parameter[id(model.backbone.weight)]["weight_decay"] == pytest.approx(0.01)
+
+
 def test_signed_pet_metrics_do_not_select_zeroed_mask_background():
     pred = np.full((5, 5), -1.0, dtype=np.float32)
     target = np.full((5, 5), -1.0, dtype=np.float32)
@@ -332,6 +382,57 @@ def test_evaluator_builds_fixed_stratified_lesion_subset():
     assert len(set(indices)) == 16
     assert indices[0] == 0
     assert indices[-1] == 29
+
+
+def test_evaluator_annotates_bottom_quantile_small_lesions():
+    from scripts.evaluate import _annotate_small_lesion_metrics
+
+    rows = [
+        {
+            "lesion_size": area,
+            "lesion_topq_peak_error_norm": error,
+            "lesion_topq_peak_signed_bias_norm": bias,
+            "lesion_peak_underestimated": underestimated,
+        }
+        for area, error, bias, underestimated in (
+            (4.0, 0.30, -0.25, 1.0),
+            (8.0, 0.20, -0.10, 1.0),
+            (16.0, 0.10, 0.05, 0.0),
+            (32.0, 0.05, -0.01, 0.0),
+        )
+    ]
+
+    info = _annotate_small_lesion_metrics(rows, quantile=0.25)
+
+    assert info == {
+        "small_lesion_quantile": 0.25,
+        "small_lesion_underestimate_tolerance": 0.05,
+        "small_lesion_area_threshold": 4.0,
+        "small_lesion_sample_count": 1,
+    }
+    assert rows[0]["small_lesion_topq_peak_error_norm"] == pytest.approx(0.30)
+    assert rows[0]["small_lesion_cold_bias_norm"] == pytest.approx(0.25)
+    assert rows[0]["small_lesion_underestimate"] == pytest.approx(1.0)
+    assert rows[1]["small_lesion"] == 0.0
+    assert "small_lesion_topq_peak_error_norm" not in rows[1]
+
+
+def test_small_lesion_underestimate_ignores_sub_tolerance_cold_bias():
+    from scripts.evaluate import _annotate_small_lesion_metrics
+
+    rows = [
+        {
+            "lesion_size": 4.0,
+            "lesion_topq_peak_error_norm": 0.01,
+            "lesion_topq_peak_signed_bias_norm": -0.01,
+        }
+    ]
+
+    _annotate_small_lesion_metrics(
+        rows, quantile=1.0, underestimate_tolerance=0.05
+    )
+
+    assert rows[0]["small_lesion_underestimate"] == 0.0
 
 
 def test_evaluator_seed_repeats_torch_and_numpy_draws():

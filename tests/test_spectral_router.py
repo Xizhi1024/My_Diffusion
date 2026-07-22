@@ -168,6 +168,49 @@ def test_router_first_forward_is_exact_noop_and_routes_are_conservative():
     assert diagnostics["routes_l1"][..., 2].mean() > 0.89
 
 
+def test_router_allows_balanced_null_prior():
+    module = _router(initial_null_probability=0.50)
+    _, diagnostics = module(
+        torch.randn(2, 1, 32, 32),
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        torch.randn(2, 1, 32, 32),
+    )
+
+    torch.testing.assert_close(
+        diagnostics["routes_l2"][..., 2],
+        torch.full((2, 3), 0.50),
+    )
+
+
+def test_native_warmup_and_ramp_gradually_release_learned_routes():
+    module = _router(
+        initial_null_probability=0.50,
+        native_warmup_epochs=2,
+        routing_ramp_epochs=2,
+    )
+    residual = torch.randn(1, 1, 32, 32)
+    ct = torch.randn_like(residual)
+    args = (residual, torch.tensor([40]), _BridgeSchedule(), ct)
+
+    _, warmup = module(*args)
+    expected_native = torch.tensor([1.0, 0.0, 0.0]).view(1, 1, 3).expand(1, 3, 3)
+    torch.testing.assert_close(warmup["routes_l2"], expected_native)
+    assert warmup["route_routing_progress"].item() == 0.0
+
+    module.set_training_epoch(2)
+    _, halfway = module(*args)
+    expected_halfway = torch.tensor([0.625, 0.125, 0.25]).view(1, 1, 3).expand(1, 3, 3)
+    torch.testing.assert_close(halfway["routes_l2"], expected_halfway)
+    assert halfway["route_routing_progress"].item() == 0.5
+
+    module.set_training_epoch(3)
+    _, released = module(*args)
+    expected_released = torch.tensor([0.25, 0.25, 0.50]).view(1, 1, 3).expand(1, 3, 3)
+    torch.testing.assert_close(released["routes_l2"], expected_released)
+    assert released["route_routing_progress"].item() == 1.0
+
+
 def test_hard_all_null_short_circuits_before_descriptors_and_projection():
     module = _router(hard_all_null=True)
 

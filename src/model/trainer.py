@@ -135,6 +135,7 @@ def _small_lesion_variants(
     pred_in_peak: float,
     lesion_size: int,
     area_quantiles: Optional[tuple[float, float]],
+    underestimate_tolerance: float = 0.05,
 ) -> Dict[str, float]:
     """Compute small-lesion specific metrics when area_quantiles is set."""
     if area_quantiles is None:
@@ -155,7 +156,7 @@ def _small_lesion_variants(
             topq_bias if is_small else 0.0
         ),
         "small_lesion_underestimate": (
-            float(peak_bias < 0.0) if is_small else 0.0
+            float(topq_bias < -underestimate_tolerance) if is_small else 0.0
         ),
         "small_lesion_failure": (
             float(out_peak > pred_in_peak) if is_small else 0.0
@@ -196,6 +197,67 @@ def _fused_adamw(params, lr: float, wd: float) -> torch.optim.AdamW:
         return torch.optim.AdamW(params, lr=lr, weight_decay=wd, fused=True)
     except (TypeError, RuntimeError):
         return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
+
+
+def _spectral_parameter_group(name: str) -> str:
+    """Classify trainable parameters for spectral-router learning rates."""
+    if "residual_preconditioner.projection_heads" in name or (
+        "residual_preconditioner.l2_to_l1_projection" in name
+    ):
+        return "projection"
+    if any(
+        token in name
+        for token in (
+            "residual_preconditioner.route_heads",
+            "residual_preconditioner.no_null_route_heads",
+            "residual_preconditioner.amplitude_heads",
+        )
+    ):
+        return "router"
+    if (
+        "residual_preconditioner.dct_descriptor" in name
+        or "priors.gabor" in name
+    ):
+        return "descriptor"
+    return "base"
+
+
+def _build_optimizer(model, training_cfg: Dict[str, Any]) -> torch.optim.AdamW:
+    base_lr = float(training_cfg.get("learning_rate", 1e-4))
+    base_wd = float(training_cfg.get("weight_decay", 0.01))
+    group_cfg = training_cfg.get("optimizer_groups", {}) or {}
+    if not bool(group_cfg.get("enabled", False)):
+        return _fused_adamw(model.parameters(), lr=base_lr, wd=base_wd)
+
+    learning_rates = {
+        "base": base_lr,
+        "projection": float(group_cfg.get("projection_lr", 5e-4)),
+        "router": float(group_cfg.get("router_lr", 5e-4)),
+        "descriptor": float(group_cfg.get("descriptor_lr", 2e-4)),
+    }
+    split_no_decay = bool(group_cfg.get("no_decay_bias_and_offsets", True))
+    buckets: Dict[tuple[str, bool], List[torch.nn.Parameter]] = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        kind = _spectral_parameter_group(name)
+        no_decay = split_no_decay and (
+            parameter.ndim <= 1
+            or name.endswith(".bias")
+            or "offset" in name
+            or "logit" in name
+        )
+        buckets.setdefault((kind, no_decay), []).append(parameter)
+
+    groups = []
+    for (kind, no_decay), parameters in sorted(buckets.items()):
+        groups.append({
+            "params": parameters,
+            "lr": learning_rates[kind],
+            "weight_decay": 0.0 if no_decay else base_wd,
+            "group_name": f"{kind}_{'no_decay' if no_decay else 'decay'}",
+        })
+    return _fused_adamw(groups, lr=base_lr, wd=base_wd)
 
 
 class Trainer:
@@ -243,10 +305,10 @@ class Trainer:
 
         self.model = model.to(device)
 
-        # Optimizer (fused if available)
-        lr = config.get("training", {}).get("learning_rate", 1e-4)
-        wd = config.get("training", {}).get("weight_decay", 0.01)
-        self.optimizer = _fused_adamw(model.parameters(), lr=lr, wd=wd)
+        # Optimizer (fused if available).  V6 can give the delayed spectral
+        # branch a larger LR without changing legacy configurations.
+        training_cfg = config.get("training", {})
+        self.optimizer = _build_optimizer(model, training_cfg)
 
         # EMA
         ema_cfg = config.get("training", {}).get("ema", {})
@@ -267,6 +329,10 @@ class Trainer:
         self.accum_count = 0
         self.epoch_count = 0
         self.start_time = None
+        self.gradient_diagnostics = bool(
+            run_cfg.get("gradient_diagnostics", False)
+        )
+        self._last_gradient_logs: Dict[str, torch.Tensor] = {}
 
         # ---- Training monitoring: tracked samples, best ckpt, early stop ----
         bc_cfg = run_cfg.get("best_checkpoint", {}) or {}
@@ -290,12 +356,59 @@ class Trainer:
 
     def _apply_optimizer_step(self) -> None:
         """Apply one optimiser/EMA update and clear accumulated gradients."""
+        if getattr(self, "gradient_diagnostics", False):
+            self._last_gradient_logs = self._collect_spectral_gradient_logs()
         if self.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.ema.update()
         self.accum_count = 0
+
+    def _collect_spectral_gradient_logs(self) -> Dict[str, torch.Tensor]:
+        groups = {
+            "grad/projection_final": ((
+                "residual_preconditioner.projection_heads",
+                "residual_preconditioner.l2_to_l1_projection",
+            ), True),
+            "grad/route_final": ((
+                "residual_preconditioner.route_heads",
+                "residual_preconditioner.no_null_route_heads",
+            ), True),
+            "grad/amplitude_final": ((
+                "residual_preconditioner.amplitude_heads",
+            ), True),
+            "grad/descriptor": ((
+                "residual_preconditioner.dct_descriptor",
+                "priors.gabor",
+            ), False),
+        }
+        logs: Dict[str, torch.Tensor] = {}
+        named_parameters = list(self.model.named_parameters())
+        for key, (tokens, final_only) in groups.items():
+            total = None
+            count = 0
+            for name, parameter in named_parameters:
+                if (
+                    parameter.grad is None
+                    or not any(token in name for token in tokens)
+                    or (final_only and ".final." not in name)
+                ):
+                    continue
+                grad = parameter.grad.detach().float()
+                value = grad.square().sum()
+                total = value if total is None else total + value
+                count += grad.numel()
+            if total is not None and count > 0:
+                logs[key] = (total / count).sqrt().detach()
+        return logs
+
+    def _set_spectral_router_epoch(self) -> None:
+        model = getattr(self.model, "_orig_mod", self.model)
+        preconditioner = getattr(model, "residual_preconditioner", None)
+        setter = getattr(preconditioner, "set_training_epoch", None)
+        if callable(setter):
+            setter(self.epoch_count)
 
     # ------------------------------------------------------------------
     # EMA context manager
@@ -344,6 +457,8 @@ class Trainer:
         log_dict: Dict[str, float] = {}
         for k, v in logs.items():
             log_dict[k] = v.item() if torch.is_tensor(v) else float(v)
+        for k, v in getattr(self, "_last_gradient_logs", {}).items():
+            log_dict[k] = v.item() if torch.is_tensor(v) else float(v)
         log_dict["loss/total"] = loss.item() * self.grad_accum
 
         return log_dict
@@ -365,6 +480,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def train_epoch(self) -> Dict[str, float]:
+        self._set_spectral_router_epoch()
         epoch_start = time.time()
         epoch_logs: Dict[str, List[float]] = {}
         batch_count = 0
@@ -882,4 +998,5 @@ class Trainer:
         self.step_count = checkpoint["step"]
         self._load_monitoring_state(checkpoint)
         self.accum_count = 0
+        self._set_spectral_router_epoch()
         print(f"Loaded checkpoint from {path} (epoch {self.epoch_count})")

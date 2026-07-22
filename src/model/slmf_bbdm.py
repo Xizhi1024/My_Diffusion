@@ -115,6 +115,44 @@ def _get_alpha_cumprod(schedule, timesteps):
     raise AttributeError(f"Noise schedule {type(schedule).__name__} has no alphas_cumprod or base_sigma")
 
 
+def _bbdm_ddim_step(
+    schedule,
+    x_t: torch.Tensor,
+    pred_x0: torch.Tensor,
+    x_source: torch.Tensor,
+    timesteps: torch.Tensor,
+    next_timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic BBDM step that preserves the inferred noise trajectory.
+
+    The forward bridge is ``x_t = m_t*x_source + (1-m_t)*x_0 + sigma_t*eps``.
+    Reusing the inferred ``eps`` at the next timestep keeps reverse states on
+    the noisy distribution seen during training.  Dropping that term makes
+    every state after the first reverse step nearly clean, which is especially
+    harmful to frequency-dependent conditioning.
+    """
+    m_t = schedule.m_t[timesteps].to(device=x_t.device, dtype=x_t.dtype)
+    m_next = schedule.m_t[next_timesteps].to(device=x_t.device, dtype=x_t.dtype)
+    sigma_t = schedule.sigma_t[timesteps].to(device=x_t.device, dtype=x_t.dtype)
+    sigma_next = schedule.sigma_t[next_timesteps].to(
+        device=x_t.device, dtype=x_t.dtype
+    )
+    while m_t.dim() < x_t.dim():
+        m_t = m_t.unsqueeze(-1)
+        m_next = m_next.unsqueeze(-1)
+        sigma_t = sigma_t.unsqueeze(-1)
+        sigma_next = sigma_next.unsqueeze(-1)
+
+    eps_hat = (
+        x_t - m_t * x_source - (1.0 - m_t) * pred_x0
+    ) / sigma_t.clamp_min(1e-6)
+    return (
+        m_next * x_source
+        + (1.0 - m_next) * pred_x0
+        + sigma_next * eps_hat
+    )
+
+
 def _image_gradient_l1_per_sample(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Per-sample L1 difference between spatial gradients."""
     pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
@@ -519,6 +557,12 @@ class SLMFBBDM(nn.Module):
                     fixed_prior=tuple(cross_level_router_cfg.get(
                         "fixed_prior", [0.05, 0.05, 0.90]
                     )),
+                    native_warmup_epochs=cross_level_router_cfg.get(
+                        "native_warmup_epochs", 0
+                    ),
+                    routing_ramp_epochs=cross_level_router_cfg.get(
+                        "routing_ramp_epochs", 0
+                    ),
                     amplitude_delta_min=frequency_cfg.get(
                         "amplitude_delta_min", -0.05
                     ),
@@ -1017,6 +1061,18 @@ class SLMFBBDM(nn.Module):
             condition.scalars["spectral_route_temporal_smoothness"] = diagnostics[
                 "route_temporal_smoothness"
             ]
+            condition.scalars["spectral_route_active_mass"] = 0.5 * (
+                diagnostics["route_l2_active_mass"]
+                + diagnostics["route_l1_active_mass"]
+            )
+            effective_policy = getattr(
+                self.residual_preconditioner, "_effective_policy", ""
+            )
+            condition.scalars["spectral_route_is_learned"] = (
+                noisy_residual.new_ones(())
+                if effective_policy in {"learned", "learned_no_null"}
+                else noisy_residual.new_zeros(())
+            )
             condition.scalars["spectral_dct_weight_offset"] = diagnostics[
                 "dct_weight_offset"
             ]
@@ -1379,6 +1435,13 @@ class SLMFBBDM(nn.Module):
                         logs[f"frequency/{key}"] = (
                             val.detach() if isinstance(val, torch.Tensor) else val
                         )
+            routing_progress = self._last_frequency_diagnostics.get(
+                "route_routing_progress"
+            )
+            if routing_progress is not None:
+                logs["frequency/route_routing_progress"] = (
+                    routing_progress.detach()
+                )
             # Injection RMS per level
             for lvl in (0, 1, 2, 3):
                 rms_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_rms")
@@ -1543,10 +1606,14 @@ class SLMFBBDM(nn.Module):
                 elif is_bbdm:
                     # BBDM: x_{t-1} = m_{t-1}·CT + (1-m_{t-1})·pred_x0
                     # As t→0: m→0, x→pred_x0=PET ✓
-                    m_next = self.noise_schedule.m_t[t_next_batch]
-                    while m_next.dim() < x_t.dim():
-                        m_next = m_next.unsqueeze(-1)
-                    x_t = m_next * bridge_source + (1 - m_next) * pred_x0
+                    x_t = _bbdm_ddim_step(
+                        self.noise_schedule,
+                        x_t,
+                        pred_x0,
+                        bridge_source,
+                        t_batch,
+                        t_next_batch,
+                    )
                 else:
                     # Standard DDIM
                     alpha_t = _get_alpha_cumprod(self.noise_schedule, t_batch)

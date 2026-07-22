@@ -1,8 +1,9 @@
 """Screen residual-frequency blocks, apply artifact gates, and retrain winners.
 
-The runner deliberately launches every promoted model as a fresh training
-process with ``resume_from=null`` and a distinct experiment name. It never
-continues a short-screen optimizer or scheduler state.
+The runner deliberately launches every promoted model with a fresh optimizer,
+scheduler, and experiment name. Plans may provide ``training.init_from`` to
+start all variants from identical model weights, but optimizer state is never
+continued from a short screen.
 """
 
 from __future__ import annotations
@@ -17,6 +18,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 
 import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.compare_v4_results import compare_all_results
 
 
 def metric_value(metrics: Mapping[str, Any], name: str) -> float:
@@ -316,6 +323,8 @@ def _run_manifest_entry(
     completion_checkpoint = None
     if settings.get("require_final_checkpoint", False):
         completion_checkpoint = checkpoint_dir / f"ckpt_epoch{int(settings['epochs']):04d}.pt"
+        if settings.get("evaluate_final_checkpoint", False):
+            checkpoint = completion_checkpoint
     return {
         "id": variant_id,
         "preset": variant["preset"],
@@ -578,6 +587,55 @@ def _write_rankings(output_dir: Path, promoted: Sequence[str], ranked: Sequence[
             })
 
 
+def _write_paired_results(
+    plan: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    phase: str,
+) -> None:
+    comparison_cfg = plan.get("paired_comparison")
+    if not isinstance(comparison_cfg, Mapping):
+        return
+    result_paths = {
+        str(entry["id"]): Path(str(entry["result"])) for entry in entries
+    }
+    report = compare_all_results(
+        result_paths,
+        comparison_cfg.get("metrics", {}),
+        seed=int(comparison_cfg.get("seed", 42)),
+        resamples=int(comparison_cfg.get("resamples", 10_000)),
+    )
+    output = Path(str(plan.get("output_dir", "results/frequency_ablations")))
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f"{phase}_paired_comparison.json").write_text(
+        json.dumps(_json_safe(report), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _write_final_gate_results(
+    plan: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
+) -> None:
+    gates = plan.get("promotion_hard_gates")
+    if not isinstance(gates, Mapping):
+        return
+    reference_id = str(plan.get("reference_id", "R0"))
+    accepted, ranked = select_promotions(
+        records,
+        reference_id=reference_id,
+        gates=gates,
+        top_k=int(plan.get("top_k", 2)),
+    )
+    output = Path(str(plan.get("output_dir", "results/frequency_ablations")))
+    payload = _json_safe(
+        {"accepted": accepted, "reference_id": reference_id, "ranked": ranked}
+    )
+    (output / "final_gate_decision.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    _write_rankings(output / "promotion", accepted, ranked)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -637,6 +695,7 @@ def main() -> None:
             top_k=int(plan.get("top_k", 2)),
         )
         _write_rankings(output_dir, promoted, ranked)
+        _write_paired_results(plan, screen_manifest["screen_runs"], phase="screen")
         print(f"Promoted variants: {promoted or '(none)'}")
 
     if args.stage == "promote":
@@ -650,8 +709,13 @@ def main() -> None:
         if not promoted:
             print("No variants passed promotion; full retraining was not started.")
             return
+        promotion_ids = list(promoted)
+        if plan.get("include_reference_in_promotion", False):
+            reference_id = str(plan.get("reference_id", "R0"))
+            if reference_id not in promotion_ids:
+                promotion_ids.insert(0, reference_id)
         promotion_manifest = build_execution_manifest(
-            plan, python=sys.executable, stage="promote", promoted_ids=promoted
+            plan, python=sys.executable, stage="promote", promoted_ids=promotion_ids
         )
         promotion_records = _run_entries(
             promotion_manifest["promotion_runs"], force=args.force
@@ -666,6 +730,10 @@ def main() -> None:
                 ensure_ascii=False,
                 allow_nan=False,
             )
+        _write_paired_results(
+            plan, promotion_manifest["promotion_runs"], phase="promotion"
+        )
+        _write_final_gate_results(plan, promotion_records)
 
 
 if __name__ == "__main__":

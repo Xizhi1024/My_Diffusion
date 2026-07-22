@@ -262,6 +262,30 @@ class TestClinicalEvaluationHelpers:
         assert "lesion_roi_l1" in metadata["lesion_aware_posttraining"]["lesion_losses"]
         assert "outside_peak_ranking" in metadata["lesion_aware_posttraining"]["lesion_losses"]
 
+    def test_finetune_can_initialize_from_checkpoint_ema(self):
+        from scripts.train_v2 import _select_initial_model_state
+
+        checkpoint = {
+            "model": {
+                "weight": torch.tensor([1.0]),
+                "buffer": torch.tensor([3.0]),
+            },
+            "ema": {"shadow": {"weight": torch.tensor([2.0])}},
+        }
+
+        raw = _select_initial_model_state(checkpoint, "raw")
+        ema = _select_initial_model_state(checkpoint, "ema")
+
+        assert raw["weight"].item() == 1.0
+        assert ema["weight"].item() == 2.0
+        assert ema["buffer"].item() == 3.0
+
+    def test_finetune_ema_init_requires_ema_checkpoint_state(self):
+        from scripts.train_v2 import _select_initial_model_state
+
+        with pytest.raises(KeyError, match="contains no EMA"):
+            _select_initial_model_state({"model": {}}, "ema")
+
     def test_train_entrypoint_loads_resume_checkpoint(self, monkeypatch):
         import scripts.train_v2 as train_v2
 
