@@ -182,6 +182,11 @@ class SplitManifest:
         entry = self._by_sample.get(sample_id)
         return entry["split"] if entry else ""
 
+    def get_entry(self, sample_id: str) -> Optional[Dict[str, str]]:
+        """Return the authoritative manifest row for a sample, if present."""
+        entry = self._by_sample.get(sample_id)
+        return dict(entry) if entry is not None else None
+
     def get_patient_split(self, patient_id: str) -> str:
         return self._patient_split.get(patient_id, "")
 

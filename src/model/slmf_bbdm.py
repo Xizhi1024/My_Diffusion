@@ -251,6 +251,8 @@ class SLMFBBDM(nn.Module):
         wavelet_unet_config: Optional[Dict[str, Any]] = None,
         meta_config: Optional[Dict[str, Any]] = None,
         segmenter_config: Optional[Dict[str, Any]] = None,
+        expected_data_lineage: Optional[Dict[str, Any]] = None,
+        require_checkpoint_lineage: bool = False,
         # Inference
         sample_scheduler: str = "ddim",
         eval_sampling_steps: int = 20,
@@ -336,6 +338,7 @@ class SLMFBBDM(nn.Module):
         dct_descriptor_cfg = frequency_cfg.get("dct_descriptor", {})
         gabor_descriptor_cfg = frequency_cfg.get("gabor_descriptor", {})
         cross_level_router_cfg = frequency_cfg.get("cross_level_router", {})
+        ct_support_cfg = frequency_cfg.get("ct_support_head", {})
         self.mean_checkpoint = mean_cfg.get("checkpoint")
         self.mean_frozen = bool(mean_cfg.get("freeze", False))
         self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
@@ -413,11 +416,18 @@ class SLMFBBDM(nn.Module):
                 )
                 if not isinstance(checkpoint, dict):
                     raise ValueError("Conditional-mean checkpoint must contain a mapping")
-                if checkpoint.get("format_version") != 1:
+                if checkpoint.get("format_version") not in (1, 2):
                     raise ValueError(
                         "Unsupported conditional-mean checkpoint format_version: "
-                        f"{checkpoint.get('format_version')!r}; expected 1"
+                        f"{checkpoint.get('format_version')!r}; expected 1 or 2"
                     )
+                from src.data.lineage import validate_checkpoint_data_lineage
+                validate_checkpoint_data_lineage(
+                    checkpoint,
+                    expected_data_lineage,
+                    required=require_checkpoint_lineage,
+                    context=f"conditional-mean checkpoint {checkpoint_path}",
+                )
                 mean_state = checkpoint.get("model")
                 if not isinstance(mean_state, dict):
                     raise ValueError(
@@ -563,11 +573,38 @@ class SLMFBBDM(nn.Module):
                     routing_ramp_epochs=cross_level_router_cfg.get(
                         "routing_ramp_epochs", 0
                     ),
+                    ct_support_enabled=ct_support_cfg.get(
+                        "enabled", False
+                    ),
+                    ct_support_band=ct_support_cfg.get(
+                        "selected_haar_band", "l2_hh"
+                    ),
+                    ct_support_direction=ct_support_cfg.get(
+                        "response_direction", "-"
+                    ),
+                    ct_support_only=ct_support_cfg.get(
+                        "support_only", False
+                    ),
                     amplitude_delta_min=frequency_cfg.get(
                         "amplitude_delta_min", -0.05
                     ),
                     amplitude_delta_max=frequency_cfg.get(
                         "amplitude_delta_max", 0.10
+                    ),
+                    uncertainty_aware_router_enabled=cross_level_router_cfg.get(
+                        "uncertainty_aware_enabled", False
+                    ),
+                    uncertainty_aware_confidence_threshold=cross_level_router_cfg.get(
+                        "uncertainty_aware_confidence_threshold", None
+                    ),
+                    h3_schedule_path=cross_level_router_cfg.get(
+                        "h3_schedule_path", None
+                    ),
+                    h3_schedule_sha256=cross_level_router_cfg.get(
+                        "h3_schedule_sha256", None
+                    ),
+                    h3_num_train_timesteps=int(
+                        self.noise_schedule.num_train_timesteps
                     ),
                 )
             else:
@@ -1040,6 +1077,7 @@ class SLMFBBDM(nn.Module):
         condition: ConditionBundle,
         timesteps: Optional[torch.Tensor],
         noisy_residual: Optional[torch.Tensor],
+        router_confidence: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         self._last_frequency_diagnostics = {}
         if not self.residual_frequency_enabled:
@@ -1055,6 +1093,7 @@ class SLMFBBDM(nn.Module):
                 gabor_feat=condition.maps.get("gabor_feat"),
                 gabor_orientation=condition.maps.get("gabor_orientation"),
                 gabor_anisotropy=condition.maps.get("gabor_anisotropy"),
+                router_confidence=router_confidence,
             )
             self._last_frequency_diagnostics = diagnostics
             condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]
@@ -1159,6 +1198,7 @@ class SLMFBBDM(nn.Module):
         timesteps: Optional[torch.Tensor] = None,
         hw_list: Optional[List[int]] = None,
         noisy_residual: Optional[torch.Tensor] = None,
+        router_confidence: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """Build Zero-Conv adapter outputs for UNet skip connections.
 
@@ -1171,7 +1211,7 @@ class SLMFBBDM(nn.Module):
             hw_list=hw_list,
         )
         frequency_injections = self._build_frequency_injections(
-            condition, timesteps, noisy_residual
+            condition, timesteps, noisy_residual, router_confidence=router_confidence
         )
         if adapter_injections and frequency_injections:
             if len(adapter_injections) != len(frequency_injections):
@@ -1249,6 +1289,7 @@ class SLMFBBDM(nn.Module):
             condition,
             timesteps=timesteps,
             noisy_residual=noisy_x if self.residual_bridge_enabled else None,
+            router_confidence=batch.get("router_confidence"),
         )
 
         # 4.5 Build metadata tensor + Cross-Attn beta
@@ -1442,6 +1483,29 @@ class SLMFBBDM(nn.Module):
                 logs["frequency/route_routing_progress"] = (
                     routing_progress.detach()
                 )
+            # Uncertainty-aware selector (V2-05) diagnostics, surfaced only when
+            # the selector ran (flag ON + router_confidence supplied).
+            for ua_key in (
+                "router_active_fraction",
+                "router_confidence_threshold",
+            ):
+                ua_val = self._last_frequency_diagnostics.get(ua_key)
+                if ua_val is not None:
+                    logs[f"frequency/{ua_key}"] = (
+                        ua_val.detach()
+                        if isinstance(ua_val, torch.Tensor)
+                        else ua_val
+                    )
+            for ua_key in (
+                "router_confidence",
+                "router_active",
+                "router_abstained",
+            ):
+                ua_val = self._last_frequency_diagnostics.get(ua_key)
+                if ua_val is not None and isinstance(ua_val, torch.Tensor):
+                    logs[f"frequency/{ua_key}_mean"] = (
+                        ua_val.float().mean().detach()
+                    )
             # Injection RMS per level
             for lvl in (0, 1, 2, 3):
                 rms_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_rms")
@@ -1564,6 +1628,7 @@ class SLMFBBDM(nn.Module):
                 condition,
                 timesteps=t_batch,
                 noisy_residual=x_t if self.residual_bridge_enabled else None,
+                router_confidence=batch.get("router_confidence"),
             )
             semantic_tokens = condition.tokens.get("semantic")
             model_input = self._model_input(denoiser_state, x_source, self_cond)
@@ -1727,6 +1792,13 @@ class SLMFBBDM(nn.Module):
         data_cfg = config.get("data", {})
         loss_cfg = config.get("losses", {})
         prior_cfgs = {name: modules_cfg.get(name, {}) for name in _PRIOR_MODULE_NAMES}
+        require_checkpoint_lineage = bool(
+            data_cfg.get("require_cache_lineage", False)
+        )
+        expected_data_lineage = None
+        if require_checkpoint_lineage:
+            from src.data.lineage import load_checkpoint_data_lineage
+            expected_data_lineage = load_checkpoint_data_lineage(config)
 
         return cls(
             image_size=data_cfg.get("image_size", 192),
@@ -1747,6 +1819,8 @@ class SLMFBBDM(nn.Module):
             wavelet_unet_config=modules_cfg.get("wavelet_unet", {}),
             meta_config=model_cfg.get("metadata", config.get("metadata", {})),
             segmenter_config=model_cfg.get("segmenter", config.get("segmenter", {})),
+            expected_data_lineage=expected_data_lineage,
+            require_checkpoint_lineage=require_checkpoint_lineage,
             self_conditioning_config=model_cfg.get("self_conditioning", {}),
             sample_scheduler=model_cfg.get("sample_scheduler", "ddim"),
             eval_sampling_steps=config.get("runtime", {}).get("eval_sampling_steps", 20),

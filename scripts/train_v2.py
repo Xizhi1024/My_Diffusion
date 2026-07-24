@@ -20,6 +20,10 @@ import torch
 # Ensure src/ is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.data.lineage import (
+    load_checkpoint_data_lineage,
+    validate_checkpoint_data_lineage,
+)
 from src.model.config_utils import (
     load_full_config,
     save_resolved_config,
@@ -28,7 +32,7 @@ from src.model.config_utils import (
     log_startup_status,
 )
 from src.model.slmf_bbdm import SLMFBBDM
-from src.model.trainer import Trainer
+from src.model.trainer import Trainer, resolve_checkpoint_dir
 
 
 def _set_seed(seed: int) -> None:
@@ -58,7 +62,13 @@ def _select_initial_model_state(checkpoint: dict, weights: str = "raw") -> dict:
     raise KeyError("EMA init requested, but checkpoint contains no EMA weights")
 
 
-def _save_run_metadata(model: SLMFBBDM, config: dict, ckpt_dir: str, ablation: str | None) -> None:
+def _save_run_metadata(
+    model: SLMFBBDM,
+    config: dict,
+    ckpt_dir: str,
+    ablation: str | None,
+    data_lineage: dict | None = None,
+) -> None:
     """Persist the experiment/module state needed to reproduce an ablation run."""
     os.makedirs(ckpt_dir, exist_ok=True)
     enabled_modules = {
@@ -122,6 +132,7 @@ def _save_run_metadata(model: SLMFBBDM, config: dict, ckpt_dir: str, ablation: s
         },
         "trainable_parameters": model.get_trainable_params(),
         "total_parameters": model.get_total_params(),
+        "data_lineage": data_lineage,
     }
     with open(os.path.join(ckpt_dir, "run_metadata.json"), "w", encoding="utf-8") as fh:
         json.dump(metadata, fh, indent=2, ensure_ascii=False)
@@ -143,6 +154,15 @@ def main():
         overrides=args.override if args.override else None,
     )
 
+    # Formal experiment configs must never be silently converted into the
+    # CPU-only smoke profile below.
+    require_cuda = bool(config.get("runtime", {}).get("require_cuda", False))
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            "runtime.require_cuda=true, but CUDA is unavailable; refusing the "
+            "CPU smoke/debug fallback"
+        )
+
     # 1.5 Set random seed for reproducibility (must happen before model/dataloader init)
     seed = config.get("experiment", {}).get("seed", 42)
     _set_seed(seed)
@@ -154,16 +174,27 @@ def main():
     #     Fails fast if data.mode=png but a DICOM/SUV/organ path is still on.
     startup_status = validate_png_baseline_config(config)
     log_startup_status(startup_status)
+    data_lineage = load_checkpoint_data_lineage(config)
+    if data_lineage is not None:
+        print(
+            "Verified cache lineage: "
+            f"{data_lineage['cache_metadata_sha256']}"
+        )
 
     # 3. Save resolved config
-    exp_name = config.get("experiment", {}).get("name", "slmf_bbdm")
-    ckpt_dir = os.path.join("checkpoints", exp_name)
+    ckpt_dir = resolve_checkpoint_dir(config)
     save_resolved_config(config, ckpt_dir)
 
     # 4. Build model
     print("Building SLMF-BBDM model...")
     model = SLMFBBDM.from_config(config)
-    _save_run_metadata(model, config, ckpt_dir, args.ablation)
+    _save_run_metadata(
+        model,
+        config,
+        ckpt_dir,
+        args.ablation,
+        data_lineage=data_lineage,
+    )
 
     # 4.5 Optionally initialise weights from a checkpoint (fine-tuning).
     #     Only model weights are loaded; optimizer / scheduler / EMA start fresh
@@ -182,6 +213,14 @@ def main():
             "(optimizer/EMA fresh)..."
         )
         ckpt = torch.load(init_from, map_location="cpu", weights_only=True)
+        validate_checkpoint_data_lineage(
+            ckpt,
+            data_lineage,
+            required=bool(
+                config.get("data", {}).get("require_cache_lineage", False)
+            ),
+            context=f"training.init_from checkpoint {init_from}",
+        )
         model.load_state_dict(_select_initial_model_state(ckpt, init_weights))
         print("  loaded.")
 

@@ -14,6 +14,10 @@ from .boundary_reliable import (
     _total_variation,
 )
 from .dct_descriptor import SelectedDCTDescriptor
+from .h3_native_null_schedule import (
+    load_h3_native_null_schedule,
+    native_null_routes,
+)
 
 
 class BoundedAmplitudeHead(nn.Module):
@@ -124,6 +128,71 @@ class NoNullRouteHead(nn.Module):
         return F.softmax(self.final(self.features(evidence)), dim=-1)
 
 
+class UncertaintyAwareRouteSelector(nn.Module):
+    """Abstain to a frozen H3 route schedule when evidence is uncertain.
+
+    This selector is intentionally not wired into the production router while
+    H4-v2 is unconfirmed.  It defines the frozen, unit-testable interface that
+    H5 may activate only after a formal zero-overlap H4-v2 PASS.
+    """
+
+    def __init__(self, confidence_threshold: float) -> None:
+        super().__init__()
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be in [0, 1]")
+        self.register_buffer(
+            "_confidence_threshold",
+            torch.tensor(float(confidence_threshold), dtype=torch.float32),
+            persistent=True,
+        )
+
+    @property
+    def confidence_threshold(self) -> float:
+        return float(self._confidence_threshold.item())
+
+    def forward(
+        self,
+        evidence_routes: torch.Tensor,
+        evidence_confidence: torch.Tensor,
+        h3_fixed_routes: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if evidence_routes.shape != h3_fixed_routes.shape:
+            raise ValueError(
+                "evidence_routes and h3_fixed_routes must have identical shapes"
+            )
+        if evidence_routes.ndim < 2:
+            raise ValueError("route tensors must include a route dimension")
+        expected_confidence_shape = evidence_routes.shape[:-1]
+        if evidence_confidence.shape == (*expected_confidence_shape, 1):
+            evidence_confidence = evidence_confidence.squeeze(-1)
+        if evidence_confidence.shape != expected_confidence_shape:
+            raise ValueError(
+                "evidence_confidence must match all non-route dimensions"
+            )
+        if not torch.isfinite(evidence_confidence).all():
+            raise ValueError("evidence_confidence must be finite")
+        confidence = evidence_confidence.to(
+            device=evidence_routes.device,
+            dtype=evidence_routes.dtype,
+        ).clamp(0.0, 1.0)
+        threshold = self._confidence_threshold.to(
+            device=evidence_routes.device,
+            dtype=evidence_routes.dtype,
+        )
+        active = confidence >= threshold
+        selected = torch.where(
+            active.unsqueeze(-1),
+            evidence_routes,
+            h3_fixed_routes.to(evidence_routes),
+        )
+        return selected, {
+            "router_confidence": confidence,
+            "router_active": active.to(evidence_routes.dtype),
+            "router_abstained": (~active).to(evidence_routes.dtype),
+            "router_active_fraction": active.float().mean(),
+        }
+
+
 class BiasFreeZeroProjection(nn.Module):
     """Zero-initialized projection that stays strictly zero for zero input.
 
@@ -152,6 +221,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     --------------
     ``native_only``    – [1,0,0] frozen, no cross-level routing (pure native).
     ``fixed_prior``    – frozen softmax prior, e.g. [0.05,0.05,0.90].
+    ``h3_native_null`` – frozen full-timestep [native,0,null] schedule.
     ``learned``        – 3-way softmax learned from evidence (native/shallow/null).
     ``learned_no_null``– 2-way softmax (native/shallow), no null option.
     ``legacy_off``     – (deprecated) cross_level_enabled=False → implicit [1,0,0]/[1,1,0].
@@ -160,6 +230,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     _ROUTE_POLICIES = frozenset({
         "native_only",
         "fixed_prior",
+        "h3_native_null",
         "learned",
         "learned_no_null",
         "legacy_off",
@@ -190,6 +261,15 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         fixed_prior: Sequence[float] = (0.05, 0.05, 0.90),
         native_warmup_epochs: int = 0,
         routing_ramp_epochs: int = 0,
+        ct_support_enabled: bool = False,
+        ct_support_band: str = "l2_hh",
+        ct_support_direction: str = "-",
+        ct_support_only: bool = False,
+        uncertainty_aware_router_enabled: bool = False,
+        uncertainty_aware_confidence_threshold: Optional[float] = None,
+        h3_schedule_path: Optional[str] = None,
+        h3_schedule_sha256: Optional[str] = None,
+        h3_num_train_timesteps: int = 1000,
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
@@ -210,8 +290,16 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
         if native_warmup_epochs < 0 or routing_ramp_epochs < 0:
             raise ValueError("routing warmup and ramp epochs must be non-negative")
+        if ct_support_band not in {"l2_lh", "l2_hl", "l2_hh"}:
+            raise ValueError("ct_support_band must be an L2 Haar detail band")
+        if ct_support_direction not in {"+", "-"}:
+            raise ValueError("ct_support_direction must be '+' or '-'")
         base_kwargs.pop("use_directional_reliability", None)
         base_kwargs.pop("use_gabor_agreement", None)
+        if ct_support_only:
+            # In formal H1 mode CT is a spatial support field only.  It must
+            # not enter residual/CT agreement amplitudes from the base class.
+            base_kwargs["use_ct_reliability"] = False
         super().__init__(
             output_channels=output_channels,
             band_scales=band_scales,
@@ -229,6 +317,12 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.fixed_prior = tuple(float(p) for p in fixed_prior)
         self.native_warmup_epochs = int(native_warmup_epochs)
         self.routing_ramp_epochs = int(routing_ramp_epochs)
+        self.ct_support_enabled = bool(ct_support_enabled)
+        self.ct_support_band = str(ct_support_band)
+        self.ct_support_direction = str(ct_support_direction)
+        self.ct_support_only = bool(ct_support_only)
+        self.h3_schedule_path = h3_schedule_path
+        self.h3_schedule_sha256 = h3_schedule_sha256
 
         # Resolve effective policy when legacy flags are used
         effective_policy = self._resolve_policy()
@@ -300,6 +394,82 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             torch.tensor(self._fixed_route_values(), dtype=torch.float32),
             persistent=False,
         )
+        self._h3_schedule_metadata: Optional[Dict[str, object]] = None
+        if effective_policy == "h3_native_null":
+            if not h3_schedule_path or not h3_schedule_sha256:
+                raise ValueError(
+                    "route_policy='h3_native_null' requires both "
+                    "h3_schedule_path and h3_schedule_sha256"
+                )
+            active_mass, schedule_metadata = load_h3_native_null_schedule(
+                h3_schedule_path,
+                expected_file_sha256=h3_schedule_sha256,
+                expected_num_train_timesteps=int(h3_num_train_timesteps),
+            )
+            self.register_buffer(
+                "_h3_native_active_mass",
+                active_mass,
+                persistent=True,
+            )
+            self._h3_schedule_metadata = dict(schedule_metadata)
+            # The H3-v2 policy is frozen by construction. Evidence heads remain
+            # in the state-dict layout for checkpoint compatibility but cannot
+            # learn or influence this route.
+            for module in (
+                self.amplitude_heads,
+                self.route_heads,
+                self.no_null_route_heads,
+            ):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+        elif h3_schedule_path is not None or h3_schedule_sha256 is not None:
+            raise ValueError(
+                "h3_schedule_path/h3_schedule_sha256 are only valid with "
+                "route_policy='h3_native_null'"
+            )
+
+        # Uncertainty-aware route selector (H4-v2 interface).  OFF by default;
+        # when enabled it abstains element-wise to a frozen fixed-policy route
+        # whenever the externally-supplied per-(level, band) confidence is below
+        # the frozen threshold.  Confidence is NEVER fabricated inside forward:
+        # it must come from a leakage-free context-aware inference path (explicit
+        # patient_id/slice_id adjacent-slice provider + frozen population stats),
+        # supplied via the ``router_confidence`` kwarg.  Without that path the
+        # selector stays disabled, so production behaviour is unchanged.
+        self.uncertainty_aware_router_enabled = bool(
+            uncertainty_aware_router_enabled
+        )
+        self._uncertainty_aware_selector: Optional[UncertaintyAwareRouteSelector] = None
+        if self.uncertainty_aware_router_enabled:
+            if effective_policy == "h3_native_null":
+                raise ValueError(
+                    "h3_native_null cannot be combined with the "
+                    "uncertainty-aware H4-v2 selector"
+                )
+            if self._effective_policy not in {"learned", "learned_no_null"}:
+                raise ValueError(
+                    "uncertainty_aware_router_enabled requires a learned route "
+                    "policy (got "
+                    f"{self._effective_policy!r}); a fixed policy has nothing "
+                    "to abstain from"
+                )
+            if uncertainty_aware_confidence_threshold is None:
+                raise ValueError(
+                    "uncertainty_aware_router_enabled requires "
+                    "uncertainty_aware_confidence_threshold in [0, 1]"
+                )
+            self._uncertainty_aware_selector = UncertaintyAwareRouteSelector(
+                confidence_threshold=float(uncertainty_aware_confidence_threshold)
+            )
+            # Frozen-by-construction abstention target: the configured fixed
+            # policy route vector, shared across both levels.  This is the
+            # router-level analog of "abstain to the H3 fixed schedule"; it is
+            # deterministic and independent of any data, mask, or PET target.
+            self.register_buffer(
+                "_ua_fallback_route",
+                torch.tensor(self._fixed_route_values(), dtype=torch.float32),
+                persistent=False,
+            )
 
     @property
     def routing_progress(self) -> float:
@@ -358,6 +528,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             return [1.0, 0.0, 0.0]
         if policy == "fixed_prior":
             return list(self.fixed_prior)
+        if policy == "h3_native_null":
+            # Dynamic rows are looked up in _acquire_routes.  This null vector
+            # is only a safe construction-time placeholder.
+            return [0.0, 0.0, 1.0]
         if policy == "learned_no_null":
             # 2-way: native/shallow split of the non-null budget
             # Use the first two entries of fixed_prior, renormalized
@@ -391,6 +565,28 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
             routes = fixed.view(1, 1, -1).expand(batch, 3, self._num_routes).to(device)
             return routes, reference.new_zeros(())
+
+        if policy == "h3_native_null":
+            active_mass = getattr(self, "_h3_native_active_mass", None)
+            if active_mass is None:
+                raise RuntimeError("H3-v2 schedule buffer is missing")
+            routes = native_null_routes(
+                active_mass,
+                timestep,
+                level_index=level_index,
+                reference=reference,
+            )
+            next_timestep = (timestep + 1).clamp_max(
+                int(schedule.num_train_timesteps) - 1
+            )
+            next_routes = native_null_routes(
+                active_mass,
+                next_timestep,
+                level_index=level_index,
+                reference=reference,
+            )
+            temporal_smoothness = (routes - next_routes).abs().mean()
+            return routes, temporal_smoothness
 
         if policy == "legacy_off":
             # Old implicit behaviour: L2=[1,0,0], L1=[1,1,0]
@@ -475,7 +671,30 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             signal.square().clamp_min(1e-8) / sigma.square().clamp_min(1e-8)
         ).clamp(-20.0, 20.0)
         normalized_log_snr = (log_snr / 20.0).clamp(-1.0, 1.0)
+        if not self.use_noise_release:
+            normalized_log_snr = torch.zeros_like(normalized_log_snr)
         return normalized_timestep.to(reference), normalized_log_snr.to(reference)
+
+    def _noise_calibrated_band_evidence(
+        self,
+        residual: torch.Tensor,
+        timesteps: torch.Tensor,
+        schedule,
+    ) -> torch.Tensor:
+        """Observed band energy relative to analytic pure bridge noise."""
+
+        if not self.use_noise_release:
+            return residual.new_zeros(residual.shape[0], 3)
+        observed = residual.abs().mean(dim=(-2, -1))
+        sigma = schedule.sigma_t[timesteps].to(
+            device=residual.device,
+            dtype=residual.dtype,
+        )[:, None]
+        expected_abs_noise = sigma * math.sqrt(2.0 / math.pi)
+        log_ratio = torch.log(
+            (observed + 1e-6) / (expected_abs_noise + 1e-6)
+        )
+        return torch.tanh(log_ratio / 5.0)
 
     def _dct_evidence(
         self, details: torch.Tensor
@@ -601,12 +820,22 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         haar_agreement = (1.0 - (residual_distribution - ct_distribution).abs()).clamp(
             0.0, 1.0
         )
+        if self.ct_support_only:
+            # Preserve the fixed 48-feature layout while ensuring CT cannot
+            # determine learned PET band amplitudes/routes.  CT remains
+            # available only through the spatial support multiplier below.
+            dct_c = torch.zeros_like(dct_c)
+            dct_diff = torch.zeros_like(dct_diff)
+            ct_distribution = torch.zeros_like(ct_distribution)
+            haar_agreement = torch.zeros_like(haar_agreement)
         normalized_timestep, normalized_log_snr = self._time_features(
             timesteps, schedule, level_index, residual
         )
-        base_reliability = (
-            base_gate.mean(dim=(-2, -1)) / self.gate_max
-        ).clamp(0.0, 1.0)
+        noise_calibrated_evidence = self._noise_calibrated_band_evidence(
+            residual,
+            timesteps,
+            schedule,
+        )
         (
             gabor_global_energy,
             gabor_orientation_energy,
@@ -629,7 +858,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 normalized_timestep[:, None].expand(-1, 3),
                 normalized_log_snr[:, None].expand(-1, 3),
                 noise[:, None].expand(-1, 3),
-                base_reliability,
+                noise_calibrated_evidence,
                 gabor_global_energy,
                 gabor_orientation_energy,
                 gabor_anisotropy_energy,
@@ -652,7 +881,33 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "dct_frequency_weights": dct_weights,
             "gabor_haar_agreement": gabor_haar_agreement,
             "gabor_dct_agreement": gabor_dct_agreement,
+            "noise_calibrated_band_evidence": noise_calibrated_evidence,
         }
+
+    def _ct_support_field(
+        self,
+        ct_details_l2,
+    ) -> torch.Tensor:
+        """H1-selected bounded CT spatial support, shared across PET bands."""
+
+        details = _stack_details(ct_details_l2).abs()
+        band_index = {"l2_lh": 0, "l2_hl": 1, "l2_hh": 2}[
+            self.ct_support_band
+        ]
+        energy = F.avg_pool2d(
+            details[:, band_index : band_index + 1],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+        flattened = energy.flatten(1)
+        location = flattened.median(dim=1).values[:, None, None, None]
+        deviation = (energy - location).abs().flatten(1).median(dim=1).values
+        scale = (1.4826 * deviation).clamp_min(1e-6)[:, None, None, None]
+        signed = (energy - location) / scale
+        if self.ct_support_direction == "-":
+            signed = -signed
+        return torch.sigmoid(signed).clamp(0.0, 1.0)
 
     def _zero_result(
         self, current_residual: torch.Tensor
@@ -766,6 +1021,76 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
         return result
 
+    def _apply_uncertainty_aware_selection(
+        self,
+        *,
+        routes_l2: torch.Tensor,
+        routes_l1: torch.Tensor,
+        router_confidence: Optional[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Apply the H4-v2 selector, or return ``None`` when it is disabled.
+
+        Fail-closed contract: when the selector is enabled, a ``router_confidence``
+        tensor of shape ``[B, 2, 3]`` (level × band) MUST be supplied by a
+        leakage-free context-aware caller.  The router never invents confidence
+        internally, so production forward (which does not supply it) must keep
+        the flag off.
+        """
+
+        selector = self._uncertainty_aware_selector
+        if selector is None:
+            return None
+        if router_confidence is None:
+            raise ValueError(
+                "uncertainty_aware_router_enabled=true requires a "
+                "router_confidence tensor of shape [B, 2, 3] (level, band); "
+                "the router never fabricates confidence internally"
+            )
+        if router_confidence.ndim != 3:
+            raise ValueError("router_confidence must have shape [B, 2, 3]")
+        batch = routes_l2.shape[0]
+        expected = (batch, 2, 3)
+        if tuple(router_confidence.shape) != expected:
+            raise ValueError(
+                f"router_confidence must have shape {expected}, got "
+                f"{tuple(router_confidence.shape)}"
+            )
+        if not torch.isfinite(router_confidence).all():
+            raise ValueError("router_confidence must be finite")
+
+        fallback = self._ua_fallback_route.to(
+            device=reference.device, dtype=routes_l2.dtype
+        )
+        fallback_l2 = fallback.view(1, 1, -1).expand_as(routes_l2)
+        fallback_l1 = fallback.view(1, 1, -1).expand_as(routes_l1)
+
+        confidence = router_confidence.to(
+            device=reference.device, dtype=routes_l2.dtype
+        )
+        selected_l2, diag_l2 = selector(routes_l2, confidence[:, 0, :], fallback_l2)
+        selected_l1, diag_l1 = selector(routes_l1, confidence[:, 1, :], fallback_l1)
+
+        active = torch.stack(
+            (diag_l2["router_active"], diag_l1["router_active"]), dim=1
+        )
+        abstained = torch.stack(
+            (diag_l2["router_abstained"], diag_l1["router_abstained"]), dim=1
+        )
+        return {
+            "router_confidence": confidence,
+            "router_active": active,
+            "router_abstained": abstained,
+            "router_active_fraction": active.float().mean(),
+            "router_confidence_threshold": selector._confidence_threshold.to(
+                device=reference.device, dtype=routes_l2.dtype
+            ),
+            "router_selected_routes_l2": selected_l2,
+            "router_selected_routes_l1": selected_l1,
+            "router_fallback_routes_l2": fallback_l2,
+            "router_fallback_routes_l1": fallback_l1,
+        }
+
     def forward(
         self,
         current_residual: torch.Tensor,
@@ -777,11 +1102,17 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         gabor_feat: Optional[torch.Tensor] = None,
         lesion_score: Optional[torch.Tensor] = None,
         topq_mask: Optional[torch.Tensor] = None,
+        router_confidence: Optional[torch.Tensor] = None,
     ) -> tuple[list[torch.Tensor], Dict[str, torch.Tensor]]:
         self._validate_inputs(current_residual, ct)
         if timestep.ndim != 1 or timestep.shape[0] != current_residual.shape[0]:
             raise ValueError("timestep must have shape [B]")
         if self.hard_all_null:
+            if self._uncertainty_aware_selector is not None:
+                raise ValueError(
+                    "uncertainty_aware_router_enabled is incompatible with "
+                    "hard_all_null (no learned routes to abstain from)"
+                )
             return self._zero_result(current_residual)
 
         # Training-only masks are accepted for integration compatibility but never routed.
@@ -805,6 +1136,29 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             None,
             None,
         )
+        if self.ct_support_enabled:
+            support_l2 = self._ct_support_field(ct_details2)
+            support_l1 = F.interpolate(
+                support_l2,
+                size=gates_l1.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            floor_l2 = self.ct_reliability_floors[0].to(gates_l2)
+            floor_l1 = self.ct_reliability_floors[1].to(gates_l1)
+            support_l2 = self.apply_reliability_floor(
+                support_l2, floor_l2
+            )
+            support_l1 = self.apply_reliability_floor(
+                support_l1, floor_l1
+            )
+        else:
+            support_l2 = gates_l2.new_ones(
+                gates_l2.shape[0], 1, *gates_l2.shape[-2:]
+            )
+            support_l1 = gates_l1.new_ones(
+                gates_l1.shape[0], 1, *gates_l1.shape[-2:]
+            )
         evidence_l2, evidence_diagnostics_l2 = self._level_evidence(
             0,
             residual_details2,
@@ -829,9 +1183,24 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             gabor_orientation,
             gabor_anisotropy,
         )
+        # Apply CT only after constructing learnable amplitude/route evidence:
+        # it controls spatial support but cannot determine PET band amplitude.
+        gates_l2 = gates_l2 * support_l2
+        gates_l1 = gates_l1 * support_l1
 
-        delta_l2 = self.amplitude_heads[0](evidence_l2)[:, :, None, None]
-        delta_l1 = self.amplitude_heads[1](evidence_l1)[:, :, None, None]
+        if self._effective_policy == "h3_native_null":
+            # H3-v2 is an evidence-free fixed schedule.  The route mass is the
+            # only learned-mechanism intervention; evidence-dependent amplitude
+            # heads are structurally bypassed.
+            delta_l2 = evidence_l2.new_zeros(
+                evidence_l2.shape[0], evidence_l2.shape[1], 1, 1
+            )
+            delta_l1 = evidence_l1.new_zeros(
+                evidence_l1.shape[0], evidence_l1.shape[1], 1, 1
+            )
+        else:
+            delta_l2 = self.amplitude_heads[0](evidence_l2)[:, :, None, None]
+            delta_l1 = self.amplitude_heads[1](evidence_l1)[:, :, None, None]
         amplitude_l2 = (gates_l2 * (1.0 + delta_l2)).clamp(0.0, self.gate_max)
         amplitude_l1 = (gates_l1 * (1.0 + delta_l1)).clamp(0.0, self.gate_max)
 
@@ -843,6 +1212,21 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             1, evidence_l1, current_residual, timestep, schedule
         )
         temporal_smoothness = 0.5 * (temporal_l2 + temporal_l1)
+
+        # Uncertainty-aware abstention (H4-v2 interface).  Replaces routes in
+        # place when enabled; low-confidence (level, band) entries become exactly
+        # the frozen fixed-policy fallback, so gradient flows only through the
+        # active evidence routes.  Mask / PET target never enter this path.
+        selector_diagnostics = self._apply_uncertainty_aware_selection(
+            routes_l2=routes_l2,
+            routes_l1=routes_l1,
+            router_confidence=router_confidence,
+            reference=current_residual,
+        )
+        if selector_diagnostics is not None:
+            routes_l2 = selector_diagnostics["router_selected_routes_l2"]
+            routes_l1 = selector_diagnostics["router_selected_routes_l1"]
+            diagnostics.update(selector_diagnostics)
 
         # Update route diagnostics
         diagnostics.update(
@@ -892,6 +1276,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             {
                 "gates_l2": amplitude_l2,
                 "gates_l1": amplitude_l1,
+                "ct_support_l2": support_l2,
+                "ct_support_l1": support_l1,
                 "routes_l2": routes_l2,
                 "routes_l1": routes_l1,
                 "noise_reliability": noise,
@@ -917,6 +1303,17 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                     (
                         evidence_diagnostics_l2["gabor_dct_agreement"],
                         evidence_diagnostics_l1["gabor_dct_agreement"],
+                    ),
+                    dim=1,
+                ),
+                "noise_calibrated_band_evidence": torch.stack(
+                    (
+                        evidence_diagnostics_l2[
+                            "noise_calibrated_band_evidence"
+                        ],
+                        evidence_diagnostics_l1[
+                            "noise_calibrated_band_evidence"
+                        ],
                     ),
                     dim=1,
                 ),

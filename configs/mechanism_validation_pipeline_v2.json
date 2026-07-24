@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "pipeline_id": "H4_V2_INTERNAL_EXPLORATORY_NESTED_CV_V1",
+  "status": "INTERNAL_EXPLORATORY_PROTOCOL_FROZEN",
+  "dataset": {
+    "patients": 155,
+    "samples": 1191,
+    "mechanism_train_patients": 99,
+    "calibration_patients": 25,
+    "validation_patients": 31,
+    "test_set_exists": false,
+    "additional_cohort_assumed": false,
+    "validation_previously_exposed": true
+  },
+  "historical_v1": {
+    "H4": "FAIL",
+    "preserve": true
+  },
+  "current_protocol": {
+    "config": "configs/h4_v2_internal_exploratory_nested_cv_v1.json",
+    "command": "pixi run mechanism-v2-internal",
+    "partition_unit": "patient",
+    "outer_folds": 5,
+    "inner_folds": 5,
+    "comparators": [
+      "no_route",
+      "h3_fixed_schedule",
+      "original_evidence",
+      "uncertainty_aware"
+    ]
+  },
+  "interpretation": "existing-dataset internal exploratory support only"
+}

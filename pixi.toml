@@ -17,8 +17,19 @@ data-manifest = "python -m src.data.data_manifest --raw-root Data --dicom-root D
 # 2. 从 manifest 读取 DICOM/label，生成训练用 .npz 张量缓存
 data-cache = "python -m src.data.dataset --manifest cache/manifest.csv --out-dir cache/tensors --image-size 192"
 
-# 2b. Build cache from the sibling ../main_data PNG split folder.
-data-cache-png-main = "python -m src.data.png_cache --png-root ../main_data --split-csv ../main_data/split.csv --out-dir cache/tensors_main --split-manifest ../main_data/split_manifest.csv --image-size 192"
+# 2b. Build the locked PNG cache without overwriting the authoritative manifest.
+data-cache-png-main = "python -m src.data.png_cache --png-root main_data --split-csv main_data/split_manifest.csv --out-dir cache/tensors_main --split-manifest cache/tensors_main_manifest.csv --image-size 192 --pet-subdirs pet --normalization auto --mask-threshold 0.5 --pet-invert"
+
+# Strict mechanism gates. The all-scope task fails closed while any H2-H6
+# validator is still marked unimplemented in the locked pipeline spec.
+mechanism-validate-local = "python scripts/run_all_mechanism_validations.py --scope local"
+mechanism-validate-all = "python scripts/run_all_mechanism_validations.py --scope all"
+mechanism-validate-plan = "python scripts/run_all_mechanism_validations.py --scope all --dry-run"
+mechanism-v2-freeze = "python scripts/freeze_h4_v2_internal_cv_plan.py"
+mechanism-v2-internal = "python scripts/run_h4_v2_internal_exploratory_pipeline.py"
+mechanism-v2-plan = "python scripts/run_h4_v2_internal_exploratory_pipeline.py --plan"
+v2-cloud-stage03 = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_cloud_v2_stage03.ps1"
+v2-inference-audit = "python scripts/audit_v2_inference_admissibility.py"
 
 # 3. 从 .npz 缓存生成 train/val/test 患者级划分清单
 data-split = "python -m src.data.split_manifest --cache-dir cache/tensors --output cache/split_manifest.csv --val-ratio 0.15 --seed 42"

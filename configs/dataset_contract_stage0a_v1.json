@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "contract_name": "ct_pet_png_dataset_contract",
+  "contract_status": "LOCKED",
+  "immutability": "content-addressed; any field change invalidates contract_sha256",
+  "hash_canonicalization": "UTF-8 JSON of contract body; sorted keys; compact separators",
+  "manifest": {
+    "path": "main_data/split_manifest.csv",
+    "semantic_sha256": "2d0638808211e67483a60b43467533456a95c22688765b67af6cf22cf427711c",
+    "source_file_sha256": "6b2130712b14c6846645491bf924be9f3b41ef25c4159ed12fe306838283c9ce"
+  },
+  "raw_png": {
+    "root": "Data/data",
+    "file_count": 3573,
+    "combined_sha256": "b11734434326ea4079151bbb27cdff939e08aa581c47a186a94ca5358c93f9c9",
+    "modalities": {
+      "ct": 1191,
+      "pet": 1191,
+      "mask": 1191
+    }
+  },
+  "splits": {
+    "train": {
+      "samples": 954,
+      "patients": 124
+    },
+    "val": {
+      "samples": 237,
+      "patients": 31
+    },
+    "test": {
+      "samples": 0,
+      "patients": 0
+    }
+  },
+  "preprocessing": {
+    "schema_version": 1,
+    "output_image_size": [
+      192,
+      192
+    ],
+    "ct": {
+      "operation_order": [
+        "decode",
+        "resize",
+        "normalize"
+      ],
+      "decode": "PIL.Image.convert('L')",
+      "resize": "PIL.Image.Resampling.BILINEAR",
+      "normalization": "uint8 / 127.5 - 1.0",
+      "output_dtype": "float32",
+      "output_range": [
+        -1.0,
+        1.0
+      ]
+    },
+    "pet": {
+      "operation_order": [
+        "decode",
+        "resize",
+        "invert",
+        "normalize"
+      ],
+      "decode": "PIL.Image.convert('L')",
+      "resize": "PIL.Image.Resampling.BILINEAR",
+      "polarity": "invert white-canvas/dark-uptake as 255 - pixel",
+      "normalization": "inverted_uint8 / 127.5 - 1.0",
+      "output_dtype": "float32",
+      "output_range": [
+        -1.0,
+        1.0
+      ]
+    },
+    "mask": {
+      "operation_order": [
+        "decode",
+        "resize",
+        "threshold",
+        "cast"
+      ],
+      "decode": "PIL.Image.convert('L')",
+      "resize": "PIL.Image.Resampling.NEAREST",
+      "threshold_uint8": {
+        "operator": ">",
+        "value": 127
+      },
+      "threshold_normalized_equivalent": {
+        "operator": ">",
+        "value": 0.5
+      },
+      "output_dtype": "float32",
+      "output_values": [
+        0.0,
+        1.0
+      ]
+    },
+    "selection_policy": {
+      "split_authority": "main_data/split_manifest.csv",
+      "physical_train_val_directories_are_file_stores_only": true
+    }
+  },
+  "preprocessing_config_sha256": "b0d3cf7a693e9c2663afde936b1bb68e5f551b3633e6428f6bb5a8dac3c44285",
+  "cloud_cache_metadata_required": {
+    "manifest_semantic_sha256": "2d0638808211e67483a60b43467533456a95c22688765b67af6cf22cf427711c",
+    "raw_png_combined_sha256": "b11734434326ea4079151bbb27cdff939e08aa581c47a186a94ca5358c93f9c9",
+    "preprocessing_config_sha256": "b0d3cf7a693e9c2663afde936b1bb68e5f551b3633e6428f6bb5a8dac3c44285",
+    "dataset_contract_sha256": "must equal this file's contract_sha256"
+  },
+  "claim_boundary": {
+    "dataset_hypothesis_allowed": true,
+    "model_mechanism_claims_allowed": false
+  },
+  "contract_sha256": "f43229d1d03f9bc68ad6218d009b9915155e00fcb4b95a0f9666d1c323cc88c1"
+}

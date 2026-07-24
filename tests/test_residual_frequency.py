@@ -464,6 +464,42 @@ class TestResidualBBDMIntegration:
         assert torch.isfinite(loss)
         assert "frequency/route_l2_null" in logs
         assert "frequency/route_l1_null" in logs
+
+    def test_uncertainty_aware_selector_threaded_through_main_model_forward(self):
+        # V2-05 gap closure: router_confidence must be threaded from the batch
+        # all the way to SpectralEvidenceFrequencyRouter. With the flag ON, a
+        # batch lacking router_confidence fails closed; with it present, the
+        # selector diagnostics reach the top-level logs.
+        from src.model.frequency.spectral_router import (
+            SpectralEvidenceFrequencyRouter,
+        )
+        from src.model.slmf_bbdm import SLMFBBDM
+
+        cfg = _enable_v5(_residual_config(frequency=True, gabor=True))
+        cfg["modules"]["residual_frequency"]["cross_level_router"].update({
+            "uncertainty_aware_enabled": True,
+            "uncertainty_aware_confidence_threshold": 0.5,
+        })
+        model = SLMFBBDM.from_config(cfg)
+        assert isinstance(
+            model.residual_preconditioner, SpectralEvidenceFrequencyRouter
+        )
+        assert (
+            model.residual_preconditioner._uncertainty_aware_selector is not None
+        )
+
+        batch = _model_batch()
+        # Batch without router_confidence -> fail closed when the flag is ON.
+        with pytest.raises(ValueError, match="router_confidence"):
+            model(batch, timesteps=torch.tensor([50]))
+
+        # Supplying router_confidence lets the forward complete and surface
+        # selector diagnostics at the top level.
+        batch["router_confidence"] = torch.ones(1, 2, 3)
+        loss, logs = model(batch, timesteps=torch.tensor([50]))
+        assert torch.isfinite(loss)
+        assert "frequency/router_active_fraction" in logs
+        assert logs["frequency/router_active_fraction"].item() == 1.0
         assert "loss/spectral_router_regularization/loss" in logs
 
     def test_v5_requires_gabor_only_when_gabor_evidence_is_enabled(self):

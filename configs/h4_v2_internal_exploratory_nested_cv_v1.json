@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "pipeline_id": "H4_V2_INTERNAL_EXPLORATORY_NESTED_CV_V1",
+  "status": "FROZEN_BEFORE_OUTER_EVALUATION",
+  "scope": "existing_155_patient_internal_exploratory_analysis",
+  "dataset_constraints": {
+    "patients": 155,
+    "samples": 1191,
+    "original_partitions": {
+      "mechanism_train": 99,
+      "calibration": 25,
+      "validation": 31
+    },
+    "test_set_exists": false,
+    "validation_is_previously_exposed": true,
+    "required_difficult_patients": [
+      "044",
+      "153"
+    ]
+  },
+  "partition": {
+    "unit": "patient",
+    "outer_folds": 5,
+    "inner_folds": 5,
+    "outer_seed": 20260811,
+    "inner_seed": 20260911,
+    "outer_balance_candidates": 4096,
+    "inner_balance_candidates": 2048,
+    "quantile_bins": 4,
+    "balance_continuous_fields": [
+      "slice_count",
+      "mean_mask_area",
+      "mean_pet_ll2_log_contrast"
+    ],
+    "balance_categorical_fields": [
+      "manifest_split",
+      "original_partition"
+    ],
+    "outer_role": "internal held-patient generalization estimate",
+    "inner_roles": [
+      "mechanism_train",
+      "calibration"
+    ]
+  },
+  "mechanism": {
+    "comparators": [
+      "no_route",
+      "h3_fixed_schedule",
+      "original_evidence",
+      "uncertainty_aware"
+    ],
+    "neighbor_radius": 1,
+    "same_orientation_cross_scale_context": true,
+    "population_normalization": "patient-excluded band-by-timestep robust statistics",
+    "patient_band_shrinkage_k": 60.0,
+    "ridge_alpha": 1.0,
+    "confidence_quantile_from_inner_calibration": 0.25,
+    "low_confidence_fallback": "h3_fixed_schedule"
+  },
+  "gates": {
+    "bootstrap_replicates": 10000,
+    "analysis_seed": 20261011,
+    "primary_comparisons": [
+      "uncertainty_vs_h3",
+      "uncertainty_vs_original"
+    ],
+    "primary_ci95_low": "> 0",
+    "primary_one_sided_sign_flip_p": "< 0.05",
+    "minimum_positive_outer_folds": 4,
+    "minimum_router_active_patient_mean": 0.5,
+    "robustness_subgroups": [
+      "few_slices",
+      "small_lesion",
+      "low_contrast"
+    ],
+    "subgroup_threshold_quantile_from_inner_mechanism_train": 0.25,
+    "subgroup_minimum_patients": 10,
+    "subgroup_raw_effect_estimate": ">= 0",
+    "subgroup_margin_adjusted_ci95_low": ">= 0",
+    "noninferiority_margin_fraction_of_inner_calibration_median_h3_mse": 0.05
+  },
+  "historical_constraint": {
+    "H4_v1_outcome": "FAIL",
+    "must_remain_unchanged": true
+  },
+  "required_reports": [
+    "every_outer_fold",
+    "patient_level_effect_and_bootstrap_95ci",
+    "improved_patient_fraction",
+    "few_slices",
+    "small_lesion",
+    "low_contrast",
+    "patients_044_and_153",
+    "original_partition_disclosure",
+    "all_four_comparators"
+  ],
+  "allowed_conclusions": {
+    "supported": "v2 获得现有数据集内部探索性支持",
+    "not_supported": "v2 未获得现有数据集内部支持"
+  },
+  "config_sha256": "891a30ece1793a3d13ae30df55597a0f4683861d8ed3c9428742fe851b973e83"
+}

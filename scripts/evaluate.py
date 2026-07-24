@@ -42,6 +42,10 @@ from scipy.ndimage import binary_dilation, binary_erosion, correlate
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.data.lineage import (
+    load_checkpoint_data_lineage,
+    validate_checkpoint_data_lineage,
+)
 from src.model.config_utils import load_full_config, resolve_runtime_profile
 from src.model.slmf_bbdm import SLMFBBDM
 from src.model.loss_terms.roi_suv import _de_collate_meta
@@ -499,6 +503,51 @@ def compute_false_hotspot_count(
     }
 
 
+def compute_target_relative_false_hotspots(
+    pred: np.ndarray,
+    target: np.ndarray,
+    lesion_mask: np.ndarray,
+    *,
+    excess_margin: float = 0.05,
+    target_quantile: float = 0.99,
+) -> Dict[str, float]:
+    """Target-relative off-lesion hot pixels in normalized PET space.
+
+    The legacy percentile count is nearly fixed when the PNG organ mask is
+    absent.  This endpoint instead requires a prediction to exceed both the
+    corresponding target pixel by a fixed margin and the target's off-lesion
+    high-intensity quantile.  Its threshold is independent of model output.
+    """
+
+    pred_2d = np.asarray(pred, dtype=np.float32).squeeze()
+    target_2d = np.asarray(target, dtype=np.float32).squeeze()
+    lesion = np.asarray(lesion_mask).squeeze() > 0.5
+    outside = ~lesion
+    if not outside.any():
+        return {
+            "target_relative_false_hotspot_count": 0.0,
+            "target_relative_false_hotspot_density": 0.0,
+            "target_relative_false_hotspot_mean_excess": 0.0,
+        }
+    target_threshold = float(np.quantile(target_2d[outside], target_quantile))
+    excess = pred_2d - target_2d
+    hotspot = (
+        outside
+        & (excess > excess_margin)
+        & (pred_2d > target_threshold)
+    )
+    count = int(np.count_nonzero(hotspot))
+    return {
+        "target_relative_false_hotspot_count": float(count),
+        "target_relative_false_hotspot_density": float(
+            count / max(int(np.count_nonzero(outside)), 1)
+        ),
+        "target_relative_false_hotspot_mean_excess": (
+            float(excess[hotspot].mean()) if count else 0.0
+        ),
+    }
+
+
 def compute_normalized_lesion_metrics(
     pred: np.ndarray,         # [1, H, W] in [-1, 1] (model output space)
     target: np.ndarray,       # [1, H, W] in [-1, 1]
@@ -822,7 +871,12 @@ def evaluate(
             for k, v in batch.items()
         }
 
-        with torch.amp.autocast("cuda", enabled=amp and device == "cuda", dtype=amp_dtype):
+        device_type = torch.device(device).type
+        with torch.amp.autocast(
+            "cuda",
+            enabled=amp and device_type == "cuda",
+            dtype=amp_dtype,
+        ):
             if mc_samples and mc_samples > 1:
                 sample_out = model.sample_mc(batch_gpu, n_samples=mc_samples, num_steps=mc_steps, progress=False)
             else:
@@ -860,7 +914,11 @@ def evaluate(
                 "ssim": compute_ssim(pred_np[0], target_np[0]),
                 "suv_valid": float(has_valid_suv),
             }
-            sample_metrics.update(compute_stripe_metrics(pred_np, target_np))
+            stripe_metrics = compute_stripe_metrics(pred_np, target_np)
+            sample_metrics.update(stripe_metrics)
+            sample_metrics["stripe_abs_excess"] = abs(
+                stripe_metrics["stripe_excess"]
+            )
             sample_metrics.update(
                 compute_boundary_metrics(
                     pred_np,
@@ -921,6 +979,13 @@ def evaluate(
             # False hotspots
             fh = compute_false_hotspot_count(pred_np, organ_np)
             sample_metrics.update(fh)
+            sample_metrics.update(
+                compute_target_relative_false_hotspots(
+                    pred_np,
+                    target_np,
+                    mask_np,
+                )
+            )
 
             all_metrics.append(sample_metrics)
             for k, v in sample_metrics.items():
@@ -1130,10 +1195,19 @@ def main():
     # Build model
     print("Building model...")
     model = SLMFBBDM.from_config(config)
+    expected_data_lineage = load_checkpoint_data_lineage(config)
 
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        validate_checkpoint_data_lineage(
+            ckpt,
+            expected_data_lineage,
+            required=bool(
+                config.get("data", {}).get("require_cache_lineage", False)
+            ),
+            context=f"evaluation checkpoint {args.checkpoint}",
+        )
         state, state_source = _select_checkpoint_state(ckpt, weights=args.weights)
         model.load_state_dict(state)
         print(f"Checkpoint weights: {state_source}")

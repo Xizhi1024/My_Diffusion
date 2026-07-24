@@ -1,0 +1,422 @@
+{
+  "schema_version": 1,
+  "pipeline_id": "ct_pet_residual_brownian_bridge_mechanism_v1",
+  "policy": {
+    "ordering": "falsify_before_implementation",
+    "patient_unit_required": true,
+    "threshold_sources": [
+      "mechanism_train",
+      "calibration"
+    ],
+    "validation_or_test_driven_training_forbidden": true,
+    "patient_bootstrap_95ci_required": true,
+    "correlation_is_not_causality_or_mutual_information": true,
+    "failed_gate_stops_dependent_stages": true,
+    "decision_json_required_per_stage": true,
+    "unverified_checkpoint_forbidden": true
+  },
+  "decision_profiles": {
+    "model_mechanism": {
+      "required_assertions": {
+        "guardrails.patient_unit": "patient",
+        "guardrails.threshold_source": "mechanism_train_and_calibration_only",
+        "guardrails.validation_or_test_drives_training_or_course": false,
+        "guardrails.patient_bootstrap_95ci": true,
+        "guardrails.causal_or_mutual_information_claimed": false,
+        "guardrails.checkpoint_lineage": "PASS"
+      }
+    }
+  },
+  "stages": [
+    {
+      "id": "00A_data_audit",
+      "title": "Stage 0A local raw-data gate",
+      "hypothesis": "DATA",
+      "scopes": [
+        "local",
+        "all"
+      ],
+      "implemented": true,
+      "output": "results/mechanism_validation/00_data_audit",
+      "command": [
+        "{python}",
+        "scripts/run_mechanism_stage0_data_audit.py",
+        "--root",
+        "{root}",
+        "--output",
+        "{output}",
+        "--raw-root",
+        "{raw_root}",
+        "--locked-contract",
+        "{contract}",
+        "--skip-checkpoint-inventory"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "data_gate",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": []
+    },
+    {
+      "id": "00B_h1_spectral_asymmetry",
+      "title": "H1 CT support / PET amplitude spectral asymmetry",
+      "hypothesis": "H1",
+      "scopes": [
+        "local",
+        "all"
+      ],
+      "implemented": true,
+      "output": "results/mechanism_validation/00B_h1_spectral_asymmetry",
+      "command": [
+        "{python}",
+        "scripts/validate_h1_local_spectral_asymmetry.py",
+        "--root",
+        "{root}",
+        "--output",
+        "{output}",
+        "--raw-root",
+        "{raw_root}"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "00A_data_audit"
+      ]
+    },
+    {
+      "id": "00C_cloud_data_gate",
+      "title": "Stage 0C cache numerical and lineage gate",
+      "hypothesis": "DATA",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "output": "results/mechanism_validation/00C_cloud_data_gate",
+      "command": [
+        "{python}",
+        "scripts/run_cloud_stage0c_gate.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--raw-root",
+        "{raw_root}",
+        "--cache-dir",
+        "{cache_dir}",
+        "--output",
+        "{output}",
+        "--seal-cache"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "cloud_training_gate",
+      "pass_value": "PASS",
+      "contract_path": "fingerprints.dataset_contract_sha256",
+      "requires": [
+        "00A_data_audit",
+        "00B_h1_spectral_asymmetry"
+      ]
+    },
+    {
+      "id": "01_h2_residual_enrichment",
+      "title": "H2 pathology-excluded conditional-mean residual enrichment and boundary safety",
+      "hypothesis": "H2",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/01_h2_residual_enrichment",
+      "command": [
+        "{python}",
+        "scripts/validate_h2_pathology_excluded_residual.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h1-decision",
+        "{root}/results/mechanism_validation/00B_h1_spectral_asymmetry/decision.json",
+        "--manifest",
+        "{raw_root}/split_manifest.csv",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "00C_cloud_data_gate"
+      ]
+    },
+    {
+      "id": "02_h3_recoverability_curves",
+      "title": "H3 log-SNR recoverability curves for coarse, shape, intensity, and local frequency",
+      "hypothesis": "H3",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/02_h3_recoverability_curves",
+      "command": [
+        "{python}",
+        "scripts/validate_h3_logsnr_recoverability.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h2-decision",
+        "{root}/results/mechanism_validation/01_h2_residual_enrichment/decision.json",
+        "--manifest",
+        "{raw_root}/split_manifest.csv",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "01_h2_residual_enrichment"
+      ]
+    },
+    {
+      "id": "03_h4_noise_calibration",
+      "title": "H4 pure-noise residual-band evidence calibration",
+      "hypothesis": "H4",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/03_h4_noise_calibration",
+      "command": [
+        "{python}",
+        "scripts/validate_h4_noise_band_calibration.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h3-decision",
+        "{root}/results/mechanism_validation/02_h3_recoverability_curves/decision.json",
+        "--manifest",
+        "{raw_root}/split_manifest.csv",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "02_h3_recoverability_curves"
+      ]
+    },
+    {
+      "id": "04_ct_support_head",
+      "title": "CT support-head prerequisite gate",
+      "hypothesis": "H5_PREREQUISITE",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/04_ct_support_head",
+      "command": [
+        "{python}",
+        "scripts/validate_ct_support_head.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h1-decision",
+        "{root}/results/mechanism_validation/00B_h1_spectral_asymmetry/decision.json",
+        "--h4-decision",
+        "{root}/results/mechanism_validation/03_h4_noise_calibration/decision.json",
+        "--output",
+        "{output}"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "03_h4_noise_calibration"
+      ]
+    },
+    {
+      "id": "05_curriculum",
+      "title": "Mechanism-train/calibration-only curriculum gate",
+      "hypothesis": "H5_PREREQUISITE",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/05_curriculum",
+      "command": [
+        "{python}",
+        "scripts/validate_mechanism_curriculum.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h3-decision",
+        "{root}/results/mechanism_validation/02_h3_recoverability_curves/decision.json",
+        "--h4-decision",
+        "{root}/results/mechanism_validation/03_h4_noise_calibration/decision.json",
+        "--ct-head-decision",
+        "{root}/results/mechanism_validation/04_ct_support_head/decision.json",
+        "--output",
+        "{output}",
+        "--formal-epochs",
+        "50"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "04_ct_support_head"
+      ]
+    },
+    {
+      "id": "06_artifact_safety",
+      "title": "False-hotspot, stripe, mask-boundary, and global-error safety gate",
+      "hypothesis": "H5_PREREQUISITE",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/06_artifact_safety",
+      "command": [
+        "{python}",
+        "scripts/validate_artifact_safety.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h2-decision",
+        "{root}/results/mechanism_validation/01_h2_residual_enrichment/decision.json",
+        "--curriculum-decision",
+        "{root}/results/mechanism_validation/05_curriculum/decision.json",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}",
+        "--epochs",
+        "50",
+        "--mc-steps",
+        "20"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "05_curriculum"
+      ]
+    },
+    {
+      "id": "07_h5_router_roles",
+      "title": "H5 separate CT-support, recoverability, and artifact-safety router roles",
+      "hypothesis": "H5",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/07_h5_router_roles",
+      "command": [
+        "{python}",
+        "scripts/validate_h5_router_role_separation.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h2-decision",
+        "{root}/results/mechanism_validation/01_h2_residual_enrichment/decision.json",
+        "--curriculum-decision",
+        "{root}/results/mechanism_validation/05_curriculum/decision.json",
+        "--artifact-decision",
+        "{root}/results/mechanism_validation/06_artifact_safety/decision.json",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}",
+        "--epochs",
+        "50",
+        "--mc-steps",
+        "20"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "06_artifact_safety"
+      ]
+    },
+    {
+      "id": "08_h6_final_integration",
+      "title": "H6 final small-lesion benefit with artifact and global-error non-inferiority",
+      "hypothesis": "H6",
+      "scopes": [
+        "all"
+      ],
+      "implemented": true,
+      "decision_profile": "model_mechanism",
+      "output": "results/mechanism_validation/08_h6_final_integration",
+      "command": [
+        "{python}",
+        "scripts/validate_h6_final_integration.py",
+        "--root",
+        "{root}",
+        "--contract",
+        "{contract}",
+        "--h2-decision",
+        "{root}/results/mechanism_validation/01_h2_residual_enrichment/decision.json",
+        "--curriculum-decision",
+        "{root}/results/mechanism_validation/05_curriculum/decision.json",
+        "--h5-decision",
+        "{root}/results/mechanism_validation/07_h5_router_roles/decision.json",
+        "--cache-dir",
+        "{cache_dir}",
+        "--cache-lineage",
+        "{cache_dir}/cache_lineage.json",
+        "--output",
+        "{output}",
+        "--epochs",
+        "50",
+        "--mc-steps",
+        "20"
+      ],
+      "decision_file": "decision.json",
+      "pass_path": "decision",
+      "pass_value": "PASS",
+      "contract_path": "dataset_contract_sha256",
+      "requires": [
+        "07_h5_router_roles"
+      ]
+    }
+  ]
+}

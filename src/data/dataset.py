@@ -405,9 +405,20 @@ class CachedDataset(Dataset):
             pid, slc = _parse_sample_id(sid)
 
             if manifest is not None:
-                entry_split = manifest.get_split(sid)
-                if not entry_split:
+                manifest_entry = manifest.get_entry(sid)
+                if not manifest_entry:
                     continue  # skip samples not in manifest
+                entry_split = manifest_entry["split"]
+                # The manifest is authoritative.  In particular, external
+                # cohorts may use site-prefixed IDs that cannot be recovered
+                # safely from a cache filename pattern.
+                pid = str(manifest_entry["patient_id"])
+                raw_slice_id = manifest_entry.get("slice_id", "")
+                try:
+                    slc = int(float(raw_slice_id))
+                except (TypeError, ValueError):
+                    _, parsed_slice = _parse_sample_id(sid)
+                    slc = parsed_slice if parsed_slice is not None else 0
             else:
                 meta_path = self.cache_dir / f"{sid}_meta.json"
                 entry_split = split

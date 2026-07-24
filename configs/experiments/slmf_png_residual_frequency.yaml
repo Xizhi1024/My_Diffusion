@@ -8,7 +8,7 @@ experiment:
 data:
   mode: png
   cache_dir: cache/tensors_main
-  split_manifest: ../main_data/split_manifest.csv
+  split_manifest: main_data/split_manifest.csv
   image_size: 192
   batch_size: 4
   val_batch_size: 4

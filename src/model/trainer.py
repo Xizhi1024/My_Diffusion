@@ -21,8 +21,43 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from src.data.lineage import (
+    attach_data_lineage,
+    load_checkpoint_data_lineage,
+    validate_checkpoint_data_lineage,
+)
+
 from .slmf_bbdm import SLMFBBDM
 from .ema import EMA
+
+
+def resolve_checkpoint_dir(config: Dict[str, Any]) -> str:
+    """Return the configured checkpoint directory without changing legacy runs.
+
+    Strict audit runners can set ``training.checkpoint_dir`` to keep every
+    mutable training artifact inside a run-owned directory.  Existing configs
+    continue to use ``checkpoints/<experiment.name>``.
+    """
+    explicit = config.get("training", {}).get("checkpoint_dir")
+    if explicit is not None:
+        explicit = os.fspath(explicit).strip()
+        if not explicit:
+            raise ValueError("training.checkpoint_dir must not be empty")
+        return explicit
+    exp_name = config.get("experiment", {}).get("name", "slmf_bbdm")
+    return os.path.join("checkpoints", exp_name)
+
+
+def resolve_sample_dir(config: Dict[str, Any]) -> str:
+    """Return a run-owned sample directory when one is explicitly configured."""
+    explicit = config.get("runtime", {}).get("sample_dir")
+    if explicit is not None:
+        explicit = os.fspath(explicit).strip()
+        if not explicit:
+            raise ValueError("runtime.sample_dir must not be empty")
+        return explicit
+    exp_name = config.get("experiment", {}).get("name", "slmf_bbdm")
+    return os.path.join("outputs", "samples", exp_name)
 
 
 def _stripe_score(pred_np: np.ndarray) -> float:
@@ -272,6 +307,7 @@ class Trainer:
         self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.data_lineage = load_checkpoint_data_lineage(config)
 
         run_cfg = config.get("runtime", {})
         self.amp = run_cfg.get("amp", True)
@@ -872,15 +908,14 @@ class Trainer:
 
         save_dir = ""
         if self.best_ckpts_enabled:
-            exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
-            save_dir = os.path.join("checkpoints", exp_name)
+            save_dir = resolve_checkpoint_dir(self.config)
             os.makedirs(save_dir, exist_ok=True)
 
         def _save(tag: str, score: float) -> None:
             if not self.best_ckpts_enabled or not improvements[tag]:
                 return
             path = os.path.join(save_dir, f"ckpt_{tag}.pt")
-            torch.save({
+            checkpoint = {
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "scheduler": self.scheduler.state_dict(),
@@ -891,7 +926,13 @@ class Trainer:
                 "metrics": metrics,
                 "config": self.config,
                 "monitoring": self._monitoring_state_dict(),
-            }, path)
+            }
+            torch.save(
+                attach_data_lineage(
+                    checkpoint, getattr(self, "data_lineage", None)
+                ),
+                path,
+            )
             print(f"  ★ new best {tag} (score={score:.4f}) → {path}")
 
         _save("best_lesion", lesion)
@@ -925,8 +966,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, tag: Optional[str] = None):
-        exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
-        save_dir = os.path.join("checkpoints", exp_name)
+        save_dir = resolve_checkpoint_dir(self.config)
         os.makedirs(save_dir, exist_ok=True)
         fname = f"ckpt_epoch{self.epoch_count:04d}.pt" if tag is None else f"ckpt_{tag}.pt"
         path = os.path.join(save_dir, fname)
@@ -940,7 +980,12 @@ class Trainer:
             "config": self.config,
             "monitoring": self._monitoring_state_dict(),
         }
-        torch.save(checkpoint, path)
+        torch.save(
+            attach_data_lineage(
+                checkpoint, getattr(self, "data_lineage", None)
+            ),
+            path,
+        )
         print(f"  Saved → {path}")
 
     def _save_sample_grid(self, batch: dict, synth_pet: torch.Tensor) -> None:
@@ -953,8 +998,7 @@ class Trainer:
             print("  [sample grid skipped: matplotlib not available]")
             return
 
-        exp_name = self.config.get("experiment", {}).get("name", "slmf_bbdm")
-        sample_dir = os.path.join("outputs", "samples", exp_name)
+        sample_dir = resolve_sample_dir(self.config)
         os.makedirs(sample_dir, exist_ok=True)
 
         n = min(4, synth_pet.shape[0])
@@ -990,6 +1034,14 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        validate_checkpoint_data_lineage(
+            checkpoint,
+            self.data_lineage,
+            required=bool(
+                self.config.get("data", {}).get("require_cache_lineage", False)
+            ),
+            context=f"resume checkpoint {path}",
+        )
         self.model.load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scheduler.load_state_dict(checkpoint["scheduler"])

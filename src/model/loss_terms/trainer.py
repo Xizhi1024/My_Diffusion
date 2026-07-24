@@ -20,6 +20,12 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.utils.data import DataLoader
 
+from src.data.lineage import (
+    attach_data_lineage,
+    load_checkpoint_data_lineage,
+    validate_checkpoint_data_lineage,
+)
+
 from .slmf_bbdm import SLMFBBDM
 from .ema import EMA
 
@@ -53,6 +59,7 @@ class Trainer:
         self.config = config
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.data_lineage = load_checkpoint_data_lineage(config)
 
         run_cfg = config.get("runtime", {})
         self.amp = run_cfg.get("amp", True)
@@ -291,7 +298,12 @@ class Trainer:
             "step": self.step_count,
             "config": self.config,
         }
-        torch.save(checkpoint, path)
+        torch.save(
+            attach_data_lineage(
+                checkpoint, getattr(self, "data_lineage", None)
+            ),
+            path,
+        )
         print(f"  Saved → {path}")
 
     def _save_sample_grid(self, batch: dict, synth_pet: torch.Tensor) -> None:
@@ -338,6 +350,14 @@ class Trainer:
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        validate_checkpoint_data_lineage(
+            checkpoint,
+            self.data_lineage,
+            required=bool(
+                self.config.get("data", {}).get("require_cache_lineage", False)
+            ),
+            context=f"resume checkpoint {path}",
+        )
         self.model.load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scheduler.load_state_dict(checkpoint["scheduler"])

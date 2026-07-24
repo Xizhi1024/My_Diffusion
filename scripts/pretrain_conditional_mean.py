@@ -14,6 +14,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.data.dataset import build_dataloaders
+from src.data.lineage import load_checkpoint_data_lineage
 from src.model.config_utils import (
     load_full_config,
     log_startup_status,
@@ -61,6 +62,12 @@ def main() -> None:
     _set_seed(seed)
     status = validate_png_baseline_config(config)
     log_startup_status(status)
+    data_lineage = load_checkpoint_data_lineage(config)
+    if data_lineage is not None:
+        print(
+            "Verified cache lineage: "
+            f"{data_lineage['cache_metadata_sha256']}"
+        )
 
     mean_cfg = config.get("modules", {}).get("conditional_mean", {})
     if not mean_cfg.get("enabled", False):
