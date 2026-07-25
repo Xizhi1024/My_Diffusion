@@ -18,6 +18,7 @@ from .h3_native_null_schedule import (
     load_h3_native_null_schedule,
     native_null_routes,
 )
+from .prior_anchor_schedule import load_prior_anchor_schedule
 
 
 class BoundedAmplitudeHead(nn.Module):
@@ -128,6 +129,33 @@ class NoNullRouteHead(nn.Module):
         return F.softmax(self.final(self.features(evidence)), dim=-1)
 
 
+class BoundedActiveLogitDeltaHead(nn.Module):
+    """Predict a bounded log-odds correction and start at exact zero."""
+
+    def __init__(
+        self,
+        input_features: int,
+        hidden_channels: int,
+        maximum_absolute_delta: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if maximum_absolute_delta <= 0:
+            raise ValueError("maximum_absolute_delta must be positive")
+        self.maximum_absolute_delta = float(maximum_absolute_delta)
+        self.features = nn.Sequential(
+            nn.Linear(input_features, hidden_channels),
+            nn.SiLU(),
+        )
+        self.final = nn.Linear(hidden_channels, 1)
+        with torch.no_grad():
+            self.final.weight.zero_()
+            self.final.bias.zero_()
+
+    def forward(self, evidence: torch.Tensor) -> torch.Tensor:
+        raw = self.final(self.features(evidence)).squeeze(-1)
+        return self.maximum_absolute_delta * torch.tanh(raw)
+
+
 class UncertaintyAwareRouteSelector(nn.Module):
     """Abstain to a frozen H3 route schedule when evidence is uncertain.
 
@@ -222,6 +250,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     ``native_only``    – [1,0,0] frozen, no cross-level routing (pure native).
     ``fixed_prior``    – frozen softmax prior, e.g. [0.05,0.05,0.90].
     ``h3_native_null`` – frozen full-timestep [native,0,null] schedule.
+    ``prior_anchored_learned`` – H3 active prior + bounded adaptive correction.
     ``learned``        – 3-way softmax learned from evidence (native/shallow/null).
     ``learned_no_null``– 2-way softmax (native/shallow), no null option.
     ``legacy_off``     – (deprecated) cross_level_enabled=False → implicit [1,0,0]/[1,1,0].
@@ -231,6 +260,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         "native_only",
         "fixed_prior",
         "h3_native_null",
+        "prior_anchored_learned",
         "learned",
         "learned_no_null",
         "legacy_off",
@@ -269,7 +299,18 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         uncertainty_aware_confidence_threshold: Optional[float] = None,
         h3_schedule_path: Optional[str] = None,
         h3_schedule_sha256: Optional[str] = None,
+        h3_schedule_source: str = "formal_h3_v2",
+        h3_repository_root: Optional[str] = None,
+        h3_allow_unverified_preview_lineage: bool = False,
         h3_num_train_timesteps: int = 1000,
+        prior_warmup_epochs: int = 10,
+        prior_active_ramp_epochs: int = 10,
+        prior_destination_warmup_epochs: int = 30,
+        prior_destination_ramp_epochs: int = 10,
+        prior_anchor_decay_end_epoch: int = 100,
+        prior_anchor_final_scale: float = 0.10,
+        active_logit_delta_max: float = 2.0,
+        initial_destination_native_probability: float = 0.95,
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
@@ -290,6 +331,36 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
         if native_warmup_epochs < 0 or routing_ramp_epochs < 0:
             raise ValueError("routing warmup and ramp epochs must be non-negative")
+        if min(
+            prior_warmup_epochs,
+            prior_active_ramp_epochs,
+            prior_destination_warmup_epochs,
+            prior_destination_ramp_epochs,
+            prior_anchor_decay_end_epoch,
+        ) < 0:
+            raise ValueError("prior-anchored phase epochs must be non-negative")
+        if prior_active_ramp_epochs == 0 or prior_destination_ramp_epochs == 0:
+            raise ValueError("prior-anchored ramp epochs must be positive")
+        if (
+            prior_destination_warmup_epochs
+            < prior_warmup_epochs + prior_active_ramp_epochs
+        ):
+            raise ValueError(
+                "prior_destination_warmup_epochs must not precede the end of "
+                "the active-correction ramp"
+            )
+        if prior_anchor_decay_end_epoch <= prior_warmup_epochs:
+            raise ValueError(
+                "prior_anchor_decay_end_epoch must be after prior_warmup_epochs"
+            )
+        if not 0.0 < prior_anchor_final_scale <= 1.0:
+            raise ValueError("prior_anchor_final_scale must be in (0, 1]")
+        if active_logit_delta_max <= 0:
+            raise ValueError("active_logit_delta_max must be positive")
+        if not 0.5 < initial_destination_native_probability < 1.0:
+            raise ValueError(
+                "initial_destination_native_probability must be in (0.5, 1)"
+            )
         if ct_support_band not in {"l2_lh", "l2_hl", "l2_hh"}:
             raise ValueError("ct_support_band must be an L2 Haar detail band")
         if ct_support_direction not in {"+", "-"}:
@@ -323,6 +394,23 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.ct_support_only = bool(ct_support_only)
         self.h3_schedule_path = h3_schedule_path
         self.h3_schedule_sha256 = h3_schedule_sha256
+        self.h3_schedule_source = str(h3_schedule_source)
+        self.h3_repository_root = h3_repository_root
+        self.h3_allow_unverified_preview_lineage = bool(
+            h3_allow_unverified_preview_lineage
+        )
+        self.prior_warmup_epochs = int(prior_warmup_epochs)
+        self.prior_active_ramp_epochs = int(prior_active_ramp_epochs)
+        self.prior_destination_warmup_epochs = int(
+            prior_destination_warmup_epochs
+        )
+        self.prior_destination_ramp_epochs = int(prior_destination_ramp_epochs)
+        self.prior_anchor_decay_end_epoch = int(prior_anchor_decay_end_epoch)
+        self.prior_anchor_final_scale = float(prior_anchor_final_scale)
+        self.active_logit_delta_max = float(active_logit_delta_max)
+        self.initial_destination_native_probability = float(
+            initial_destination_native_probability
+        )
 
         # Resolve effective policy when legacy flags are used
         effective_policy = self._resolve_policy()
@@ -373,6 +461,27 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
             for _ in range(2)
         )
+        self.prior_active_heads = nn.ModuleList()
+        self.prior_destination_heads = nn.ModuleList()
+        if effective_policy == "prior_anchored_learned":
+            self.prior_active_heads.extend(
+                BoundedActiveLogitDeltaHead(
+                    self.evidence_features,
+                    hidden_channels,
+                    maximum_absolute_delta=self.active_logit_delta_max,
+                )
+                for _ in range(2)
+            )
+            self.prior_destination_heads.extend(
+                NoNullRouteHead(
+                    self.evidence_features,
+                    hidden_channels,
+                    initial_native_probability=(
+                        self.initial_destination_native_probability
+                    ),
+                )
+                for _ in range(2)
+            )
 
         # Replace base-class _ZeroProjection heads with bias-free variants.
         # The base class stores them as self.projection_heads[0..2]; we rebuild.
@@ -395,37 +504,67 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             persistent=False,
         )
         self._h3_schedule_metadata: Optional[Dict[str, object]] = None
-        if effective_policy == "h3_native_null":
+        if effective_policy in {"h3_native_null", "prior_anchored_learned"}:
             if not h3_schedule_path or not h3_schedule_sha256:
                 raise ValueError(
-                    "route_policy='h3_native_null' requires both "
+                    f"route_policy={effective_policy!r} requires both "
                     "h3_schedule_path and h3_schedule_sha256"
                 )
-            active_mass, schedule_metadata = load_h3_native_null_schedule(
-                h3_schedule_path,
-                expected_file_sha256=h3_schedule_sha256,
-                expected_num_train_timesteps=int(h3_num_train_timesteps),
-            )
+            if effective_policy == "h3_native_null":
+                active_mass, schedule_metadata = load_h3_native_null_schedule(
+                    h3_schedule_path,
+                    expected_file_sha256=h3_schedule_sha256,
+                    expected_num_train_timesteps=int(h3_num_train_timesteps),
+                )
+            else:
+                active_mass, schedule_metadata = load_prior_anchor_schedule(
+                    h3_schedule_path,
+                    schedule_source=self.h3_schedule_source,
+                    expected_file_sha256=h3_schedule_sha256,
+                    expected_num_train_timesteps=int(h3_num_train_timesteps),
+                    repository_root=self.h3_repository_root,
+                    allow_unverified_preview_lineage=(
+                        self.h3_allow_unverified_preview_lineage
+                    ),
+                )
             self.register_buffer(
                 "_h3_native_active_mass",
                 active_mass,
                 persistent=True,
             )
             self._h3_schedule_metadata = dict(schedule_metadata)
-            # The H3-v2 policy is frozen by construction. Evidence heads remain
-            # in the state-dict layout for checkpoint compatibility but cannot
-            # learn or influence this route.
-            for module in (
+            frozen_modules = (
                 self.amplitude_heads,
                 self.route_heads,
                 self.no_null_route_heads,
-            ):
+            )
+            # The fixed policy freezes every evidence head.  The anchored
+            # policy keeps only its two explicitly separated heads trainable.
+            for module in frozen_modules:
                 for parameter in module.parameters():
                     parameter.requires_grad_(False)
         elif h3_schedule_path is not None or h3_schedule_sha256 is not None:
             raise ValueError(
                 "h3_schedule_path/h3_schedule_sha256 are only valid with "
-                "route_policy='h3_native_null'"
+                "route_policy='h3_native_null' or "
+                "'prior_anchored_learned'"
+            )
+
+        if effective_policy == "prior_anchored_learned":
+            self.register_buffer(
+                "_prior_active_progress",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_prior_destination_progress",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "_prior_anchor_scale",
+                torch.tensor(1.0, dtype=torch.float32),
+                persistent=True,
             )
 
         # Uncertainty-aware route selector (H4-v2 interface).  OFF by default;
@@ -441,9 +580,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         )
         self._uncertainty_aware_selector: Optional[UncertaintyAwareRouteSelector] = None
         if self.uncertainty_aware_router_enabled:
-            if effective_policy == "h3_native_null":
+            if effective_policy in {"h3_native_null", "prior_anchored_learned"}:
                 raise ValueError(
-                    "h3_native_null cannot be combined with the "
+                    f"{effective_policy} cannot be combined with the "
                     "uncertainty-aware H4-v2 selector"
                 )
             if self._effective_policy not in {"learned", "learned_no_null"}:
@@ -482,6 +621,39 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
     def set_training_epoch(self, epoch: int) -> None:
         """Apply the configured native warm-up and learned-route ramp."""
+        if self._effective_policy == "prior_anchored_learned":
+            epoch = max(int(epoch), 0)
+            active_progress = self._phase_progress(
+                epoch,
+                start_epoch=self.prior_warmup_epochs,
+                ramp_epochs=self.prior_active_ramp_epochs,
+            )
+            destination_progress = self._phase_progress(
+                epoch,
+                start_epoch=self.prior_destination_warmup_epochs,
+                ramp_epochs=self.prior_destination_ramp_epochs,
+            )
+            decay_fraction = min(
+                max(
+                    (
+                        epoch - self.prior_warmup_epochs
+                    )
+                    / (
+                        self.prior_anchor_decay_end_epoch
+                        - self.prior_warmup_epochs
+                    ),
+                    0.0,
+                ),
+                1.0,
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * decay_fraction))
+            anchor_scale = self.prior_anchor_final_scale + (
+                1.0 - self.prior_anchor_final_scale
+            ) * cosine
+            self._prior_active_progress.fill_(active_progress)
+            self._prior_destination_progress.fill_(destination_progress)
+            self._prior_anchor_scale.fill_(anchor_scale)
+            return
         if self._effective_policy not in {"learned", "learned_no_null"}:
             return
         epoch = max(int(epoch), 0)
@@ -493,6 +665,17 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             return
         progress = (epoch - self.native_warmup_epochs + 1) / self.routing_ramp_epochs
         self.set_routing_progress(progress)
+
+    @staticmethod
+    def _phase_progress(
+        epoch: int,
+        *,
+        start_epoch: int,
+        ramp_epochs: int,
+    ) -> float:
+        if epoch < start_epoch:
+            return 0.0
+        return min(max((epoch - start_epoch + 1) / ramp_epochs, 0.0), 1.0)
 
     def _blend_with_native(self, routes: torch.Tensor) -> torch.Tensor:
         if self._effective_policy not in {"learned", "learned_no_null"}:
@@ -532,6 +715,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             # Dynamic rows are looked up in _acquire_routes.  This null vector
             # is only a safe construction-time placeholder.
             return [0.0, 0.0, 1.0]
+        if policy == "prior_anchored_learned":
+            # Dynamic rows are anchored to the H3 table at runtime.
+            return [0.0, 0.0, 1.0]
         if policy == "learned_no_null":
             # 2-way: native/shallow split of the non-null budget
             # Use the first two entries of fixed_prior, renormalized
@@ -543,6 +729,132 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         # learned / legacy_off: not used as fixed
         return [1.0, 0.0, 0.0]  # safe default
 
+    def _lookup_prior_active(
+        self,
+        *,
+        level_index: int,
+        timestep: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        active_mass = getattr(self, "_h3_native_active_mass", None)
+        if active_mass is None:
+            raise RuntimeError("prior-anchored H3 schedule buffer is missing")
+        if level_index not in (0, 1):
+            raise ValueError("level_index must identify L2 (0) or L1 (1)")
+        table = active_mass[level_index].transpose(0, 1)
+        prior = table.to(device=timestep.device)[timestep.long()]
+        return prior.to(device=reference.device, dtype=torch.float32)
+
+    def _retime_prior_evidence(
+        self,
+        evidence: torch.Tensor,
+        timestep: torch.Tensor,
+        schedule,
+        *,
+        level_index: int,
+        observed_band_abs_mean: torch.Tensor,
+    ) -> torch.Tensor:
+        """Update every explicitly timestep-dependent evidence feature."""
+        retimed = evidence.clone()
+        normalized_timestep, normalized_log_snr = self._time_features(
+            timestep,
+            schedule,
+            level_index,
+            evidence,
+        )
+        retimed[:, :, self.timestep_feature_index] = (
+            normalized_timestep[:, None].expand(-1, 3)
+        )
+        retimed[:, :, self.log_snr_feature_index] = (
+            normalized_log_snr[:, None].expand(-1, 3)
+        )
+        noise = self.noise_reliability(timestep, schedule).to(evidence)
+        retimed[:, :, self.dct_features + 5] = noise[:, level_index, None].expand(
+            -1, 3
+        )
+        if self.use_noise_release:
+            sigma = schedule.sigma_t[timestep].to(
+                device=evidence.device,
+                dtype=evidence.dtype,
+            )[:, None]
+            expected_abs_noise = sigma * math.sqrt(2.0 / math.pi)
+            log_ratio = torch.log(
+                (observed_band_abs_mean.to(evidence) + 1e-6)
+                / (expected_abs_noise + 1e-6)
+            )
+            calibrated = torch.tanh(log_ratio / 5.0)
+        else:
+            calibrated = torch.zeros_like(observed_band_abs_mean).to(evidence)
+        retimed[:, :, self.dct_features + 6] = calibrated
+        return retimed
+
+    def _prior_anchored_route_at(
+        self,
+        *,
+        level_index: int,
+        evidence: torch.Tensor,
+        reference: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        prior = self._lookup_prior_active(
+            level_index=level_index,
+            timestep=timestep,
+            reference=reference,
+        )
+        active_progress_value = float(self._prior_active_progress.item())
+        destination_progress_value = float(
+            self._prior_destination_progress.item()
+        )
+
+        # Do not call a closed branch: this gives grad=None, not merely a zero
+        # gradient, and prevents optimizer state from drifting before release.
+        if active_progress_value <= 0.0:
+            effective_delta = torch.zeros_like(prior)
+            active = prior
+        else:
+            raw_delta = self.prior_active_heads[level_index](evidence).float()
+            active_progress = self._prior_active_progress.to(
+                device=raw_delta.device,
+                dtype=torch.float32,
+            )
+            effective_delta = active_progress * raw_delta
+            odds_multiplier = torch.exp(
+                effective_delta.clamp(
+                    -self.active_logit_delta_max,
+                    self.active_logit_delta_max,
+                )
+            )
+            numerator = prior * odds_multiplier
+            denominator = (1.0 - prior) + numerator
+            active = numerator / denominator.clamp_min(1e-12)
+            active = torch.where(prior <= 0.0, torch.zeros_like(active), active)
+            active = torch.where(prior >= 1.0, torch.ones_like(active), active)
+
+        if destination_progress_value <= 0.0:
+            conditional_shallow = torch.zeros_like(active)
+        else:
+            learned_destination = self.prior_destination_heads[level_index](
+                evidence
+            ).float()
+            destination_progress = self._prior_destination_progress.to(
+                device=learned_destination.device,
+                dtype=torch.float32,
+            )
+            conditional_shallow = (
+                destination_progress * learned_destination[..., 1]
+            )
+        conditional_native = 1.0 - conditional_shallow
+        native = active * conditional_native
+        shallow = active * conditional_shallow
+        routes = torch.stack((native, shallow, 1.0 - active), dim=-1)
+        return routes.to(reference), {
+            "prior_active": prior,
+            "active": active,
+            "active_delta": effective_delta,
+            "conditional_shallow": conditional_shallow,
+            "shallow_probability": shallow,
+        }
+
     def _acquire_routes(
         self,
         level_index: int,
@@ -550,11 +862,23 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         reference: torch.Tensor,
         timestep: torch.Tensor,
         schedule,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        observed_band_abs_mean: Optional[torch.Tensor] = None,
+        return_diagnostics: bool = False,
+    ):
         """Return (routes, temporal_smoothness) for one level."""
         policy = self._effective_policy
         batch = evidence.shape[0]
         device = evidence.device
+
+        def _result(
+            routes: torch.Tensor,
+            temporal: torch.Tensor,
+            diagnostics: Optional[Dict[str, torch.Tensor]] = None,
+        ):
+            if return_diagnostics:
+                return routes, temporal, diagnostics or {}
+            return routes, temporal
 
         if policy in ("native_only", "fixed_prior"):
             # Fixed routes: expand batch and band dimensions
@@ -564,7 +888,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 else self._fixed_routes_l1
             )
             routes = fixed.view(1, 1, -1).expand(batch, 3, self._num_routes).to(device)
-            return routes, reference.new_zeros(())
+            return _result(routes, reference.new_zeros(()))
 
         if policy == "h3_native_null":
             active_mass = getattr(self, "_h3_native_active_mass", None)
@@ -586,7 +910,77 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 reference=reference,
             )
             temporal_smoothness = (routes - next_routes).abs().mean()
-            return routes, temporal_smoothness
+            return _result(routes, temporal_smoothness)
+
+        if policy == "prior_anchored_learned":
+            if observed_band_abs_mean is None:
+                raise ValueError(
+                    "prior-anchored routing requires observed band amplitudes "
+                    "for exact timestep retiming"
+                )
+            routes, current = self._prior_anchored_route_at(
+                level_index=level_index,
+                evidence=evidence,
+                reference=reference,
+                timestep=timestep,
+            )
+            final_timestep = int(schedule.num_train_timesteps) - 1
+            next_timestep = (timestep + 1).clamp_max(final_timestep)
+            previous_timestep = (timestep - 1).clamp_min(0)
+            next_evidence = self._retime_prior_evidence(
+                evidence,
+                next_timestep,
+                schedule,
+                level_index=level_index,
+                observed_band_abs_mean=observed_band_abs_mean,
+            )
+            previous_evidence = self._retime_prior_evidence(
+                evidence,
+                previous_timestep,
+                schedule,
+                level_index=level_index,
+                observed_band_abs_mean=observed_band_abs_mean,
+            )
+            next_routes, following = self._prior_anchored_route_at(
+                level_index=level_index,
+                evidence=next_evidence,
+                reference=reference,
+                timestep=next_timestep,
+            )
+            _, previous = self._prior_anchored_route_at(
+                level_index=level_index,
+                evidence=previous_evidence,
+                reference=reference,
+                timestep=previous_timestep,
+            )
+            prior_routes = torch.stack(
+                (
+                    current["prior_active"],
+                    torch.zeros_like(current["prior_active"]),
+                    1.0 - current["prior_active"],
+                ),
+                dim=-1,
+            ).to(routes)
+            next_prior_routes = torch.stack(
+                (
+                    following["prior_active"],
+                    torch.zeros_like(following["prior_active"]),
+                    1.0 - following["prior_active"],
+                ),
+                dim=-1,
+            ).to(next_routes)
+            temporal_smoothness = (
+                (routes - prior_routes) - (next_routes - next_prior_routes)
+            ).abs().mean()
+            diagnostics = {
+                **current,
+                "active_next": following["active"],
+                "delta_next": following["active_delta"],
+                "delta_prev": previous["active_delta"],
+                "has_next": timestep < final_timestep,
+                "has_prev": timestep > 0,
+            }
+            return _result(routes, temporal_smoothness, diagnostics)
 
         if policy == "legacy_off":
             # Old implicit behaviour: L2=[1,0,0], L1=[1,1,0]
@@ -595,7 +989,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             else:
                 vec = reference.new_tensor([1.0, 1.0, 0.0])
             routes = vec.view(1, 1, 3).expand(batch, 3, 3)
-            return routes, reference.new_zeros(())
+            return _result(routes, reference.new_zeros(()))
 
         if policy == "learned_no_null":
             # Two-way learnable router: native vs shallow, no null sink
@@ -615,7 +1009,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 self.no_null_route_heads[level_index](next_evidence)
             )
             temporal_smoothness = (routes - next_routes).abs().mean()
-            return routes, temporal_smoothness
+            return _result(routes, temporal_smoothness)
 
         # Learned 3-way policy: compute from evidence
         routes = self._blend_with_native(self.route_heads[level_index](evidence))
@@ -632,7 +1026,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             self.route_heads[level_index](next_evidence)
         )
         temporal_smoothness = (routes - next_routes).abs().mean()
-        return routes, temporal_smoothness
+        return _result(routes, temporal_smoothness)
 
     @staticmethod
     def _validate_inputs(current_residual: torch.Tensor, ct: torch.Tensor) -> None:
@@ -882,6 +1276,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "gabor_haar_agreement": gabor_haar_agreement,
             "gabor_dct_agreement": gabor_dct_agreement,
             "noise_calibrated_band_evidence": noise_calibrated_evidence,
+            "observed_band_abs_mean": residual.abs().mean(dim=(-2, -1)),
         }
 
     def _ct_support_field(
@@ -1188,7 +1583,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         gates_l2 = gates_l2 * support_l2
         gates_l1 = gates_l1 * support_l1
 
-        if self._effective_policy == "h3_native_null":
+        if self._effective_policy in {
+            "h3_native_null",
+            "prior_anchored_learned",
+        }:
             # H3-v2 is an evidence-free fixed schedule.  The route mass is the
             # only learned-mechanism intervention; evidence-dependent amplitude
             # heads are structurally bypassed.
@@ -1205,11 +1603,27 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         amplitude_l1 = (gates_l1 * (1.0 + delta_l1)).clamp(0.0, self.gate_max)
 
         diagnostics: Dict[str, torch.Tensor] = {}
-        routes_l2, temporal_l2 = self._acquire_routes(
-            0, evidence_l2, current_residual, timestep, schedule
+        routes_l2, temporal_l2, prior_diagnostics_l2 = self._acquire_routes(
+            0,
+            evidence_l2,
+            current_residual,
+            timestep,
+            schedule,
+            observed_band_abs_mean=evidence_diagnostics_l2[
+                "observed_band_abs_mean"
+            ],
+            return_diagnostics=True,
         )
-        routes_l1, temporal_l1 = self._acquire_routes(
-            1, evidence_l1, current_residual, timestep, schedule
+        routes_l1, temporal_l1, prior_diagnostics_l1 = self._acquire_routes(
+            1,
+            evidence_l1,
+            current_residual,
+            timestep,
+            schedule,
+            observed_band_abs_mean=evidence_diagnostics_l1[
+                "observed_band_abs_mean"
+            ],
+            return_diagnostics=True,
         )
         temporal_smoothness = 0.5 * (temporal_l2 + temporal_l1)
 
@@ -1232,9 +1646,78 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         diagnostics.update(
             self._route_diagnostics(routes_l2, routes_l1, current_residual)
         )
-        diagnostics["route_routing_progress"] = self._routing_progress.to(
-            device=current_residual.device, dtype=current_residual.dtype
-        )
+        if self._effective_policy == "prior_anchored_learned":
+            diagnostics["route_routing_progress"] = (
+                self._prior_destination_progress.to(
+                    device=current_residual.device,
+                    dtype=current_residual.dtype,
+                )
+            )
+            diagnostics["route_active_progress"] = (
+                self._prior_active_progress.to(
+                    device=current_residual.device,
+                    dtype=current_residual.dtype,
+                )
+            )
+            diagnostics["route_destination_progress"] = (
+                self._prior_destination_progress.to(
+                    device=current_residual.device,
+                    dtype=current_residual.dtype,
+                )
+            )
+            diagnostics["route_anchor_scale"] = self._prior_anchor_scale.to(
+                device=current_residual.device,
+                dtype=current_residual.dtype,
+            )
+            for key in (
+                "prior_active",
+                "active",
+                "active_delta",
+                "active_next",
+                "delta_prev",
+                "delta_next",
+                "conditional_shallow",
+                "shallow_probability",
+            ):
+                diagnostics[f"route_{key}"] = torch.stack(
+                    (
+                        prior_diagnostics_l2[key],
+                        prior_diagnostics_l1[key],
+                    ),
+                    dim=1,
+                )
+            diagnostics["route_has_next"] = prior_diagnostics_l2["has_next"]
+            diagnostics["route_has_prev"] = prior_diagnostics_l2["has_prev"]
+            active = diagnostics["route_active"].float()
+            prior_active = diagnostics["route_prior_active"].float()
+            active_next = diagnostics["route_active_next"].float()
+            has_next = diagnostics["route_has_next"][:, None, None]
+            monotonic_excess = torch.where(
+                has_next,
+                torch.relu(active_next - active),
+                torch.zeros_like(active),
+            )
+            diagnostics["route_prior_active_mae"] = (
+                active - prior_active
+            ).abs().mean()
+            diagnostics["route_active_delta_abs_mean"] = diagnostics[
+                "route_active_delta"
+            ].float().abs().mean()
+            diagnostics["route_active_delta_abs_max"] = diagnostics[
+                "route_active_delta"
+            ].float().abs().amax()
+            diagnostics["route_monotonic_violation"] = monotonic_excess.mean()
+            diagnostics["route_monotonic_violation_fraction"] = (
+                monotonic_excess > 1e-6
+            ).float().mean()
+            diagnostics["route_shallow_mass"] = diagnostics[
+                "route_shallow_probability"
+            ].float().mean()
+        else:
+            diagnostics["route_routing_progress"] = self._routing_progress.to(
+                device=current_residual.device,
+                dtype=current_residual.dtype,
+            )
 
         scale_l2 = self.band_scales[0].to(current_residual)
         scale_l1 = self.band_scales[1].to(current_residual)

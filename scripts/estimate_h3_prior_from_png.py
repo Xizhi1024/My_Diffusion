@@ -79,6 +79,57 @@ def _resolve(root: Path, value: str | Path) -> Path:
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
+def _looks_like_png_root(path: Path) -> bool:
+    return all(
+        any((path / split / modality).is_dir() for split in ("train", "val", "test"))
+        for modality in ("ct", "pet", "label")
+    )
+
+
+def select_png_root(
+    *,
+    root: Path,
+    explicit: Path | None,
+    dataset_contract_path: Path,
+) -> Path:
+    """Select a relative-layout PNG store without assuming local/cloud parity."""
+
+    if explicit is not None:
+        selected = _resolve(root, explicit)
+        if not _looks_like_png_root(selected):
+            raise FileNotFoundError(
+                f"--png-root is not a CT/PET/label PNG store: {explicit.as_posix()}"
+            )
+        return selected
+
+    contract = json.loads(dataset_contract_path.read_text(encoding="utf-8-sig"))
+    declared = ""
+    if isinstance(contract, Mapping):
+        raw_png = contract.get("raw_png", {})
+        if isinstance(raw_png, Mapping):
+            declared = str(raw_png.get("root", "") or "").strip()
+    candidates: list[Path] = []
+    if declared:
+        candidates.append(_resolve(root, declared))
+    candidates.extend((_resolve(root, "main_data"), _resolve(root, "Data/data")))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _looks_like_png_root(candidate):
+            return candidate
+    checked = [
+        portable_path(candidate, root=root)
+        for candidate in candidates
+        if candidate.is_relative_to(root)
+    ]
+    raise FileNotFoundError(
+        "Cannot locate a CT/PET/label PNG store; checked "
+        f"{checked}. Pass --png-root with a repository-relative path."
+    )
+
+
 def portable_path(path: Path, *, root: Path) -> str:
     """Serialize a repo-relative POSIX path without leaking a machine path."""
 
@@ -805,9 +856,13 @@ def _validate_dataset_contract(
 def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_h3_preview_parameters(args)
     root = args.root.resolve()
-    png_root = _resolve(root, args.png_root)
     manifest_path = _resolve(root, args.manifest)
     dataset_contract_path = _resolve(root, args.dataset_contract)
+    png_root = select_png_root(
+        root=root,
+        explicit=args.png_root,
+        dataset_contract_path=dataset_contract_path,
+    )
     checkpoint_path = _resolve(root, args.mean_checkpoint)
     output_dir = _resolve(root, args.output_dir)
     entries, partition, inventory = build_png_entries(
@@ -986,7 +1041,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--png-root", type=Path, default=Path("Data/data"))
+    parser.add_argument(
+        "--png-root",
+        type=Path,
+        default=None,
+        help=(
+            "Repository-relative raw PNG root. When omitted, check the dataset "
+            "contract path, main_data, then Data/data."
+        ),
+    )
     parser.add_argument(
         "--manifest",
         type=Path,

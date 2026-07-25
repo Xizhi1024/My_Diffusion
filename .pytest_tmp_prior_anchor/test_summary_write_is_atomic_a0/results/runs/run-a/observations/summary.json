@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "pipeline_id": "PRIOR_ANCHORED_ROUTER_100E_SUMMARY_V1",
+  "generated_at_utc": "2026-07-25T12:32:30.490556+00:00",
+  "decision": "INCOMPLETE",
+  "scientific_claim_allowed": false,
+  "reason": "This artifact reports run completeness and router observability; it does not establish clinical, production, or causal validity.",
+  "run_dir": "results/runs/run-a",
+  "resolved_config": "results/runs/run-a/resolved_config.yaml",
+  "resolved_config_sha256": "4e86b7d8d72ea5c4667a11ede820559c9729bfe6e23428ba22cbe8e168268e95",
+  "configured_total_epochs": 100,
+  "runner_state": {
+    "status": "INTERRUPTED",
+    "latest_epoch": 40,
+    "current_stage": null,
+    "error": null
+  },
+  "prior": {
+    "status": "PASS",
+    "path": "results/runs/run-a/prior/prior.json",
+    "sha256": "b377906b611605c1f381963111604dd02fe4e141951b0ffed67e8b801155a0fc",
+    "expected_sha256": "b377906b611605c1f381963111604dd02fe4e141951b0ffed67e8b801155a0fc",
+    "pipeline_id": "H3_DIRECT_PNG_PRIOR_PREVIEW_V1",
+    "decision": "PREVIEW_ONLY",
+    "preview_only": true,
+    "patients": null,
+    "crossings": {}
+  },
+  "checkpoints": {
+    "checkpoint_dir": "results/runs/run-a/checkpoints",
+    "records": [
+      {
+        "epoch": 10,
+        "step": 30,
+        "phase": "prior_frozen",
+        "path": "results/runs/run-a/checkpoints/ckpt_epoch0010.pt",
+        "sha256": "0e216bea84e69bd824b61071fac2588c460e8141675e5d70128ce0958a1ffcb5",
+        "status": "VALID"
+      }
+    ],
+    "valid_epochs": [
+      10
+    ],
+    "invalid_count": 0,
+    "duplicate_epochs": [],
+    "ignored_files": [],
+    "latest": {
+      "epoch": 10,
+      "step": 30,
+      "phase": "prior_frozen",
+      "path": "results/runs/run-a/checkpoints/ckpt_epoch0010.pt",
+      "sha256": "0e216bea84e69bd824b61071fac2588c460e8141675e5d70128ce0958a1ffcb5",
+      "status": "VALID"
+    },
+    "phase_observation_epochs": [
+      10,
+      20,
+      30,
+      40,
+      100
+    ],
+    "missing_phase_checkpoints": [
+      20,
+      30,
+      40,
+      100
+    ],
+    "final_checkpoint_valid": false
+  },
+  "metrics_jsonl": {
+    "path": "results/runs/run-a/training_metrics.jsonl",
+    "status": "NOT_WRITTEN",
+    "record_count": 0,
+    "epochs": [],
+    "duplicate_epochs": [],
+    "invalid_lines": [],
+    "latest": null,
+    "phase_observations": {}
+  },
+  "phase_contract": [
+    {
+      "checkpoint_epoch": 10,
+      "phase": "prior_frozen",
+      "checkpoint_present": true,
+      "metrics_present": false
+    },
+    {
+      "checkpoint_epoch": 20,
+      "phase": "active_ramp",
+      "checkpoint_present": false,
+      "metrics_present": false
+    },
+    {
+      "checkpoint_epoch": 30,
+      "phase": "active_only_hold",
+      "checkpoint_present": false,
+      "metrics_present": false
+    },
+    {
+      "checkpoint_epoch": 40,
+      "phase": "destination_ramp",
+      "checkpoint_present": false,
+      "metrics_present": false
+    },
+    {
+      "checkpoint_epoch": 100,
+      "phase": "full_adaptive",
+      "checkpoint_present": false,
+      "metrics_present": false
+    }
+  ]
+}

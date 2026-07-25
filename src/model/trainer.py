@@ -12,6 +12,8 @@ Covers the "common speed killers" checklist:
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -246,6 +248,8 @@ def _spectral_parameter_group(name: str) -> str:
             "residual_preconditioner.route_heads",
             "residual_preconditioner.no_null_route_heads",
             "residual_preconditioner.amplitude_heads",
+            "residual_preconditioner.prior_active_heads",
+            "residual_preconditioner.prior_destination_heads",
         )
     ):
         return "router"
@@ -389,6 +393,18 @@ class Trainer:
         self.tracked_sample_ids: List[str] = list(run_cfg.get("tracked_sample_ids", []) or [])
         self._tracked_batch: Optional[Dict[str, Any]] = None
         self._tracked_meta: Optional[List[Dict[str, Any]]] = None
+        self.metrics_jsonl = os.fspath(
+            run_cfg.get(
+                "metrics_jsonl",
+                run_cfg.get(
+                    "training_metrics_jsonl",
+                    os.path.join(
+                        resolve_checkpoint_dir(config),
+                        "training_metrics.jsonl",
+                    ),
+                ),
+            )
+        )
 
     def _apply_optimizer_step(self) -> None:
         """Apply one optimiser/EMA update and clear accumulated gradients."""
@@ -410,6 +426,14 @@ class Trainer:
             "grad/route_final": ((
                 "residual_preconditioner.route_heads",
                 "residual_preconditioner.no_null_route_heads",
+                "residual_preconditioner.prior_active_heads",
+                "residual_preconditioner.prior_destination_heads",
+            ), True),
+            "grad/prior_active_final": ((
+                "residual_preconditioner.prior_active_heads",
+            ), True),
+            "grad/prior_destination_final": ((
+                "residual_preconditioner.prior_destination_heads",
             ), True),
             "grad/amplitude_final": ((
                 "residual_preconditioner.amplitude_heads",
@@ -547,6 +571,79 @@ class Trainer:
 
         return avg_logs
 
+    @staticmethod
+    def _finite_metric_mapping(
+        values: Optional[Dict[str, float]],
+    ) -> Optional[Dict[str, Optional[float]]]:
+        if values is None:
+            return None
+        normalized: Dict[str, Optional[float]] = {}
+        for key, value in values.items():
+            numeric = float(value)
+            normalized[key] = numeric if math.isfinite(numeric) else None
+        return normalized
+
+    def _append_epoch_metrics(
+        self,
+        *,
+        train_logs: Dict[str, float],
+        eval_logs: Optional[Dict[str, float]],
+        validation_metrics: Optional[Dict[str, float]],
+    ) -> None:
+        """Append one portable, restart-safe monitoring record per epoch."""
+        metrics_path = os.path.normpath(self.metrics_jsonl)
+        parent = os.path.dirname(metrics_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        record = {
+            "schema_version": 1,
+            "epoch": int(self.epoch_count),
+            "step": int(self.step_count),
+            "train": self._finite_metric_mapping(train_logs),
+            "eval": self._finite_metric_mapping(eval_logs),
+            "validation": self._finite_metric_mapping(validation_metrics),
+        }
+        with open(metrics_path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+            handle.write("\n")
+
+    @staticmethod
+    def _print_prior_anchor_summary(train_logs: Dict[str, float]) -> None:
+        active = train_logs.get("frequency/prior_anchor_active_progress")
+        if active is None:
+            return
+        destination = train_logs.get(
+            "frequency/prior_anchor_destination_progress",
+            float("nan"),
+        )
+        prior_mae = train_logs.get(
+            "frequency/prior_anchor_prior_active_mae",
+            float("nan"),
+        )
+        shallow = train_logs.get(
+            "frequency/prior_anchor_shallow_mass",
+            float("nan"),
+        )
+        monotonic = train_logs.get(
+            "frequency/prior_anchor_monotonic_violation",
+            float("nan"),
+        )
+        print(
+            "  Router "
+            f"active_release={active:.2f} "
+            f"destination_release={destination:.2f} "
+            f"prior_mae={prior_mae:.4f} "
+            f"shallow={shallow:.4f} "
+            f"mono={monotonic:.6f}"
+        )
+
     # ------------------------------------------------------------------
     # Full training loop
     # ------------------------------------------------------------------
@@ -562,6 +659,11 @@ class Trainer:
             self._tracked_meta = None
             self.best_ckpts_enabled = False
             self.early_stopping_enabled = False
+        if not hasattr(self, "metrics_jsonl"):
+            self.metrics_jsonl = os.path.join(
+                resolve_checkpoint_dir(self.config),
+                "training_metrics.jsonl",
+            )
 
         print(f"\n{'='*60}")
         print(f"SLMF-BBDM Training")
@@ -575,6 +677,8 @@ class Trainer:
         while self.epoch_count < num_epochs:
             train_logs = self.train_epoch()
             tracked_sample_result = None
+            avg_eval = None
+            val_metrics = None
 
             total = train_logs.get("loss/total", 0)
             elapsed = time.time() - self.start_time
@@ -586,6 +690,7 @@ class Trainer:
                 f"Time: {elapsed:.0f}s ({epoch_s:.1f}s/ep) | "
                 f"LR: {lr:.2e}"
             )
+            self._print_prior_anchor_summary(train_logs)
 
             # Select fixed tracked samples once (lazy — val_loader must exist)
             self._initialize_tracked_batch()
@@ -593,7 +698,6 @@ class Trainer:
             # Evaluation (with EMA) + sample-based monitoring + model selection
             should_stop = False
             if self.val_loader is not None and self.epoch_count % self.eval_interval == 0:
-                val_metrics = None
                 combined_improved = False
                 with self.ema_scope(), self._eval_rng_scope():
                     eval_logs = [self.eval_step(b) for b in self.val_loader]
@@ -633,6 +737,12 @@ class Trainer:
                 synth_pet = tracked_sample_result["synthetic_pet"]
                 print(f"  Sample PET range: [{synth_pet.min().item():.4f}, {synth_pet.max().item():.4f}]")
                 self._save_sample_grid(self._tracked_batch, synth_pet)
+
+            self._append_epoch_metrics(
+                train_logs=train_logs,
+                eval_logs=avg_eval,
+                validation_metrics=val_metrics,
+            )
 
             if should_stop:
                 break

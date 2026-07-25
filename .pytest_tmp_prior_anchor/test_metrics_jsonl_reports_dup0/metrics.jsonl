@@ -1,0 +1,5 @@
+{"epoch": 10, "loss/total": 1.0, "frequency/route_active_progress": 0.0}
+{"epoch": 10, "loss/total": 0.9}
+{invalid
+{"loss/total": 0.8}
+{"epoch": 20, "router/prior_anchor": 0.2, "unrelated_tensor": [1, 2, 3]}

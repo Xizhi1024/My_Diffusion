@@ -24,6 +24,7 @@ from scripts.estimate_h3_prior_from_png import (
     portable_path,
     read_png_triplet,
     recoverability_from_statistics,
+    select_png_root,
 )
 from src.model.frequency.h3_native_null_schedule import (
     load_h3_native_null_schedule,
@@ -226,6 +227,27 @@ def test_pet_subdirectory_order_is_a_priority_not_a_duplicate(
     index = _index_pngs(root, ("pet", "pet_peizhuan"))
 
     assert index["001001"] == preferred
+
+
+def test_png_root_auto_detection_falls_back_from_local_to_cloud_layout(
+    tmp_path: Path,
+) -> None:
+    contract = tmp_path / "contract.json"
+    contract.write_text(
+        json.dumps({"raw_png": {"root": "Data/data"}}),
+        encoding="utf-8",
+    )
+    cloud_root = tmp_path / "main_data"
+    for modality in ("ct", "pet", "label"):
+        (cloud_root / "train" / modality).mkdir(parents=True)
+
+    selected = select_png_root(
+        root=tmp_path,
+        explicit=None,
+        dataset_contract_path=contract,
+    )
+
+    assert selected == cloud_root.resolve()
 
 
 def test_isotonic_prior_uses_train_patients_and_is_non_increasing() -> None:

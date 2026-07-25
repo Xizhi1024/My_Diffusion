@@ -603,8 +603,43 @@ class SLMFBBDM(nn.Module):
                     h3_schedule_sha256=cross_level_router_cfg.get(
                         "h3_schedule_sha256", None
                     ),
+                    h3_schedule_source=cross_level_router_cfg.get(
+                        "h3_schedule_source", "formal_h3_v2"
+                    ),
+                    h3_repository_root=cross_level_router_cfg.get(
+                        "h3_repository_root", "."
+                    ),
+                    h3_allow_unverified_preview_lineage=cross_level_router_cfg.get(
+                        "h3_allow_unverified_preview_lineage", False
+                    ),
                     h3_num_train_timesteps=int(
                         self.noise_schedule.num_train_timesteps
+                    ),
+                    prior_warmup_epochs=cross_level_router_cfg.get(
+                        "prior_warmup_epochs", 10
+                    ),
+                    prior_active_ramp_epochs=cross_level_router_cfg.get(
+                        "prior_active_ramp_epochs", 10
+                    ),
+                    prior_destination_warmup_epochs=cross_level_router_cfg.get(
+                        "prior_destination_warmup_epochs", 30
+                    ),
+                    prior_destination_ramp_epochs=cross_level_router_cfg.get(
+                        "prior_destination_ramp_epochs", 10
+                    ),
+                    prior_anchor_decay_end_epoch=cross_level_router_cfg.get(
+                        "prior_anchor_decay_end_epoch", 100
+                    ),
+                    prior_anchor_final_scale=cross_level_router_cfg.get(
+                        "prior_anchor_final_scale", 0.10
+                    ),
+                    active_logit_delta_max=cross_level_router_cfg.get(
+                        "active_logit_delta_max", 2.0
+                    ),
+                    initial_destination_native_probability=(
+                        cross_level_router_cfg.get(
+                            "initial_destination_native_probability", 0.95
+                        )
                     ),
                 )
             else:
@@ -860,6 +895,16 @@ class SLMFBBDM(nn.Module):
                 temporal_weight=cfg.get("temporal_weight", 1e-4),
                 dct_weight=cfg.get("dct_weight", 1e-4),
                 gabor_weight=cfg.get("gabor_weight", 1e-4),
+                active_mass_weight=cfg.get("active_mass_weight", 0.0),
+                active_mass_floor=cfg.get("active_mass_floor", 0.25),
+                prior_anchor_weight=cfg.get("prior_anchor_weight", 0.0),
+                monotonic_weight=cfg.get("monotonic_weight", 0.0),
+                curvature_weight=cfg.get("curvature_weight", 0.0),
+                budget_weight=cfg.get("budget_weight", 0.0),
+                shallow_weight=cfg.get(
+                    "shallow_cost_weight",
+                    cfg.get("shallow_weight", 0.0),
+                ),
             )
         elif name == "boundary_frequency":
             from .loss_terms.boundary_frequency import BoundaryFrequencyLoss
@@ -1109,9 +1154,44 @@ class SLMFBBDM(nn.Module):
             )
             condition.scalars["spectral_route_is_learned"] = (
                 noisy_residual.new_ones(())
-                if effective_policy in {"learned", "learned_no_null"}
+                if effective_policy
+                in {
+                    "learned",
+                    "learned_no_null",
+                    "prior_anchored_learned",
+                }
                 else noisy_residual.new_zeros(())
             )
+            is_prior_anchored = (
+                effective_policy == "prior_anchored_learned"
+            )
+            condition.scalars["spectral_route_is_prior_anchored"] = (
+                noisy_residual.new_tensor(float(is_prior_anchored))
+            )
+            if is_prior_anchored:
+                scalar_mapping = {
+                    "spectral_route_prior_active": "route_prior_active",
+                    "spectral_route_active": "route_active",
+                    "spectral_route_active_delta": "route_active_delta",
+                    "spectral_route_active_next": "route_active_next",
+                    "spectral_route_delta_prev": "route_delta_prev",
+                    "spectral_route_delta_next": "route_delta_next",
+                    "spectral_route_shallow_probability": (
+                        "route_shallow_probability"
+                    ),
+                    "spectral_route_conditional_shallow": (
+                        "route_conditional_shallow"
+                    ),
+                    "spectral_route_active_phase": "route_active_progress",
+                    "spectral_route_destination_phase": (
+                        "route_destination_progress"
+                    ),
+                    "spectral_route_anchor_scale": "route_anchor_scale",
+                    "spectral_route_has_next": "route_has_next",
+                    "spectral_route_has_prev": "route_has_prev",
+                }
+                for scalar_key, diagnostic_key in scalar_mapping.items():
+                    condition.scalars[scalar_key] = diagnostics[diagnostic_key]
             condition.scalars["spectral_dct_weight_offset"] = diagnostics[
                 "dct_weight_offset"
             ]
@@ -1483,6 +1563,65 @@ class SLMFBBDM(nn.Module):
                 logs["frequency/route_routing_progress"] = (
                     routing_progress.detach()
                 )
+            if (
+                getattr(
+                    self.residual_preconditioner,
+                    "_effective_policy",
+                    "",
+                )
+                == "prior_anchored_learned"
+            ):
+                for diagnostic_key, log_key in (
+                    ("route_active_progress", "active_progress"),
+                    ("route_destination_progress", "destination_progress"),
+                    ("route_anchor_scale", "anchor_scale"),
+                    ("route_prior_active_mae", "prior_active_mae"),
+                    (
+                        "route_active_delta_abs_mean",
+                        "active_delta_abs_mean",
+                    ),
+                    ("route_active_delta_abs_max", "active_delta_abs_max"),
+                    (
+                        "route_monotonic_violation",
+                        "monotonic_violation",
+                    ),
+                    (
+                        "route_monotonic_violation_fraction",
+                        "monotonic_violation_fraction",
+                    ),
+                    ("route_shallow_mass", "shallow_mass"),
+                ):
+                    value = self._last_frequency_diagnostics.get(
+                        diagnostic_key
+                    )
+                    if value is not None:
+                        logs[f"frequency/prior_anchor_{log_key}"] = (
+                            value.detach()
+                            if isinstance(value, torch.Tensor)
+                            else value
+                        )
+                level_names = ("l2", "l1")
+                band_names = ("lh", "hl", "hh")
+                for diagnostic_key, log_stem in (
+                    ("route_prior_active", "prior"),
+                    ("route_active", "active"),
+                    ("route_active_delta", "delta"),
+                    ("route_shallow_probability", "shallow"),
+                    ("route_conditional_shallow", "conditional_shallow"),
+                ):
+                    value = self._last_frequency_diagnostics.get(
+                        diagnostic_key
+                    )
+                    if value is None:
+                        continue
+                    for level_index, level_name in enumerate(level_names):
+                        for band_index, band_name in enumerate(band_names):
+                            logs[
+                                "frequency/prior_anchor_"
+                                f"{level_name}_{band_name}_{log_stem}"
+                            ] = value[
+                                :, level_index, band_index
+                            ].mean().detach()
             # Uncertainty-aware selector (V2-05) diagnostics, surfaced only when
             # the selector ran (flag ON + router_confidence supplied).
             for ua_key in (

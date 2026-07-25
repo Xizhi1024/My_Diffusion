@@ -36,7 +36,6 @@ the new direct-PNG run.
 ```powershell
 pixi run python scripts/estimate_h3_prior_from_png.py `
   --root . `
-  --png-root Data/data `
   --manifest main_data/split_manifest.csv `
   --mean-checkpoint results/mechanism_validation/01_h2_residual_enrichment/checkpoints/mean_excluded_fixed.pt `
   --output-dir results/h3_png_prior_preview `
@@ -66,7 +65,7 @@ changing code or embedding a mount path:
 ```powershell
 pixi run python scripts/estimate_h3_prior_from_png.py `
   --root . `
-  --png-root Data/data `
+  --png-root main_data `
   --manifest main_data/split_manifest.csv `
   --mean-checkpoint checkpoints/freq_mean_excluded_v1/mean_best.pt `
   --output-dir results/h3_png_prior_cloud_preview `
