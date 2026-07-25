@@ -210,12 +210,29 @@ def _validate_protocol(
         "must_not_overwrite_or_relabel"
     ) is not True:
         raise ValueError("Protocol does not preserve the historical H3/H4 results")
+    role = protocol.get("mechanism_role", {})
+    if (
+        not isinstance(role, Mapping)
+        or role.get("stage") != "A1_availability_screen"
+        or role.get("tested_component")
+        != "full_timestep_band_conditioned_native_null_availability"
+        or role.get("destination_component_status") != "NOT_EVALUATED"
+        or role.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError(
+            "Protocol must isolate Stage-A1 availability from destination"
+        )
     rules = protocol.get("stop_and_claim_rules", {})
     required_false = (
         "production_training",
         "production_activation",
         "h5_started",
         "h6_started",
+        "full_ternary_router_claim",
+        "destination_mechanism_claim",
+        "artifact_safety_mechanism_claim",
+        "h3_driven_curriculum_claim",
+        "recoverability_schedule_specificity_claim",
         "next_production_stage_allowed",
     )
     if not isinstance(rules, Mapping) or any(
@@ -254,6 +271,11 @@ def _validate_calibration_decision(
         or decision.get("pipeline_id") != H3_V2_PIPELINE_ID
         or decision.get("decision") != "PASS"
         or decision.get("calibration_complete") is not True
+        or decision.get("mechanism_component") != "availability"
+        or decision.get("destination_mechanism_evaluated") is not False
+        or decision.get("artifact_safety_mechanism_evaluated") is not False
+        or decision.get("h3_driven_curriculum_evaluated") is not False
+        or decision.get("full_ternary_router_claim_allowed") is not False
     ):
         raise ValueError("H3-v2 calibration decision is not the completed PASS")
     if decision.get("config_sha256") != protocol.get("config_sha256"):
@@ -367,6 +389,11 @@ def _validate_schedule(
     if (
         declared_self_hash != decision.get("schedule_sha256")
         or schedule.get("config_sha256") != protocol.get("config_sha256")
+        or schedule.get("mechanism_component") != "availability"
+        or schedule.get("destination_mechanism_evaluated") is not False
+        or schedule.get("artifact_safety_mechanism_evaluated") is not False
+        or schedule.get("h3_driven_curriculum_evaluated") is not False
+        or schedule.get("full_ternary_router_claim_allowed") is not False
     ):
         raise ValueError("Schedule and calibration decision identities disagree")
     timesteps = int(protocol["calibration"]["num_train_timesteps"])
@@ -734,7 +761,14 @@ def _prepare_variant_config(
         "schema_version": SCHEMA_VERSION,
         "stage": STAGE,
         "pipeline_id": PLAN_PIPELINE_ID,
-        "scope": "internal_exploratory_only_on_previously_exposed_dataset",
+        "scope": (
+            "stage_A1_availability_screen_internal_exploratory_only_on_"
+            "previously_exposed_dataset"
+        ),
+        "mechanism_component": "availability",
+        "destination_mechanism_evaluated": False,
+        "artifact_safety_mechanism_evaluated": False,
+        "h3_driven_curriculum_evaluated": False,
         "run_id": run_id,
         "attempt": attempt,
         "variant": variant,
@@ -1015,7 +1049,11 @@ def build(args: argparse.Namespace) -> Path:
         "stage": STAGE,
         "pipeline_id": PLAN_PIPELINE_ID,
         "execution_status": "PLANNED_NOT_STARTED",
-        "scope": "isolated_internal_exploratory_model_experiment",
+        "scope": "isolated_stage_A1_availability_screen",
+        "mechanism_component": "availability",
+        "destination_mechanism_evaluated": False,
+        "artifact_safety_mechanism_evaluated": False,
+        "h3_driven_curriculum_evaluated": False,
         "run_id": run_id,
         "attempt": attempt,
         "attempt_dir": str(attempt_dir),

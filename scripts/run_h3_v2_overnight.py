@@ -183,12 +183,29 @@ def validate_protocol() -> tuple[dict[str, Any], dict[str, str]]:
         "must_not_overwrite_or_relabel"
     ) is not True:
         raise ValueError("Protocol does not preserve historical H3/H4 decisions")
+    role = config.get("mechanism_role", {})
+    if (
+        not isinstance(role, Mapping)
+        or role.get("stage") != "A1_availability_screen"
+        or role.get("tested_component")
+        != "full_timestep_band_conditioned_native_null_availability"
+        or role.get("destination_component_status") != "NOT_EVALUATED"
+        or role.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError(
+            "Protocol must isolate Stage-A1 availability from destination"
+        )
     stop = config.get("stop_and_claim_rules", {})
     forbidden_true = (
         "production_training",
         "production_activation",
         "h5_started",
         "h6_started",
+        "full_ternary_router_claim",
+        "destination_mechanism_claim",
+        "artifact_safety_mechanism_claim",
+        "h3_driven_curriculum_claim",
+        "recoverability_schedule_specificity_claim",
         "next_production_stage_allowed",
     )
     if any(stop.get(key) is not False for key in forbidden_true):
@@ -522,6 +539,11 @@ class OvernightRunner:
             "execution_status": execution_status,
             "calibration_decision": self.scientific_decision,
             "experiment_decision": self.experiment_decision,
+            "mechanism_component": "availability",
+            "destination_mechanism_evaluated": False,
+            "artifact_safety_mechanism_evaluated": False,
+            "h3_driven_curriculum_evaluated": False,
+            "full_ternary_router_claim_allowed": False,
             "development_training_started": self.development_training_started,
             "production_training_started": False,
             "production_activation_allowed": False,
@@ -1202,6 +1224,11 @@ class OvernightRunner:
             or calibration.get("production_training_allowed") is not False
             or calibration.get("production_activation_allowed") is not False
             or calibration.get("h5_h6_allowed") is not False
+            or calibration.get("mechanism_component") != "availability"
+            or calibration.get("destination_mechanism_evaluated") is not False
+            or calibration.get("artifact_safety_mechanism_evaluated") is not False
+            or calibration.get("h3_driven_curriculum_evaluated") is not False
+            or calibration.get("full_ternary_router_claim_allowed") is not False
         ):
             raise StageFailure(
                 "Calibration decision is incomplete, unsealed, or unsafe",
@@ -1483,6 +1510,11 @@ class OvernightRunner:
             or analysis.get("production_activation_allowed") is not False
             or analysis.get("h5_h6_allowed") is not False
             or analysis.get("does_not_override_05B") is not True
+            or analysis.get("mechanism_component") != "availability"
+            or analysis.get("destination_mechanism_evaluated") is not False
+            or analysis.get("artifact_safety_mechanism_evaluated") is not False
+            or analysis.get("h3_driven_curriculum_evaluated") is not False
+            or analysis.get("full_ternary_router_claim_allowed") is not False
         ):
             raise StageFailure(
                 "Experiment analysis decision is unsealed or unsafe",
@@ -1669,7 +1701,7 @@ class OvernightRunner:
             ),
             (
                 "08_train_h3_v2",
-                "Train matched H3-v2 native/null candidate",
+                "Train matched Stage-A1 native/null availability candidate",
                 h3_route,
             ),
         ):
@@ -1767,7 +1799,7 @@ class OvernightRunner:
         ]
         self.run_command_stage(
             stage_id="11_analyze_experiment",
-            label="Patient-level paired H3-v2 internal support decision",
+            label="Patient-level paired Stage-A1 availability support decision",
             command=analyzer_command,
             timeout_seconds=self.args.test_timeout_seconds,
             artifact_paths=[analysis_decision, analysis_patients],
@@ -1853,6 +1885,11 @@ def build_plan(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
             "cpu_fallback_allowed": False,
             "calibration_fail_stops_before_training": True,
             "all_mutable_training_outputs_below_run_dir": True,
+            "mechanism_component": "availability",
+            "destination_mechanism_evaluated": False,
+            "artifact_safety_mechanism_evaluated": False,
+            "h3_driven_curriculum_evaluated": False,
+            "full_ternary_router_claim_allowed": False,
             "production_training_started": False,
             "production_activation_allowed": False,
             "h5_h6_started": False,

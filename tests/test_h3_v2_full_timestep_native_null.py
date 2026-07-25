@@ -433,6 +433,20 @@ def test_protocol_config_self_hash_and_runtime_source_hashes() -> None:
     assert payload["calibration"]["mapping"]["shallow_route_policy"] == (
         "structurally_zero"
     )
+    role = payload["mechanism_role"]
+    assert role["stage"] == "A1_availability_screen"
+    assert role["tested_component"] == (
+        "full_timestep_band_conditioned_native_null_availability"
+    )
+    assert role["destination_component_status"] == "NOT_EVALUATED"
+    assert role["full_ternary_router_claim_allowed"] is False
+    assert payload["exploratory_model_experiment"][
+        "specificity_controls_deferred_until_candidate_support"
+    ] == ["band_constant", "timestep_shuffle", "wrong_band_schedule"]
+    assert payload["stop_and_claim_rules"]["full_ternary_router_claim"] is False
+    assert (
+        payload["stop_and_claim_rules"]["destination_mechanism_claim"] is False
+    )
     assert payload["stop_and_claim_rules"]["production_activation"] is False
     assert payload["stop_and_claim_rules"]["h5_started"] is False
     assert payload["stop_and_claim_rules"]["h6_started"] is False

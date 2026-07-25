@@ -162,6 +162,17 @@ def _validate_config(
         raise ValueError("Unsupported H3-v2 protocol schema")
     if config.get("pipeline_id") != CALIBRATION_PIPELINE_ID:
         raise ValueError("Unexpected H3-v2 protocol pipeline_id")
+    role = _require_mapping(config, "mechanism_role", "protocol")
+    if (
+        role.get("stage") != "A1_availability_screen"
+        or role.get("tested_component")
+        != "full_timestep_band_conditioned_native_null_availability"
+        or role.get("destination_component_status") != "NOT_EVALUATED"
+        or role.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError(
+            "Protocol must remain a Stage-A1 availability-only experiment"
+        )
     declared = _require_sha256(
         config.get("config_sha256"), "protocol.config_sha256"
     )
@@ -199,6 +210,11 @@ def _validate_config(
         "production_activation",
         "h5_started",
         "h6_started",
+        "full_ternary_router_claim",
+        "destination_mechanism_claim",
+        "artifact_safety_mechanism_claim",
+        "h3_driven_curriculum_claim",
+        "recoverability_schedule_specificity_claim",
         "next_production_stage_allowed",
     ):
         if stop_rules.get(field) is not False:
@@ -235,6 +251,14 @@ def _validate_schedule(
         raise ValueError("Frozen schedule route order mismatch")
     if schedule.get("shallow_route_policy") != "structurally_zero":
         raise ValueError("Frozen schedule does not structurally disable shallow")
+    if (
+        schedule.get("mechanism_component") != "availability"
+        or schedule.get("destination_mechanism_evaluated") is not False
+        or schedule.get("artifact_safety_mechanism_evaluated") is not False
+        or schedule.get("h3_driven_curriculum_evaluated") is not False
+        or schedule.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError("Frozen schedule exceeds the Stage-A1 claim boundary")
     declared_self = _require_sha256(
         schedule.get("schedule_sha256"), "frozen_schedule.schedule_sha256"
     )
@@ -270,6 +294,14 @@ def _validate_calibration(
         raise ValueError("H3-v2 calibration must PASS before model analysis")
     if decision.get("calibration_complete") is not True:
         raise ValueError("H3-v2 calibration is not complete")
+    if (
+        decision.get("mechanism_component") != "availability"
+        or decision.get("destination_mechanism_evaluated") is not False
+        or decision.get("artifact_safety_mechanism_evaluated") is not False
+        or decision.get("h3_driven_curriculum_evaluated") is not False
+        or decision.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError("Calibration decision exceeds the Stage-A1 claim boundary")
     if decision.get("config_sha256") != config_sha256:
         raise ValueError("Calibration decision config_sha256 mismatch")
     if decision.get("model_experiment_allowed") is not True:
@@ -1605,6 +1637,13 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
         "decision": decision_name,
         "scientific_decision": decision_name,
         "scientific_conclusion": conclusion,
+        "mechanism_component": "availability",
+        "stage_A1_screen_complete": True,
+        "destination_mechanism_evaluated": False,
+        "artifact_safety_mechanism_evaluated": False,
+        "h3_driven_curriculum_evaluated": False,
+        "recoverability_schedule_specificity_controls_complete": False,
+        "full_ternary_router_claim_allowed": False,
         "evaluation_label": "post_hoc_internal_exploratory_only",
         "validation_previously_exposed": True,
         "independent_validation_claimed": False,
@@ -1665,8 +1704,12 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
         "does_not_override_05B": True,
         "does_not_restore_h4_v1_or_h4_v2": True,
         "claim_boundary": (
-            "Internal exploratory evidence on the already exposed development "
-            "dataset only; no external, confirmatory, or production claim."
+            "Stage-A1 availability screening on the already exposed development "
+            "dataset only. This result does not identify native-versus-shallow "
+            "destination, validate an artifact-safety mechanism or H3-driven "
+            "curriculum, complete shuffled/wrong-band specificity controls, or "
+            "support any external, confirmatory, ternary-router, or production "
+            "claim."
         ),
     }
     decision["decision_sha256"] = _canonical_self_hash(

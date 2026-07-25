@@ -3,9 +3,23 @@
   "stage": "05C_h3_v2_full_timestep_native_null",
   "pipeline_id": "H3_V2_FULL_TIMESTEP_NATIVE_NULL_CALIBRATION_V1",
   "status": "PREREGISTERED_BEFORE_H3_V2_CALIBRATION_OR_MODEL_EVALUATION",
-  "scope": "new_independent_h3_v2_mechanism_not_a_reinterpretation_of_h3_v1_or_h4_v2",
+  "scope": "stage_A1_timestep_band_availability_screen_not_a_ternary_destination_router",
+  "mechanism_role": {
+    "stage": "A1_availability_screen",
+    "tested_component": "full_timestep_band_conditioned_native_null_availability",
+    "availability_parameter": "a_l_b_t",
+    "destination_component_status": "NOT_EVALUATED",
+    "artifact_safety_component_status": "OUTPUT_SAFETY_GATES_ONLY_NOT_A_VALIDATED_SAFETY_MECHANISM",
+    "h3_driven_curriculum_status": "NOT_EVALUATED",
+    "full_ternary_router_claim_allowed": false,
+    "recoverability_specificity_claim_requires_future_controls": [
+      "timestep_shuffle",
+      "wrong_band_schedule"
+    ]
+  },
   "historical_results_preserved": {
-    "h3_v1_fixed_schedule_inference": "FAIL",
+    "original_h3_logsnr_recoverability": "PASS",
+    "05B_h3_fixed_schedule_inference_admissibility": "FAIL",
     "h4_v1": "FAIL",
     "h4_v2_production_inference_admissibility": "FAIL",
     "must_not_overwrite_or_relabel": true
@@ -147,9 +161,16 @@
   },
   "exploratory_model_experiment": {
     "runs_only_after_calibration_pass": true,
+    "stage_A1_design": "candidate_vs_no_route_after_offline_band_constant_calibration_gate",
     "comparators": [
       "no_route",
       "h3_v2_native_null"
+    ],
+    "specificity_controls_completed_in_model_training": [],
+    "specificity_controls_deferred_until_candidate_support": [
+      "band_constant",
+      "timestep_shuffle",
+      "wrong_band_schedule"
     ],
     "training_partition": "mechanism_train_99_patients_only",
     "checkpoint_selection_partition": "calibration_25_patients_only",
@@ -180,8 +201,8 @@
     },
     "bootstrap_replicates": 10000,
     "bootstrap_seed": 20260733,
-    "allowed_positive_wording": "H3-v2 native/null schedule obtained internal exploratory support on the existing exposed dataset.",
-    "allowed_negative_wording": "H3-v2 native/null schedule did not obtain internal support on the existing exposed dataset."
+    "allowed_positive_wording": "The Stage-A1 full-timestep band-conditioned native/null availability candidate obtained internal exploratory support versus no-route on the existing exposed dataset; destination, safety-mechanism, curriculum, and schedule-specificity claims remain untested.",
+    "allowed_negative_wording": "The Stage-A1 full-timestep band-conditioned native/null availability candidate did not obtain internal support versus no-route on the existing exposed dataset."
   },
   "stop_and_claim_rules": {
     "production_training": false,
@@ -189,6 +210,11 @@
     "h5_started": false,
     "h6_started": false,
     "h4_v1_or_v2_restored": false,
+    "full_ternary_router_claim": false,
+    "destination_mechanism_claim": false,
+    "artifact_safety_mechanism_claim": false,
+    "h3_driven_curriculum_claim": false,
+    "recoverability_schedule_specificity_claim": false,
     "independent_validation_claim": false,
     "external_generalization_claim": false,
     "confirmatory_evidence_claim": false,
@@ -197,7 +223,7 @@
   "runtime_sources": {
     "calibration_script": {
       "path": "scripts/calibrate_h3_v2_full_timestep_native_null.py",
-      "file_sha256": "b8e08296c2a95fe4ac5a6b2083803545b12b205aaead5e6addd2ed4c3510da45"
+      "file_sha256": "ad65795304b0930251f33b1c29061e576d524c3fedcd131fafc5159942dab98f"
     },
     "h2_predictor_helpers": {
       "path": "scripts/validate_h2_pathology_excluded_residual.py",
@@ -245,11 +271,11 @@
     },
     "experiment_builder": {
       "path": "scripts/build_h3_v2_experiment_configs.py",
-      "file_sha256": "02c5b7b5d658e45455a5f1843eb56bb9003705f1886a52509ea44438c2d7426c"
+      "file_sha256": "5a23946294ca37b28756ed9b7cb0ab3bbb8a3b8f7274147ce8e9bc55643eebc7"
     },
     "experiment_analyzer": {
       "path": "scripts/analyze_h3_v2_experiment.py",
-      "file_sha256": "52187db6f3b70cc5f76826f50a2bdd5103595445903282ace48848fbdea7e345"
+      "file_sha256": "57f32faefe56570b575cab7ef9890e30747acc4a4302bfca372489d1a9ef8c81"
     },
     "training_entry": {
       "path": "scripts/train_v2.py",
@@ -277,12 +303,12 @@
     },
     "overnight_runner": {
       "path": "scripts/run_h3_v2_overnight.py",
-      "file_sha256": "c0dc56eabed79c2c48790f1ae071f9d6c4268f3fa48cd368703beb3aef5e48fd"
+      "file_sha256": "e6e05e52d46d777ab674a7c74bd8e70d30fc5664d53ecc78fa2105201601202e"
     },
     "overnight_launcher": {
       "path": "scripts/run_h3_v2_overnight.ps1",
       "file_sha256": "f5338c29d0bbf9389e1ba707227ea68adddc758013b88adf5792a5473d904fd7"
     }
   },
-  "config_sha256": "dc8f41780aa1c92d59db86903c9e9873df2e385e0aebda039d7dd2c4eb7d6a50"
+  "config_sha256": "82e418129be15cbcb2914cd99ebf5ba2783c74e3084f2396a5d90f464c5cbb39"
 }

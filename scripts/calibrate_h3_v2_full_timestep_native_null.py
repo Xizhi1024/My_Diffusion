@@ -144,13 +144,40 @@ def _validate_protocol_config(
         "must_not_overwrite_or_relabel"
     ) is not True:
         raise ValueError("H3-v2 protocol does not preserve historical failures")
+    role = config.get("mechanism_role", {})
+    if (
+        not isinstance(role, Mapping)
+        or role.get("stage") != "A1_availability_screen"
+        or role.get("tested_component")
+        != "full_timestep_band_conditioned_native_null_availability"
+        or role.get("destination_component_status") != "NOT_EVALUATED"
+        or role.get("full_ternary_router_claim_allowed") is not False
+    ):
+        raise ValueError(
+            "H3-v2 must remain a Stage-A1 availability-only protocol"
+        )
     if config.get("calibration", {}).get("validation_images_read") is not False:
         raise ValueError("H3-v2 calibration must exclude validation images")
     mapping = config.get("calibration", {}).get("mapping", {})
     if mapping.get("shallow_route_policy") != "structurally_zero":
         raise ValueError("H3-v2 protocol must structurally exclude shallow routing")
-    if config.get("stop_and_claim_rules", {}).get("production_activation") is not False:
-        raise ValueError("H3-v2 protocol cannot authorize production")
+    claim_rules = config.get("stop_and_claim_rules", {})
+    required_false = (
+        "production_training",
+        "production_activation",
+        "h5_started",
+        "h6_started",
+        "full_ternary_router_claim",
+        "destination_mechanism_claim",
+        "artifact_safety_mechanism_claim",
+        "h3_driven_curriculum_claim",
+        "recoverability_schedule_specificity_claim",
+        "next_production_stage_allowed",
+    )
+    if not isinstance(claim_rules, Mapping) or any(
+        claim_rules.get(field) is not False for field in required_false
+    ):
+        raise ValueError("H3-v2 protocol claim boundary is not fail-closed")
 
     source_hashes: dict[str, str] = {}
     for label, spec in config.get("runtime_sources", {}).items():
@@ -963,6 +990,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "stage": config["stage"],
             "pipeline_id": PIPELINE_ID,
             "decision": "PASS",
+            "mechanism_component": "availability",
+            "destination_mechanism_evaluated": False,
+            "artifact_safety_mechanism_evaluated": False,
+            "h3_driven_curriculum_evaluated": False,
+            "full_ternary_router_claim_allowed": False,
             "config_sha256": config["config_sha256"],
             "inference_schedule_allowed": True,
             "production_activation_allowed": False,
@@ -1025,6 +1057,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "stage": config["stage"],
         "pipeline_id": PIPELINE_ID,
         "decision": "PASS" if passed else "FAIL",
+        "mechanism_component": "availability",
+        "stage_A1_calibration_complete": True,
+        "destination_mechanism_evaluated": False,
+        "artifact_safety_mechanism_evaluated": False,
+        "h3_driven_curriculum_evaluated": False,
+        "recoverability_schedule_specificity_controls_complete": False,
+        "full_ternary_router_claim_allowed": False,
         "calibration_complete": True,
         "config_path": str(config_path),
         "config_sha256": config["config_sha256"],
@@ -1122,6 +1161,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             "stage": "05C_h3_v2_full_timestep_native_null",
             "pipeline_id": PIPELINE_ID,
             "decision": "FAIL",
+            "mechanism_component": "availability",
+            "destination_mechanism_evaluated": False,
+            "artifact_safety_mechanism_evaluated": False,
+            "h3_driven_curriculum_evaluated": False,
+            "full_ternary_router_claim_allowed": False,
             "calibration_complete": False,
             "fatal_error": f"{type(exc).__name__}: {exc}",
             "model_experiment_allowed": False,
