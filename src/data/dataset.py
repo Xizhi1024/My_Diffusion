@@ -22,18 +22,70 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 _CACHE_EXT = ".npz"
 _SAMPLE_ID_PATTERN: re.Pattern = re.compile(r"^(\d{3})(\d{3})$")
 _CT_TARGET_RANGE = (-1.0, 1.0)
 _PET_TARGET_RANGE = (-1.0, 1.0)
+
+
+def _epoch_sample_seed(base_seed: int, epoch: int, sample_index: int) -> int:
+    """Return a stable, platform-independent seed for one sample in one epoch."""
+    # Keep the result in torch.Generator.manual_seed's signed 63-bit range.
+    mixed = (
+        int(base_seed)
+        + 0x4F1BBCDCBFA54001 * (int(epoch) + 1)
+        + 0x369DEA0F31A53F85 * (int(sample_index) + 1)
+    )
+    return mixed & ((1 << 63) - 1)
+
+
+def _split_epoch_index(index: Any) -> Tuple[int, int]:
+    """Accept ordinary indices and epoch-stamped indices from our sampler."""
+    if isinstance(index, tuple) and len(index) == 2:
+        epoch, sample_index = index
+        return int(epoch), int(sample_index)
+    return 0, int(index)
+
+
+class EpochShuffleSampler(Sampler[Tuple[int, int]]):
+    """Shuffle with an explicit RNG and stamp every index with its epoch.
+
+    Stamping the index lets dataset augmentation depend only on
+    ``(seed, epoch, sample_index)``.  It therefore remains exactly reproducible
+    across checkpoint resume even when DataLoader persistent workers are used.
+    """
+
+    def __init__(
+        self,
+        data_source: Dataset,
+        *,
+        generator: torch.Generator,
+    ) -> None:
+        self.data_source = data_source
+        self.generator = generator
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[Tuple[int, int]]:
+        indices = torch.randperm(
+            len(self.data_source),
+            generator=self.generator,
+        ).tolist()
+        epoch = self.epoch
+        return iter((epoch, int(index)) for index in indices)
+
+    def __len__(self) -> int:
+        return len(self.data_source)
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +436,12 @@ class CachedDataset(Dataset):
     def __init__(self, cache_dir: str | Path, split: str = "train", *, augment: bool = False,
                  split_manifest: Optional[Path] = None,
                  required_keys: Optional[List[str]] = None,
-                 optional_keys: Optional[List[str]] = None):
+                 optional_keys: Optional[List[str]] = None,
+                 augmentation_seed: int = 0):
         self.cache_dir = Path(cache_dir)
         self.split = split
         self.augment = augment
+        self.augmentation_seed = int(augmentation_seed)
         self.entries: List[SampleEntry] = []
         self.required_keys = required_keys or ["ct", "pet"]
         self.optional_keys = optional_keys or []
@@ -482,7 +536,8 @@ class CachedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: Any) -> Dict[str, torch.Tensor]:
+        epoch, idx = _split_epoch_index(idx)
         entry = self.entries[idx]
         with np.load(entry.cache_path) as data:
             missing_required = [k for k in self.required_keys if k not in data]
@@ -554,16 +609,21 @@ class CachedDataset(Dataset):
             scale_meta.setdefault("pet_physical_key", "pet_suv" if has_pet_suv else ("pet_activity" if has_pet_activity else ""))
             scale_meta.setdefault("pet_suv_available", bool(has_pet_suv))
 
-        if self.augment and torch.rand((), device=ct.device) < 0.5:
-            stacked = torch.cat([ct, pet, mask, organ_mask, organ_distance, mu_map, ct_hu, pet_suv, pet_activity], dim=0)
-            stacked = torch.flip(stacked, dims=(-1,))
-            ct, pet, mask = stacked[0:1], stacked[1:2], stacked[2:3]
-            organ_mask = stacked[3:9]
-            organ_distance = stacked[9:15]
-            mu_map = stacked[15:16]
-            ct_hu = stacked[16:17]
-            pet_suv = stacked[17:18]
-            pet_activity = stacked[18:19]
+        if self.augment:
+            augment_generator = torch.Generator(device="cpu")
+            augment_generator.manual_seed(
+                _epoch_sample_seed(self.augmentation_seed, epoch, idx)
+            )
+            if torch.rand((), generator=augment_generator) < 0.5:
+                stacked = torch.cat([ct, pet, mask, organ_mask, organ_distance, mu_map, ct_hu, pet_suv, pet_activity], dim=0)
+                stacked = torch.flip(stacked, dims=(-1,))
+                ct, pet, mask = stacked[0:1], stacked[1:2], stacked[2:3]
+                organ_mask = stacked[3:9]
+                organ_distance = stacked[9:15]
+                mu_map = stacked[15:16]
+                ct_hu = stacked[16:17]
+                pet_suv = stacked[17:18]
+                pet_activity = stacked[18:19]
 
         sample = {
             "ct": ct,
@@ -585,18 +645,27 @@ class CachedDataset(Dataset):
 class FakeDataset(Dataset):
     """Synthetic dataset for smoke tests — no real data needed."""
 
-    def __init__(self, num_samples: int = 32, image_size: int = 32):
+    def __init__(
+        self,
+        num_samples: int = 32,
+        image_size: int = 32,
+        seed: int = 0,
+    ):
         self.num_samples = num_samples
         self.image_size = image_size
+        self.seed = int(seed)
 
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: Any) -> Dict[str, torch.Tensor]:
+        epoch, idx = _split_epoch_index(idx)
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_epoch_sample_seed(self.seed, epoch, idx))
         H = W = self.image_size
         sample = {
-            "ct": torch.randn(1, H, W) * 2 - 1,
-            "pet": torch.randn(1, H, W) * 2 - 1,
+            "ct": torch.randn(1, H, W, generator=generator) * 2 - 1,
+            "pet": torch.randn(1, H, W, generator=generator) * 2 - 1,
             "mask": torch.zeros(1, H, W),
             "organ_mask": torch.zeros(6, H, W),
             "organ_distance": torch.zeros(6, H, W),
@@ -610,8 +679,8 @@ class FakeDataset(Dataset):
                      "uptake_min": 60.0, "weight_kg": 65.0, "age_years": 52.0,
                      "thickness_mm": 2.0, "z_mm": 0.0},
         }
-        cx = H // 2 + torch.randint(-3, 4, (1,)).item()
-        cy = W // 2 + torch.randint(-3, 4, (1,)).item()
+        cx = H // 2 + torch.randint(-3, 4, (1,), generator=generator).item()
+        cy = W // 2 + torch.randint(-3, 4, (1,), generator=generator).item()
         sample["mask"][0, cx:cx+3, cy:cy+3] = 1.0
         return sample
 
@@ -629,6 +698,12 @@ def build_dataloaders(data_cfg: Dict[str, Any], run_cfg: Dict[str, Any]) -> Tupl
     pin_memory = run_cfg.get("pin_memory", True) and torch.cuda.is_available()
     persistent = run_cfg.get("persistent_workers", True) and num_workers > 0
     prefetch = run_cfg.get("prefetch_factor", 2) if num_workers > 0 else None
+    dataloader_seed = int(
+        run_cfg.get(
+            "dataloader_seed",
+            run_cfg.get("eval_seed", run_cfg.get("seed", 42)),
+        )
+    )
     cache_dir = data_cfg.get("cache_dir", "")
     val_cache_dir = data_cfg.get("val_cache_dir", "")
     split_manifest_path = data_cfg.get("split_manifest", None)
@@ -644,19 +719,21 @@ def build_dataloaders(data_cfg: Dict[str, Any], run_cfg: Dict[str, Any]) -> Tupl
         # the cache-first ordering would silently ignore use_fake_data=true,
         # turning a smoke test into a real training run on (possibly misaligned) data.
         print("[DataLoader] use_fake_data=True — using FakeDataset for smoke testing")
-        train_ds = FakeDataset(32, image_size)
-        val_ds = FakeDataset(8, image_size)
+        train_ds = FakeDataset(32, image_size, seed=dataloader_seed)
+        val_ds = FakeDataset(8, image_size, seed=dataloader_seed + 1)
     elif cache_dir and Path(cache_dir).is_dir():
         train_ds = CachedDataset(cache_dir, split="train", augment=augment,
                                  split_manifest=split_manifest_path,
-                                 required_keys=required_keys, optional_keys=optional_keys)
+                                 required_keys=required_keys, optional_keys=optional_keys,
+                                 augmentation_seed=dataloader_seed)
         val_ds = None
         val_dir = val_cache_dir or cache_dir
         if Path(val_dir).is_dir():
             try:
                 val_ds = CachedDataset(val_dir, split="val", augment=False,
                                        split_manifest=split_manifest_path,
-                                       required_keys=required_keys, optional_keys=optional_keys)
+                                       required_keys=required_keys, optional_keys=optional_keys,
+                                       augmentation_seed=dataloader_seed + 1)
             except ValueError:
                 print(f"[DataLoader] No val samples in {val_dir} — training without validation set")
     else:
@@ -665,10 +742,38 @@ def build_dataloaders(data_cfg: Dict[str, Any], run_cfg: Dict[str, Any]) -> Tupl
             "To use fake/synthetic data for smoke testing, set 'data.use_fake_data: true' in your config."
         )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent, prefetch_factor=prefetch, drop_last=True)
+    sampler_generator = torch.Generator(device="cpu")
+    sampler_generator.manual_seed(dataloader_seed)
+    worker_generator = torch.Generator(device="cpu")
+    worker_generator.manual_seed(dataloader_seed + 1)
+    train_sampler = EpochShuffleSampler(
+        train_ds,
+        generator=sampler_generator,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+        prefetch_factor=prefetch,
+        drop_last=True,
+        generator=worker_generator,
+    )
     val_loader = None
     if val_ds is not None:
-        val_loader = DataLoader(val_ds, batch_size=val_batch_size, shuffle=False, num_workers=min(num_workers, 1), pin_memory=pin_memory, drop_last=False)
+        val_generator = torch.Generator(device="cpu")
+        val_generator.manual_seed(dataloader_seed + 2)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=min(num_workers, 1),
+            pin_memory=pin_memory,
+            drop_last=False,
+            generator=val_generator,
+        )
     return train_loader, val_loader
 
 

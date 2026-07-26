@@ -12,12 +12,16 @@ Covers the "common speed killers" checklist:
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
+import random
+import re
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +35,108 @@ from src.data.lineage import (
 
 from .slmf_bbdm import SLMFBBDM
 from .ema import EMA
+
+
+_PRIOR_ANCHORED_PIPELINE_ID = "PRIOR_ANCHORED_ROUTER_100E_CLOUD_V1"
+_NUMBERED_CHECKPOINT_NAME = re.compile(r"^ckpt_epoch\d{4}\.pt$")
+
+
+def _strict_repo_relative_path(value: Any, *, label: str) -> str:
+    """Validate one persisted path without resolving it against local state."""
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{label} must be a non-empty repository-relative path")
+    if "\\" in value:
+        raise RuntimeError(f"{label} must use repository-relative POSIX syntax")
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        raise RuntimeError(f"{label} must be repository-relative")
+    if PureWindowsPath(value).drive:
+        raise RuntimeError(f"{label} must not contain a Windows drive")
+    segments = value.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise RuntimeError(
+            f"{label} must not contain empty, '.' or '..' path segments"
+        )
+    return PurePosixPath(value).as_posix()
+
+
+def _validate_prior_anchored_resume_identity(
+    *,
+    current_config: Mapping[str, Any],
+    checkpoint_config: Any,
+    checkpoint_path: str,
+) -> None:
+    """Fail closed for the run-owned exploratory 100-epoch pipeline."""
+    prior_run = current_config.get("prior_anchored_run")
+    if (
+        not isinstance(prior_run, Mapping)
+        or prior_run.get("pipeline_id") != _PRIOR_ANCHORED_PIPELINE_ID
+    ):
+        return
+    if not isinstance(checkpoint_config, Mapping):
+        raise RuntimeError("Resume checkpoint config is not a mapping")
+
+    current_training = current_config.get("training")
+    observed_training = checkpoint_config.get("training")
+    if not isinstance(current_training, Mapping) or not isinstance(
+        observed_training, Mapping
+    ):
+        raise RuntimeError(
+            "Prior-anchored resume requires training config in both configs"
+        )
+
+    checkpoint_dir = _strict_repo_relative_path(
+        current_training.get("checkpoint_dir"),
+        label="training.checkpoint_dir",
+    )
+
+    def _validate_pointer(value: Any, *, label: str, allow_null: bool) -> Optional[str]:
+        if value is None:
+            if allow_null:
+                return None
+            raise RuntimeError(f"{label} must name the checkpoint being resumed")
+        normalized = _strict_repo_relative_path(value, label=label)
+        pointer = PurePosixPath(normalized)
+        if (
+            pointer.parent.as_posix() != checkpoint_dir
+            or _NUMBERED_CHECKPOINT_NAME.fullmatch(pointer.name) is None
+        ):
+            raise RuntimeError(
+                f"{label} must name ckpt_epochNNNN.pt inside the current "
+                "training.checkpoint_dir"
+            )
+        return normalized
+
+    current_pointer = _validate_pointer(
+        current_training.get("resume_from"),
+        label="current training.resume_from",
+        allow_null=False,
+    )
+    _validate_pointer(
+        observed_training.get("resume_from"),
+        label="checkpoint training.resume_from",
+        allow_null=True,
+    )
+    actual_pointer = _validate_pointer(
+        checkpoint_path,
+        label="load_checkpoint path",
+        allow_null=False,
+    )
+    if actual_pointer != current_pointer:
+        raise RuntimeError(
+            "load_checkpoint path differs from current training.resume_from"
+        )
+
+    current_identity = copy.deepcopy(dict(current_config))
+    observed_identity = copy.deepcopy(dict(checkpoint_config))
+    for identity in (current_identity, observed_identity):
+        training = identity.get("training")
+        if isinstance(training, dict):
+            training["resume_from"] = None
+    if observed_identity != current_identity:
+        raise RuntimeError(
+            "Resume checkpoint configuration differs from the current "
+            "prior-anchored run config"
+        )
 
 
 def resolve_checkpoint_dir(config: Dict[str, Any]) -> str:
@@ -60,6 +166,20 @@ def resolve_sample_dir(config: Dict[str, Any]) -> str:
         return explicit
     exp_name = config.get("experiment", {}).get("name", "slmf_bbdm")
     return os.path.join("outputs", "samples", exp_name)
+
+
+def _atomic_torch_save(payload: Dict[str, Any], path: str) -> None:
+    """Write a torch payload without exposing a partially written checkpoint."""
+    temporary = path + ".tmp"
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _stripe_score(pred_np: np.ndarray) -> float:
@@ -219,6 +339,62 @@ def _to_device(batch: Dict[str, Any], device: str) -> Dict[str, Any]:
     }
 
 
+def _chunk_batch(batch: Mapping[str, Any], chunk_size: int) -> List[Dict[str, Any]]:
+    """Split a tracked-sample batch into chunks no larger than ``chunk_size``.
+
+    Tensor values are sliced along dim 0; list values are sliced element-wise;
+    scalar / other values are replicated unchanged so each chunk is a valid
+    ``model.sample`` input.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    batch_size = 0
+    for value in batch.values():
+        if torch.is_tensor(value) and value.ndim >= 1:
+            batch_size = max(batch_size, int(value.shape[0]))
+        elif isinstance(value, list) and value:
+            batch_size = max(batch_size, len(value))
+    if batch_size == 0:
+        return [dict(batch)]
+    chunks: List[Dict[str, Any]] = []
+    for start in range(0, batch_size, chunk_size):
+        end = min(start + chunk_size, batch_size)
+        chunk: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value) and value.ndim >= 1 and value.shape[0] == batch_size:
+                chunk[key] = value[start:end]
+            elif isinstance(value, list) and len(value) == batch_size:
+                chunk[key] = value[start:end]
+            else:
+                chunk[key] = value
+        chunks.append(chunk)
+    return chunks
+
+
+def _cat_sampled(key: str, parts: List[Dict[str, Any]]) -> Any:
+    """Concatenate a sampled-output key across chunks, preserving list values."""
+    values = [part[key] for part in parts]
+    tensors = [v for v in values if torch.is_tensor(v)]
+    if len(tensors) == len(values):
+        return torch.cat(tensors, dim=0)
+    # Mixed / list outputs: fall back to a flat list.
+    merged: List[Any] = []
+    for value in values:
+        if isinstance(value, list):
+            merged.extend(value)
+        else:
+            merged.append(value)
+    return merged
+
+
+def _sampled_output_to_cpu(output: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach sampled tensors and release each GPU chunk immediately."""
+    return {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in output.items()
+    }
+
+
 def _detect_dtype() -> torch.dtype:
     """Return best AMP dtype: bf16 > fp16 > fp32."""
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -326,6 +502,14 @@ class Trainer:
         self.eval_seed = int(
             run_cfg.get("eval_seed", config.get("experiment", {}).get("seed", 42))
         )
+        # Chunked validation sampling: the tracked-sample batch (up to
+        # eval_num_samples) is fed to model.sample in chunks no larger than
+        # eval_sample_batch_size so peak GPU memory stays bounded.  Default
+        # caps at the configured validation batch size.
+        val_batch_size = int(config.get("data", {}).get("val_batch_size", 1))
+        default_chunk = max(1, min(val_batch_size, self.eval_num_samples))
+        requested_chunk = int(run_cfg.get("eval_sample_batch_size", default_chunk))
+        self.eval_sample_batch_size = max(1, min(requested_chunk, self.eval_num_samples))
         self.sample_interval = run_cfg.get("sample_interval", 50)
         self.save_interval = run_cfg.get("save_interval", 50)
 
@@ -369,6 +553,7 @@ class Trainer:
         self.accum_count = 0
         self.epoch_count = 0
         self.start_time = None
+        self._resumed_elapsed = 0.0
         self.gradient_diagnostics = bool(
             run_cfg.get("gradient_diagnostics", False)
         )
@@ -470,6 +655,13 @@ class Trainer:
         if callable(setter):
             setter(self.epoch_count)
 
+    def _set_data_epoch(self) -> None:
+        """Stamp the next training epoch on an epoch-aware sampler."""
+        sampler = getattr(self.train_loader, "sampler", None)
+        setter = getattr(sampler, "set_epoch", None)
+        if callable(setter):
+            setter(self.epoch_count)
+
     # ------------------------------------------------------------------
     # EMA context manager
     # ------------------------------------------------------------------
@@ -541,6 +733,7 @@ class Trainer:
 
     def train_epoch(self) -> Dict[str, float]:
         self._set_spectral_router_epoch()
+        self._set_data_epoch()
         epoch_start = time.time()
         epoch_logs: Dict[str, List[float]] = {}
         batch_count = 0
@@ -583,6 +776,18 @@ class Trainer:
             normalized[key] = numeric if math.isfinite(numeric) else None
         return normalized
 
+    def _router_phase_label(self) -> Optional[str]:
+        """Return the configured router phase label for the current epoch, if any."""
+        model = getattr(self.model, "_orig_mod", self.model)
+        for attr in ("residual_preconditioner", "preconditioner"):
+            preconditioner = getattr(model, attr, None)
+            label_fn = getattr(preconditioner, "phase_label", None)
+            if callable(label_fn):
+                # epoch_count is 1-based (number of completed epochs); the
+                # router expects the 0-based index of the epoch just trained.
+                return str(label_fn(max(self.epoch_count - 1, 0)))
+        return None
+
     def _append_epoch_metrics(
         self,
         *,
@@ -590,29 +795,154 @@ class Trainer:
         eval_logs: Optional[Dict[str, float]],
         validation_metrics: Optional[Dict[str, float]],
     ) -> None:
-        """Append one portable, restart-safe monitoring record per epoch."""
+        """Atomically commit exactly one monitoring record for this epoch."""
         metrics_path = os.path.normpath(self.metrics_jsonl)
         parent = os.path.dirname(metrics_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        record = {
+        record: Dict[str, Any] = {
             "schema_version": 1,
             "epoch": int(self.epoch_count),
             "step": int(self.step_count),
+            # phase is stamped at the top level so the summarizer does not
+            # need to re-derive it from the epoch number.
+            "phase": self._router_phase_label(),
             "train": self._finite_metric_mapping(train_logs),
             "eval": self._finite_metric_mapping(eval_logs),
             "validation": self._finite_metric_mapping(validation_metrics),
         }
-        with open(metrics_path, "a", encoding="utf-8", newline="\n") as handle:
+        existing = self._validated_metrics_jsonl(metrics_path)
+        expected = list(range(1, int(self.epoch_count)))
+        observed = [epoch for epoch, _ in existing]
+        if observed != expected:
+            raise RuntimeError(
+                "Metrics JSONL is not an exact completed-epoch prefix before "
+                f"writing epoch {self.epoch_count}: expected {expected}, "
+                f"found {observed}"
+            )
+
+        serialized = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        temporary = metrics_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            for _, line in existing:
+                handle.write(line)
+                handle.write("\n")
             handle.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    allow_nan=False,
-                )
+                serialized
             )
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, metrics_path)
+
+    def _validated_metrics_jsonl(
+        self,
+        path: str,
+    ) -> List[Tuple[int, str]]:
+        """Parse JSONL strictly and return ordered ``(epoch, line)`` rows.
+
+        Corrupt, duplicate, non-positive, out-of-order, and configured-range
+        violations are errors.  Resume cleanup may remove a valid future tail,
+        but it must never hide corruption.
+        """
+        if not os.path.exists(path):
+            return []
+        configured_max = None
+        config = getattr(self, "config", None)
+        if isinstance(config, dict):
+            raw_max = config.get("training", {}).get("num_epochs")
+            if raw_max is not None:
+                configured_max = int(raw_max)
+
+        rows: List[Tuple[int, str]] = []
+        previous_epoch = 0
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                stripped = raw.strip()
+                if not stripped:
+                    raise RuntimeError(
+                        f"Metrics JSONL contains a blank line at {line_number}"
+                    )
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "Metrics JSONL contains invalid JSON at line "
+                        f"{line_number}: {exc.msg}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        "Metrics JSONL record must be an object at line "
+                        f"{line_number}"
+                    )
+                epoch = payload.get("epoch")
+                if isinstance(epoch, bool) or not isinstance(epoch, int):
+                    raise RuntimeError(
+                        "Metrics JSONL epoch must be an integer at line "
+                        f"{line_number}"
+                    )
+                if epoch < 1:
+                    raise RuntimeError(
+                        f"Metrics JSONL epoch must be >= 1, found {epoch}"
+                    )
+                if configured_max is not None and epoch > configured_max:
+                    raise RuntimeError(
+                        "Metrics JSONL epoch exceeds configured training range: "
+                        f"{epoch} > {configured_max}"
+                    )
+                if epoch <= previous_epoch:
+                    detail = "duplicate" if epoch == previous_epoch else "out of order"
+                    raise RuntimeError(
+                        f"Metrics JSONL contains {detail} epoch {epoch}"
+                    )
+                previous_epoch = epoch
+                rows.append((epoch, stripped))
+        return rows
+
+    def _truncate_metrics_jsonl_to_epoch(self) -> None:
+        """Drop a valid future tail and require an exact checkpoint prefix."""
+        path = getattr(self, "metrics_jsonl", "")
+        if not path:
+            if self.epoch_count > 0:
+                raise RuntimeError(
+                    "Cannot resume: checkpoint has completed epochs but no "
+                    "metrics JSONL path is configured"
+                )
+            return
+
+        normalized = os.path.normpath(path)
+        rows = self._validated_metrics_jsonl(normalized)
+        kept = [(epoch, line) for epoch, line in rows if epoch <= self.epoch_count]
+        observed = [epoch for epoch, _ in kept]
+        expected = list(range(1, int(self.epoch_count) + 1))
+        if observed != expected:
+            raise RuntimeError(
+                "Cannot resume: metrics JSONL does not exactly cover the "
+                f"checkpoint prefix 1..{self.epoch_count}; found {observed}"
+            )
+
+        dropped = len(rows) - len(kept)
+        if dropped == 0:
+            return
+        temporary = normalized + ".tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+            for _, line in kept:
+                handle.write(line)
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, normalized)
+        print(
+            "  Resumed metrics JSONL truncated to epoch "
+            f"{self.epoch_count} (dropped {dropped} valid future "
+            f"record{'s' if dropped != 1 else ''})."
+        )
+
 
     @staticmethod
     def _print_prior_anchor_summary(train_logs: Dict[str, float]) -> None:
@@ -651,6 +981,7 @@ class Trainer:
     def run(self, num_epochs: Optional[int] = None) -> None:
         num_epochs = num_epochs or self.config.get("training", {}).get("num_epochs", 1000)
         self.start_time = time.time()
+        monitoring_contract_enabled = hasattr(self, "metrics_jsonl")
 
         # Backwards-compat: a few unit tests build Trainer via object.__new__
         # without calling __init__.  Ensure the monitoring attributes exist.
@@ -664,6 +995,12 @@ class Trainer:
                 resolve_checkpoint_dir(self.config),
                 "training_metrics.jsonl",
             )
+        # Monitoring records carry step_count; ensure it exists for the
+        # object.__new__ path used by a few unit tests.
+        if not hasattr(self, "step_count"):
+            self.step_count = 0
+        if not hasattr(self, "_resumed_elapsed"):
+            self._resumed_elapsed = 0.0
 
         print(f"\n{'='*60}")
         print(f"SLMF-BBDM Training")
@@ -681,7 +1018,7 @@ class Trainer:
             val_metrics = None
 
             total = train_logs.get("loss/total", 0)
-            elapsed = time.time() - self.start_time
+            elapsed = time.time() - self.start_time + self._resumed_elapsed
             epoch_s = train_logs.get("perf/epoch_seconds", 0)
             lr = train_logs.get("perf/lr", 0)
             print(
@@ -725,11 +1062,11 @@ class Trainer:
                     if self._check_early_stopping(combined_improved):
                         should_stop = True
 
-            # Checkpoint
-            if self.epoch_count % self.save_interval == 0:
-                self.save_checkpoint()
-
-            # Sampling — fixed tracked samples (not next(iter(val_loader)))
+            # Sampling — fixed tracked samples (not next(iter(val_loader))).
+            # This non-critical artifact may still fail (matplotlib, disk,
+            # permissions), so finish it before committing the epoch ledger and
+            # numbered checkpoint.  Once the checkpoint exists, no optional
+            # post-commit work may turn a completed run into a false FAILED.
             if self._tracked_batch is not None and self.epoch_count % self.sample_interval == 0:
                 if tracked_sample_result is None:
                     with self.ema_scope():
@@ -738,16 +1075,27 @@ class Trainer:
                 print(f"  Sample PET range: [{synth_pet.min().item():.4f}, {synth_pet.max().item():.4f}]")
                 self._save_sample_grid(self._tracked_batch, synth_pet)
 
-            self._append_epoch_metrics(
-                train_logs=train_logs,
-                eval_logs=avg_eval,
-                validation_metrics=val_metrics,
-            )
+            # Commit the epoch record before its checkpoint.  If checkpoint
+            # writing then fails, resume from the previous checkpoint safely
+            # truncates this valid future metrics tail.  The inverse ordering
+            # can create a checkpoint whose own epoch has no metrics record.
+            if monitoring_contract_enabled:
+                self._append_epoch_metrics(
+                    train_logs=train_logs,
+                    eval_logs=avg_eval,
+                    validation_metrics=val_metrics,
+                )
+
+            # The numbered checkpoint is the final fallible operation for this
+            # epoch.  A successful final checkpoint therefore cannot be
+            # followed by an optional artifact failure.
+            if self.epoch_count % self.save_interval == 0:
+                self.save_checkpoint()
 
             if should_stop:
                 break
 
-        print(f"\nTraining complete. Total: {time.time() - self.start_time:.0f}s")
+        print(f"\nTraining complete. Total: {time.time() - self.start_time + self._resumed_elapsed:.0f}s")
 
     # ------------------------------------------------------------------
     # Validation & model selection
@@ -863,10 +1211,28 @@ class Trainer:
             yield
 
     @torch.no_grad()
-    def _sample_with_eval_seed(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """Sample with fixed noise without advancing the training RNG state."""
+    def _sample_with_eval_seed(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Sample with fixed noise without advancing the training RNG state.
+
+        The batch is fed to ``model.sample`` in chunks of
+        ``eval_sample_batch_size`` so a 64-sample tracked batch never reaches
+        the sampler as a single forward pass.  All chunks run inside the same
+        eval RNG scope, so the per-sample noise trajectory is identical to a
+        single seeded pass for the same total ordering.
+        """
+        chunk_size = max(1, int(getattr(self, "eval_sample_batch_size", 1)))
         with self._eval_rng_scope():
-            return self.model.sample(_to_device(batch, self.device))
+            chunks = _chunk_batch(batch, chunk_size)
+            parts: List[Dict[str, Any]] = []
+            for chunk in chunks:
+                sampled = self.model.sample(_to_device(chunk, self.device))
+                parts.append(_sampled_output_to_cpu(sampled))
+            if len(parts) == 1:
+                return parts[0]
+            merged: Dict[str, Any] = {}
+            for key in parts[0]:
+                merged[key] = _cat_sampled(key, parts)
+            return merged
 
     @torch.no_grad()
     def _compute_val_sample_metrics(
@@ -876,22 +1242,38 @@ class Trainer:
     ) -> Dict[str, float]:
         """Run sampling on a fixed batch and compute monitoring metrics."""
         self.model.eval()
-        batch = _to_device(batch, self.device)
         if synth is None:
             synth = self._sample_with_eval_seed(batch)["synthetic_pet"]
-        target = batch["pet"]
-        mask = batch.get("mask")
+        # Sampling already transfers one bounded chunk at a time and returns
+        # CPU tensors.  Keep the full tracked target/mask batch on CPU so metric
+        # computation never creates a second batch-sized GPU allocation.
+        synth = synth.detach().cpu()
+        target = batch["pet"].detach().cpu()
+        raw_mask = batch.get("mask")
+        mask = raw_mask.detach().cpu() if torch.is_tensor(raw_mask) else raw_mask
+
+        # Small-lesion stratification: fix the area threshold from THIS batch's
+        # ground-truth masks so the small-lesion underestimate rate is
+        # well-defined even without a precomputed cohort threshold.
+        area_quantiles = self._batch_area_quantiles(mask)
 
         metrics: Dict[str, float] = {}
-        mae_vals, ssim_vals, stripe_vals = [], [], []
+        mae_vals, mse_vals, ssim_vals, stripe_vals, psnr_vals = [], [], [], [], []
         peak_err_vals, topq_peak_err_vals = [], []
         centroid_vals, oir_vals, roi_l1_vals = [], [], []
         failure_count = 0
+        small_under_count = 0
+        small_total = 0
         B = synth.shape[0]
         for i in range(B):
             p = synth[i, 0].float().cpu().numpy()
             t = target[i, 0].float().cpu().numpy()
-            mae_vals.append(float(np.abs(p - t).mean()))
+            diff = p - t
+            mae_vals.append(float(np.abs(diff).mean()))
+            mse_vals.append(float(np.mean(diff * diff)))
+            # PSNR in dB over a [-1, 1] data range; guard divide-by-zero.
+            _mse = max(float(np.mean(diff * diff)), 1e-12)
+            psnr_vals.append(float(10.0 * np.log10(4.0 / _mse)))
             stripe_vals.append(_stripe_score(p))
             # SSIM (lazy import to avoid hard dep at module load)
             try:
@@ -901,7 +1283,9 @@ class Trainer:
                 pass
             if mask is not None:
                 mi = mask[i, 0].float().cpu().numpy()
-                lesion_metrics = _compute_pet_sample_metrics(p, t, mi)
+                lesion_metrics = _compute_pet_sample_metrics(
+                    p, t, mi, area_quantiles=area_quantiles
+                )
                 if lesion_metrics is not None:
                     peak_err_vals.append(lesion_metrics["lesion_peak_error_norm"])
                     topq_peak_err_vals.append(
@@ -911,21 +1295,64 @@ class Trainer:
                     oir_vals.append(lesion_metrics["outside_inside_peak_ratio"])
                     roi_l1_vals.append(lesion_metrics["lesion_roi_l1"])
                     failure_count += int(lesion_metrics["failure"])
+                    small_total += int(lesion_metrics.get("small_lesion_count", 0.0))
+                    small_under_count += int(
+                        lesion_metrics.get("small_lesion_underestimate", 0.0)
+                    )
 
         def _mean(vals):
             return float(np.mean(vals)) if vals else float("nan")
 
         metrics["val/mae"] = _mean(mae_vals)
+        metrics["val/mse"] = _mean(mse_vals)
+        metrics["val/psnr"] = _mean(psnr_vals)
         metrics["val/ssim"] = _mean(ssim_vals)
         metrics["val/stripe_score"] = _mean(stripe_vals)
         metrics["val/lesion_peak_error_norm"] = _mean(peak_err_vals)
         metrics["val/lesion_topq_peak_error_norm"] = _mean(topq_peak_err_vals)
         metrics["val/lesion_centroid_distance"] = _mean(centroid_vals)
         metrics["val/outside_inside_peak_ratio"] = _mean(oir_vals)
-        metrics["val/failure_rate"] = float(failure_count) / max(len(peak_err_vals), 1)
+        # false_hotspot_proxy: fraction of lesion-bearing samples where the
+        # outside peak exceeds the in-lesion peak (same definition as failure).
+        metrics["val/false_hotspot_proxy"] = float(failure_count) / max(
+            len(peak_err_vals), 1
+        )
+        metrics["val/failure_rate"] = float(failure_count) / max(
+            len(peak_err_vals), 1
+        )
         metrics["val/lesion_roi_l1"] = _mean(roi_l1_vals)
         metrics["val/lesion_sample_count"] = float(len(peak_err_vals))
+        metrics["val/small_lesion_underestimate"] = (
+            float(small_under_count) / max(small_total, 1)
+            if small_total > 0
+            else float("nan")
+        )
+        metrics["val/small_lesion_sample_count"] = float(small_total)
         return metrics
+
+    @staticmethod
+    def _batch_area_quantiles(
+        mask: Optional[torch.Tensor],
+    ) -> Optional[tuple[float, float]]:
+        """Return (Q33, Q67) of per-sample lesion area for small/medium/large cuts.
+
+        Computed once per validation batch from ground-truth masks so the
+        small-lesion underestimate rate has a deterministic threshold even
+        without a precomputed cohort reference.  Returns None when no sample
+        carries a lesion.
+        """
+        if mask is None:
+            return None
+        areas = mask.float().reshape(mask.shape[0], -1).sum(dim=1).cpu().numpy()
+        positive = [float(a) for a in areas if a > 0.0]
+        if len(positive) < 2:
+            return None
+        q33 = float(np.quantile(positive, 1.0 / 3.0))
+        q67 = float(np.quantile(positive, 2.0 / 3.0))
+        if q33 <= 0.0:
+            return None
+        return (q33, q67)
+
 
     def _model_selection_scores(self, metrics: Dict[str, float]) -> Tuple[float, float, float]:
         """Return (lesion_score, image_score, combined) where higher is better.
@@ -964,7 +1391,189 @@ class Trainer:
             "best_image_score": self._best_image_score,
             "epochs_since_improve": self._epochs_since_improve,
             "last_combined_improvement_epoch": self._last_combined_improvement_epoch,
+            "resumed_elapsed": (
+                time.time() - self.start_time
+                if self.start_time is not None
+                else 0.0
+            ),
         }
+
+    def _rng_state_dict(self) -> Dict[str, Any]:
+        """Capture Python / NumPy / Torch / CUDA / DataLoader RNG state.
+
+        Schema v2 intentionally contains only primitives, containers, and CPU
+        tensors accepted by ``torch.load(weights_only=True)``.  In particular,
+        NumPy's ndarray state is encoded as a tensor instead of pickling
+        ``numpy._core.multiarray._reconstruct``.
+        """
+        np_state = np.random.get_state()
+        states: Dict[str, Any] = {
+            "schema_version": 2,
+            "python_random": random.getstate(),
+            "numpy": {
+                "bit_generator": str(np_state[0]),
+                "state": torch.from_numpy(
+                    np_state[1].astype(np.int64, copy=True)
+                ).cpu(),
+                "pos": int(np_state[2]),
+                "has_gauss": int(np_state[3]),
+                "cached_gaussian": float(np_state[4]),
+            },
+            "torch_cpu": torch.get_rng_state().detach().cpu(),
+        }
+        if torch.cuda.is_available():
+            states["torch_cuda_all"] = [
+                value.detach().cpu().clone()
+                for value in torch.cuda.get_rng_state_all()
+            ]
+        loader_states: Dict[str, Any] = {}
+        sampler_states: Dict[str, Any] = {}
+        for name in ("train_loader", "val_loader"):
+            loader = getattr(self, name, None)
+            generator = getattr(loader, "generator", None)
+            if generator is not None:
+                loader_states[name] = generator.get_state().detach().cpu().clone()
+            else:
+                loader_states[name] = None
+            sampler = getattr(loader, "sampler", None)
+            sampler_generator = getattr(sampler, "generator", None)
+            if sampler_generator is not None:
+                sampler_states[name] = (
+                    sampler_generator.get_state().detach().cpu().clone()
+                )
+            else:
+                sampler_states[name] = None
+        states["loader_generators"] = loader_states
+        states["sampler_generators"] = sampler_states
+        return states
+
+    def _load_rng_state(self, checkpoint: Dict[str, Any]) -> None:
+        """Restore schema-v2 RNG state, failing closed on an unsafe resume."""
+        rng = checkpoint.get("rng")
+        if not isinstance(rng, dict):
+            raise RuntimeError(
+                "Resume checkpoint lacks RNG state; exact continuation cannot "
+                "be guaranteed"
+            )
+        if rng.get("schema_version") != 2:
+            raise RuntimeError(
+                "Resume checkpoint RNG schema is unsupported; expected "
+                "schema_version=2"
+            )
+        py_state = rng.get("python_random")
+        if py_state is None:
+            raise RuntimeError("Resume checkpoint lacks Python RNG state")
+        try:
+            random.setstate(py_state)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Resume checkpoint Python RNG state is invalid") from exc
+
+        np_state = rng.get("numpy")
+        if not isinstance(np_state, dict):
+            raise RuntimeError("Resume checkpoint lacks NumPy RNG state")
+        required_numpy = {
+            "bit_generator",
+            "state",
+            "pos",
+            "has_gauss",
+            "cached_gaussian",
+        }
+        missing_numpy = sorted(required_numpy.difference(np_state))
+        if missing_numpy:
+            raise RuntimeError(
+                f"Resume checkpoint NumPy RNG state lacks {missing_numpy}"
+            )
+        np_array = np_state["state"]
+        if not torch.is_tensor(np_array):
+            raise RuntimeError("Resume checkpoint NumPy RNG array is not a tensor")
+        try:
+            np.random.set_state(
+                (
+                    str(np_state["bit_generator"]),
+                    np_array.detach().cpu().numpy().astype(np.uint32, copy=True),
+                    int(np_state["pos"]),
+                    int(np_state["has_gauss"]),
+                    float(np_state["cached_gaussian"]),
+                )
+            )
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Resume checkpoint NumPy RNG state is invalid") from exc
+
+        cpu_state = rng.get("torch_cpu")
+        if not torch.is_tensor(cpu_state):
+            raise RuntimeError("Resume checkpoint lacks Torch CPU RNG state")
+        try:
+            torch.set_rng_state(cpu_state.detach().cpu())
+        except (TypeError, RuntimeError) as exc:
+            raise RuntimeError("Resume checkpoint Torch CPU RNG state is invalid") from exc
+
+        cuda_states = rng.get("torch_cuda_all")
+        resume_device = torch.device(getattr(self, "device", "cpu"))
+        if resume_device.type == "cuda" and torch.cuda.is_available():
+            if (
+                not isinstance(cuda_states, list)
+                or len(cuda_states) != torch.cuda.device_count()
+                or not all(torch.is_tensor(state) for state in cuda_states)
+            ):
+                raise RuntimeError(
+                    "Resume checkpoint lacks complete Torch CUDA RNG state"
+                )
+            try:
+                torch.cuda.set_rng_state_all(
+                    [state.detach().cpu() for state in cuda_states]
+                )
+            except (AttributeError, TypeError, RuntimeError) as exc:
+                raise RuntimeError(
+                    "Resume checkpoint Torch CUDA RNG state is invalid"
+                ) from exc
+
+        loader_states = rng.get("loader_generators")
+        sampler_states = rng.get("sampler_generators")
+        if not isinstance(loader_states, dict) or not isinstance(
+            sampler_states, dict
+        ):
+            raise RuntimeError(
+                "Resume checkpoint lacks DataLoader/sampler RNG state"
+            )
+        for name in ("train_loader", "val_loader"):
+            loader = getattr(self, name, None)
+            if loader is None:
+                continue
+            generator = getattr(loader, "generator", None)
+            saved_loader_state = loader_states.get(name)
+            if generator is None or not torch.is_tensor(saved_loader_state):
+                raise RuntimeError(
+                    f"Exact resume requires an explicit {name} generator"
+                )
+            try:
+                generator.set_state(saved_loader_state.detach().cpu())
+            except (TypeError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"Resume checkpoint {name} generator state is invalid"
+                ) from exc
+
+            sampler = getattr(loader, "sampler", None)
+            sampler_generator = getattr(sampler, "generator", None)
+            saved_sampler_state = sampler_states.get(name)
+            # Validation is sequential and has no sampler RNG.  The shuffled
+            # training sampler must always be explicit and checkpointed.
+            if name == "train_loader":
+                if sampler_generator is None or not torch.is_tensor(
+                    saved_sampler_state
+                ):
+                    raise RuntimeError(
+                        "Exact resume requires an explicit train sampler "
+                        "generator"
+                    )
+                try:
+                    sampler_generator.set_state(
+                        saved_sampler_state.detach().cpu()
+                    )
+                except (TypeError, RuntimeError) as exc:
+                    raise RuntimeError(
+                        "Resume checkpoint train sampler generator state is "
+                        "invalid"
+                    ) from exc
 
     def _load_monitoring_state(self, checkpoint: Dict[str, Any]) -> None:
         """Restore monitoring state when present; accept older checkpoints."""
@@ -989,6 +1598,10 @@ class Trainer:
         )
         self._last_combined_improvement_epoch = (
             int(last_epoch) if last_epoch is not None else None
+        )
+        resumed_elapsed = state.get("resumed_elapsed")
+        self._resumed_elapsed = (
+            float(resumed_elapsed) if resumed_elapsed is not None else 0.0
         )
 
     def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
@@ -1037,7 +1650,7 @@ class Trainer:
                 "config": self.config,
                 "monitoring": self._monitoring_state_dict(),
             }
-            torch.save(
+            _atomic_torch_save(
                 attach_data_lineage(
                     checkpoint, getattr(self, "data_lineage", None)
                 ),
@@ -1089,8 +1702,9 @@ class Trainer:
             "step": self.step_count,
             "config": self.config,
             "monitoring": self._monitoring_state_dict(),
+            "rng": self._rng_state_dict(),
         }
-        torch.save(
+        _atomic_torch_save(
             attach_data_lineage(
                 checkpoint, getattr(self, "data_lineage", None)
             ),
@@ -1143,7 +1757,17 @@ class Trainer:
         print(f"  Sample grid → {out_path}")
 
     def load_checkpoint(self, path: str):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        # Load on CPU so CPU RNG tensors are never remapped to CUDA.  Module and
+        # optimizer loaders copy/cast their tensors to the live parameter
+        # devices below.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, Mapping):
+            raise RuntimeError("Resume checkpoint payload is not a mapping")
+        _validate_prior_anchored_resume_identity(
+            current_config=self.config,
+            checkpoint_config=checkpoint.get("config"),
+            checkpoint_path=os.fspath(path),
+        )
         validate_checkpoint_data_lineage(
             checkpoint,
             self.data_lineage,
@@ -1156,9 +1780,27 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scheduler.load_state_dict(checkpoint["scheduler"])
         self.ema.load_state_dict(checkpoint["ema"])
+        parameter_devices = {
+            name: parameter.device
+            for name, parameter in self.model.named_parameters()
+        }
+        self.ema.shadow = {
+            name: value.to(parameter_devices.get(name, self.device))
+            for name, value in self.ema.shadow.items()
+        }
         self.epoch_count = checkpoint["epoch"]
         self.step_count = checkpoint["step"]
         self._load_monitoring_state(checkpoint)
+        # The fixed tracked batch is intentionally not serialized.  Rebuild it
+        # while the fresh validation loader is still at its initial state, then
+        # restore the checkpoint RNG below.  Otherwise run() would perform this
+        # scan after RNG restoration and advance the val-loader generator beyond
+        # the uninterrupted trajectory.  build_dataloaders always constructs the
+        # validation CachedDataset with augment=False, so this scan is
+        # deterministic and carries no hidden worker augmentation state.
+        self._initialize_tracked_batch()
+        self._load_rng_state(checkpoint)
         self.accum_count = 0
         self._set_spectral_router_epoch()
+        self._truncate_metrics_jsonl_to_epoch()
         print(f"Loaded checkpoint from {path} (epoch {self.epoch_count})")

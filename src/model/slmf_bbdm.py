@@ -1563,6 +1563,22 @@ class SLMFBBDM(nn.Module):
                 logs["frequency/route_routing_progress"] = (
                     routing_progress.detach()
                 )
+            # Stable cross-policy names used by paired monitoring.  These are
+            # present for native-only, fixed, learned, and prior-anchored
+            # routers alike; prior-specific aliases below remain for backward
+            # compatibility with existing C-run summaries.
+            for diagnostic_key in (
+                "route_native_mass",
+                "route_shallow_mass",
+                "route_null_mass",
+            ):
+                value = self._last_frequency_diagnostics.get(diagnostic_key)
+                if value is not None:
+                    logs[f"frequency/{diagnostic_key}"] = (
+                        value.detach()
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
             if (
                 getattr(
                     self.residual_preconditioner,
@@ -1590,6 +1606,10 @@ class SLMFBBDM(nn.Module):
                         "monotonic_violation_fraction",
                     ),
                     ("route_shallow_mass", "shallow_mass"),
+                    ("route_native_mass", "native_mass"),
+                    ("route_null_mass", "null_mass"),
+                    ("route_prior_active_mean", "prior_active_mean"),
+                    ("route_active_mean", "active_mean"),
                 ):
                     value = self._last_frequency_diagnostics.get(
                         diagnostic_key

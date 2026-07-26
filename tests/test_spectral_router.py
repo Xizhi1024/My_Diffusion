@@ -552,6 +552,9 @@ def test_hard_all_null_short_circuits_before_descriptors_and_projection():
             assert diagnostics[f"route_{level}_null_{statistic}"].item() == 1.0
     for level in range(4):
         assert diagnostics[f"injection/l{level}_rms"].item() == 0.0
+    assert diagnostics["route_native_mass"].item() == 0.0
+    assert diagnostics["route_shallow_mass"].item() == 0.0
+    assert diagnostics["route_null_mass"].item() == 1.0
 
 
 def test_learned_no_null_routes_are_two_way_normalized_and_trainable():
@@ -601,7 +604,12 @@ def test_router_half_precision_preserves_reference_dtype_and_stays_finite():
 
     assert all(value.dtype == torch.float16 for value in injections)
     assert all(torch.isfinite(value).all() for value in injections)
-    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+    tensor_diagnostics = (
+        value for value in diagnostics.values() if isinstance(value, torch.Tensor)
+    )
+    assert all(torch.isfinite(value).all() for value in tensor_diagnostics)
+    assert diagnostics["route_l2_entropy"].dtype == torch.float32
+    assert diagnostics["route_l1_entropy"].dtype == torch.float32
 
 
 def test_router_half_precision_is_finite_at_bridge_endpoints():
@@ -646,6 +654,22 @@ def test_router_half_precision_is_finite_at_bridge_endpoints():
     assert diagnostics["noise_reliability"].max() <= 1
 
 
+def test_router_half_precision_entropy_is_finite_for_exact_zero_routes():
+    module = _router(route_policy="native_only").half()
+    residual = torch.randn(2, 1, 32, 32, dtype=torch.float16)
+    _, diagnostics = module(
+        residual,
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        torch.randn_like(residual),
+    )
+
+    for key in ("route_l2_entropy", "route_l1_entropy"):
+        assert diagnostics[key].dtype == torch.float32
+        assert torch.isfinite(diagnostics[key])
+        assert diagnostics[key].item() == pytest.approx(0.0)
+
+
 def test_router_normalizes_optional_gabor_evidence_to_reference_dtype():
     module = _router().half()
     residual = torch.randn(2, 1, 32, 32, dtype=torch.float16)
@@ -664,7 +688,47 @@ def test_router_normalizes_optional_gabor_evidence_to_reference_dtype():
     assert all(value.dtype == torch.float16 for value in injections)
     assert diagnostics["gabor_haar_agreement"].dtype == torch.float16
     assert diagnostics["gabor_dct_agreement"].dtype == torch.float16
-    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+    tensor_diagnostics = (
+        value for value in diagnostics.values() if isinstance(value, torch.Tensor)
+    )
+    assert all(torch.isfinite(value).all() for value in tensor_diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("policy", "fixed_prior"),
+    (
+        ("native_only", (0.05, 0.05, 0.90)),
+        ("fixed_prior", (0.20, 0.30, 0.50)),
+        ("learned", (0.05, 0.05, 0.90)),
+        ("learned_no_null", (0.50, 0.50)),
+    ),
+)
+def test_all_route_policies_emit_common_route_mass_diagnostics(
+    policy,
+    fixed_prior,
+):
+    module = _router(route_policy=policy, fixed_prior=fixed_prior)
+    residual = torch.randn(2, 1, 32, 32)
+    _, diagnostics = module(
+        residual,
+        torch.tensor([20, 60]),
+        _BridgeSchedule(),
+        torch.randn_like(residual),
+    )
+
+    for key in (
+        "route_native_mass",
+        "route_shallow_mass",
+        "route_null_mass",
+    ):
+        assert key in diagnostics
+        assert diagnostics[key].ndim == 0
+        assert torch.isfinite(diagnostics[key])
+    assert (
+        diagnostics["route_native_mass"]
+        + diagnostics["route_shallow_mass"]
+        + diagnostics["route_null_mass"]
+    ).item() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_router_receives_gradients_after_zero_projection_learns():

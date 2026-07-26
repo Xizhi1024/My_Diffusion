@@ -4,7 +4,8 @@
 > `memory/mechanism-freeze-and-positioning.md`(及待写的 `docs/mechanism_freeze.md`)。
 > 本文件随实现变更更新;每项区分三层:**已实现 / 已启用 / 已验证**。
 >
-> 基准日期:2026-07-24。生产配置:`configs/experiments/slmf_png_spectral_router_v5.yaml`。
+> 基准日期:2026-07-26。生产配置:`configs/experiments/slmf_png_spectral_router_v5.yaml`。
+> 探索性 prior-anchored router 实验(未上生产):`configs/experiments/slmf_png_prior_anchored_router_100e.yaml`。
 
 ## 0. 最准确的模型名(现状)
 
@@ -112,6 +113,52 @@ V2-03 决策:`results/mechanism_validation_v2/03_excluded_mean_production/decisi
 ## 6. 证据指针
 
 - 生产配置:[slmf_png_spectral_router_v5.yaml](../configs/experiments/slmf_png_spectral_router_v5.yaml)
+- 探索性 prior-anchored router 配置(未上生产):[slmf_png_prior_anchored_router_100e.yaml](../configs/experiments/slmf_png_prior_anchored_router_100e.yaml)
+- 配对消融计划(探索性):[prior_anchored_paired_ablation_v1.yaml](../configs/experiments/prior_anchored_paired_ablation_v1.yaml)
 - Router 实现:[spectral_router.py](../src/model/frequency/spectral_router.py)
+- Prior-anchored 加载器:[prior_anchor_schedule.py](../src/model/frequency/prior_anchor_schedule.py)
 - Mean 训练:[mean_pretraining.py](../src/model/mean_pretraining.py)
 - 现状→目标的最小改动清单:见 `docs/freeze_gap_checklist.md`
+
+## 7. 探索性 prior-anchored router 实验(五层状态)
+
+> 本节严格区分 **已实现 / 已启用 / 已运行 / 已验证 / 生产启用**。
+> 该实验是 exploratory,不接入生产,不构成 clinical / causal / H5-H6 formal claim。
+
+### 7.1 状态表
+
+| 层 | 状态 | 证据 |
+|---|---|---|
+| 已实现 | ✅ | `prior_anchored_learned` policy、有界 active logit correction、conditional destination head、6 项正则(anchor/monotonic/curvature/budget/shallow/temporal)、phase-gated 监控 |
+| 已连接 | ✅ | Trainer 每 epoch 调 `set_training_epoch`(+resume 恢复);6 个正则项经 `ConditionBundle.scalars` 接入;JSONL 记录路由 mass/delta/grad |
+| 已通过单元测试 | ✅ | phase schedule、endpoint 精确、warmup 绕过 head(grad=None)、state_dict 往返、loss phase-gating、native+shallow+null=1、resume JSONL 去重、summarizer 嵌套 metrics、CPU 端到端 smoke |
+| 已运行 | ❌ | 100e 真实 run 尚未执行;本地只改代码并做合成/静态验证,不读取也不假定本地 cache、PNG 或 checkpoint 与云端一致;真实训练为云端专属 |
+| 已验证 | ❌ | A/B/C/D 目前仅有 fail-closed 计划;因参数结构、幅度合同和初始化不等而 `paired_execution_allowed=false`,且 B 缺 formal H3-v2 schedule;未执行 |
+| 生产启用 | ❌ | preview prior 标记 `preview_only=true`、`production_activation_allowed=false`;`h3_allow_unverified_preview_lineage=true` 仅限 exploratory |
+
+### 7.2 科学含义(允许的表述)
+
+- H3 prior(timestep-band active)决定群体级"何时/哪个频带通常可开放"的候选;
+- active correction 是患者级、自适应、**有界** logit 修正(`active_logit_delta_max=2.0`);
+- destination head 只回答 active 信息送 native 还是 shallow;
+- 先验端点(prior=0 或 1)保持精确,adaptive head 不能将其打开或关闭;
+- p_native = a·q_n,p_shallow = a·q_s,p_null = 1−a。
+
+### 7.3 禁止的表述
+
+- 不得声称 artifact safety 已验证(`artifact_safety_weight=0`);
+- 不得声称 H4-v2 已外部确认;
+- 不得声称完整层级路由已证明(destination 未独立干预);
+- 不得声称临床有效、代谢定量 / SUV 一致;
+- 不得声称不会生成假病灶(数据全病灶层,无阴性切片);
+- 当前数据无物理 SUV,只能使用 normalized uptake proxy。
+
+### 7.4 监控契约(每个 epoch 一条 JSONL 记录)
+
+每个 epoch 的记录至少包含:epoch、step、phase、active/destination release progress、anchor scale、
+prior/adaptive active mean、prior-active MAE、active delta abs mean/max、
+native/shallow/null mass、monotonic violation、curvature、budget deviation、shallow-cost、
+router/active-head/destination-head/projection gradient norm 与 total loss。validation image、
+lesion ROI、normalized uptake proxy、stripe、outside/inside peak ratio 和 small-lesion
+stratified metrics 仅在配置的验证 epoch 写入。checkpoint 前先原子提交 JSONL;
+resume 必须看到 `1..checkpoint_epoch` 的完整前缀,只允许原子丢弃合法的未来尾部。

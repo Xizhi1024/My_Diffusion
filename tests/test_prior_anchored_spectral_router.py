@@ -28,10 +28,15 @@ def _active_table(steps: int = 100) -> torch.Tensor:
     return rows.reshape(2, 3, steps)
 
 
-def _router(monkeypatch, *, steps: int = 100):
+def _router(
+    monkeypatch,
+    *,
+    steps: int = 100,
+    active_table: torch.Tensor | None = None,
+):
     from src.model.frequency import spectral_router
 
-    active = _active_table(steps)
+    active = _active_table(steps) if active_table is None else active_table
     monkeypatch.setattr(
         spectral_router,
         "load_prior_anchor_schedule",
@@ -61,7 +66,7 @@ def _router(monkeypatch, *, steps: int = 100):
         prior_active_ramp_epochs=10,
         prior_destination_warmup_epochs=30,
         prior_destination_ramp_epochs=10,
-        prior_anchor_decay_end_epoch=99,
+        prior_anchor_decay_end_epoch=100,
         prior_anchor_final_scale=0.10,
     )
 
@@ -201,6 +206,54 @@ def test_prior_endpoints_remain_exact_and_diagnostics_are_finite(monkeypatch):
         assert torch.isfinite(diagnostics[key]).all()
 
 
+def test_route_masses_partition_one_and_match_phase_invariants(monkeypatch):
+    router = _router(monkeypatch)
+
+    # Warmup: destination closed, active correction frozen at zero, so the
+    # route must equal the frozen H3 prior exactly.
+    router.set_training_epoch(0)
+    _, diagnostics = _forward(router, timestep=40)
+    assert diagnostics["route_shallow_mass"].item() == pytest.approx(0.0)
+    assert diagnostics["route_native_mass"].item() == pytest.approx(
+        diagnostics["route_prior_active_mean"].item()
+    )
+    assert diagnostics["route_null_mass"].item() == pytest.approx(
+        1.0 - diagnostics["route_prior_active_mean"].item()
+    )
+
+    # Full release: native + shallow + null must sum to 1.0 exactly, and the
+    # adaptive active mean is the (possibly corrected) mass split across
+    # native + shallow.
+    router.set_training_epoch(99)
+    _, diagnostics = _forward(router, timestep=40)
+    total = (
+        diagnostics["route_native_mass"].item()
+        + diagnostics["route_shallow_mass"].item()
+        + diagnostics["route_null_mass"].item()
+    )
+    assert total == pytest.approx(1.0, abs=1e-6)
+    native_plus_shallow = (
+        diagnostics["route_native_mass"].item()
+        + diagnostics["route_shallow_mass"].item()
+    )
+    assert native_plus_shallow == pytest.approx(
+        diagnostics["route_active_mean"].item(), abs=1e-6
+    )
+    assert diagnostics["route_native_mass"].item() >= 0.0
+    assert diagnostics["route_shallow_mass"].item() >= 0.0
+    assert diagnostics["route_null_mass"].item() >= 0.0
+    # Sanity: the four scalar diagnostics are real scalars.
+    for key in (
+        "route_native_mass",
+        "route_shallow_mass",
+        "route_null_mass",
+        "route_prior_active_mean",
+        "route_active_mean",
+    ):
+        assert diagnostics[key].ndim == 0
+        assert torch.isfinite(diagnostics[key])
+
+
 def test_prior_phase_buffers_survive_state_dict_round_trip(monkeypatch):
     router = _router(monkeypatch)
     router.set_training_epoch(35)
@@ -214,3 +267,64 @@ def test_prior_phase_buffers_survive_state_dict_round_trip(monkeypatch):
         restored._prior_anchor_scale.item()
         == router._prior_anchor_scale.item()
     )
+    assert restored._prior_active_progress_value == pytest.approx(1.0)
+    assert restored._prior_destination_progress_value == pytest.approx(0.6)
+
+
+def test_verified_prior_is_not_checkpoint_owned_and_legacy_key_is_ignored(
+    monkeypatch,
+):
+    old_table = _active_table()
+    new_table = old_table.flip(-1).contiguous()
+
+    old_router = _router(monkeypatch, active_table=old_table)
+    old_router.set_training_epoch(35)
+    legacy_state = old_router.state_dict()
+    assert "_h3_native_active_mass" not in legacy_state
+    # Simulate a checkpoint written before the schedule became non-persistent.
+    legacy_state["_h3_native_active_mass"] = old_table.clone()
+
+    restored = _router(monkeypatch, active_table=new_table)
+    restored.load_state_dict(legacy_state, strict=True)
+
+    torch.testing.assert_close(restored._h3_native_active_mass, new_table)
+    assert not torch.equal(restored._h3_native_active_mass, old_table)
+
+
+def test_legacy_prior_key_is_not_suppressed_for_a_non_prior_policy():
+    from src.model.frequency.spectral_router import (
+        SpectralEvidenceFrequencyRouter,
+    )
+
+    router = SpectralEvidenceFrequencyRouter(
+        output_channels=(16, 16, 8, 4),
+        band_scales=(0.5, 0.25),
+        ct_reliability_floors=(0.25, 0.50),
+        hidden_channels=8,
+        dct_enabled=False,
+        gabor_enabled=False,
+        route_policy="native_only",
+    )
+    incompatible_state = router.state_dict()
+    incompatible_state["_h3_native_active_mass"] = _active_table()
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        router.load_state_dict(incompatible_state, strict=True)
+
+
+def test_prior_forward_does_not_read_progress_buffers_with_item(monkeypatch):
+    router = _router(monkeypatch)
+    router.set_training_epoch(35)
+    tracked = {
+        router._prior_active_progress.data_ptr(),
+        router._prior_destination_progress.data_ptr(),
+    }
+    original_item = torch.Tensor.item
+
+    def guarded_item(tensor):
+        if tensor.data_ptr() in tracked:
+            raise AssertionError("prior forward synchronized a progress buffer")
+        return original_item(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", guarded_item)
+    _, diagnostics = _forward(router)
+    assert torch.isfinite(diagnostics["route_active"]).all()

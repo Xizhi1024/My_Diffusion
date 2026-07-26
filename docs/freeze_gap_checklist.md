@@ -18,16 +18,20 @@
 | 5 | router **重构成** `a=π·eCT·eRes·eSafe` × `p=softmax(native/shallow/null)` × `null=1−a` 的分解 | [spectral_router.py](../src/model/frequency/spectral_router.py) 结构重构 | #3 + #4(依赖 e^res 稳定 + e^safe 存在) | ❌ **不能**。依赖 #3#4。注意:把 H4-v1 FAIL 的 raw e^res 直接当主驱动,等于复活一个已 FAIL 的门,必须走 #3 的 uncertainty-aware 路径 |
 | 6 | (验证)**H5** 路由消融:fixed / shuffle / wrong-band / timestep-permutation,证明收益来自时间—层级而非参数量 | [validate_h5_router_role_separation.py](../scripts/validate_h5_router_role_separation.py)(已存在,dry-run 计划 epochs=50 mc=20) | router 定形(依赖 #3#4 或至少冻结一种稳定 router 形态) | ⏳ 脚本就绪;需 router 定形后正式跑 |
 | 7 | (验证)**H6** 最终小病灶增益 + 假热点/条纹/全图误差非劣,对比 plain residual diffusion 与固定频率注入 | [validate_h6_final_integration.py](../scripts/validate_h6_final_integration.py)(已存在,dry-run) | **H5 PASS** + #1–#5 | ⏳ 末步,全部上游就绪后 |
+| 8 | (探索性,非 formal gate)**A/B/C/D 候选消融**:no_route / fixed_h3_native_null / h3_prior_anchored_adaptive / unconstrained_learned_router;意图只改 router block,但当前参数结构、初始化与幅度合同并不配对 | [prior_anchored_paired_ablation_v1.yaml](../configs/experiments/prior_anchored_paired_ablation_v1.yaml)(fail-closed plan)+ [契约测试](../tests/test_prior_anchored_paired_ablation.py) | 先统一结构/初始化/预算;**B 另卡 formal H3-v2 schedule** | ⛔ `paired_execution_allowed=false`;当前不可执行、未运行,不替代 H5/H6 formal validation |
 
 ## 排序与门控
 
 ```
 现在可做:  #1(excluded mean 重训,H2 已 PASS)
            #2 的阈值设置部分(按 H3 纠正排序;收益待 stage 05)
+           #8 的 fail-closed plan + 契约(只记录 blocker,不授权执行)
 卡门:      #3 → H4-v2 外部确认
            #4 → stage 06 artifact_safety
            #5 → #3 + #4
            #2 的收益主张 → stage 05
+           #8 的配对执行 → 统一参数结构/初始化/幅度合同
+           #8 的 B 变体 → formal H3-v2 schedule(decision=PASS)
 验证链:    router 定形 → #6(H5) → #7(H6)
 ```
 

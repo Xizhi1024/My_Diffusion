@@ -1,29 +1,94 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
+import random
 from pathlib import Path
 
 import pytest
 import torch
 import yaml
 
+from scripts import run_prior_anchored_router_100e as runner_module
 from scripts.run_prior_anchored_router_100e import (
     DEFAULT_CONFIG,
     PIPELINE_ID,
     RunnerError,
     build_static_preflight,
     find_latest_resume_checkpoint,
+    inspect_resume_checkpoint,
     materialize_run_config,
     normalize_repo_relative,
     prepare_fresh_run,
     select_latest_resumable_run,
     select_mean_checkpoint,
+    validate_complete_metrics_jsonl,
     validate_prior_artifact,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _checkpoint_lineage() -> dict:
+    lineage = {
+        "lineage_type": "verified_png_tensor_cache",
+        "manifest_semantic_sha256": "1" * 64,
+        "raw_png_combined_sha256": "2" * 64,
+        "preprocessing_config_sha256": "3" * 64,
+        "dataset_contract_sha256": "4" * 64,
+        "cache_payload_sha256": "5" * 64,
+    }
+    canonical = json.dumps(
+        lineage,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lineage["cache_metadata_sha256"] = hashlib.sha256(canonical).hexdigest()
+    return lineage
+
+
+def _write_current_lineage(root: Path) -> dict:
+    contract = {
+        "manifest": {"semantic_sha256": "1" * 64},
+        "raw_png": {"combined_sha256": "2" * 64},
+        "preprocessing_config_sha256": "3" * 64,
+    }
+    contract_body = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    contract["contract_sha256"] = hashlib.sha256(contract_body).hexdigest()
+    contract_path = root / "configs" / "dataset_contract_stage0a_v1.json"
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    lineage = {
+        "lineage_type": "verified_png_tensor_cache",
+        "manifest_semantic_sha256": "1" * 64,
+        "raw_png_combined_sha256": "2" * 64,
+        "preprocessing_config_sha256": "3" * 64,
+        "dataset_contract_sha256": contract["contract_sha256"],
+        "cache_payload_sha256": "5" * 64,
+    }
+    lineage_body = json.dumps(
+        lineage,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lineage["cache_metadata_sha256"] = hashlib.sha256(
+        lineage_body
+    ).hexdigest()
+    lineage_path = root / "cache" / "tensors_main" / "cache_lineage.json"
+    lineage_path.parent.mkdir(parents=True, exist_ok=True)
+    lineage_path.write_text(json.dumps(lineage), encoding="utf-8")
+    return lineage
 
 
 def _base_config() -> dict:
@@ -50,8 +115,10 @@ def _write_checkpoint(
     *,
     epoch: int,
     config: dict,
+    lineage: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    generator_state = torch.Generator().get_state()
     torch.save(
         {
             "model": {},
@@ -61,7 +128,28 @@ def _write_checkpoint(
             "epoch": epoch,
             "step": epoch * 7,
             "config": config,
-            "data_lineage": {"cache_metadata_sha256": "b" * 64},
+            "data_lineage": lineage or _checkpoint_lineage(),
+            "rng": {
+                "schema_version": 2,
+                "python_random": random.getstate(),
+                "numpy": {
+                    "bit_generator": "MT19937",
+                    "state": torch.zeros(624, dtype=torch.int64),
+                    "pos": 0,
+                    "has_gauss": 0,
+                    "cached_gaussian": 0.0,
+                },
+                "torch_cpu": generator_state.clone(),
+                "torch_cuda_all": [generator_state.clone()],
+                "loader_generators": {
+                    "train_loader": generator_state.clone(),
+                    "val_loader": generator_state.clone(),
+                },
+                "sampler_generators": {
+                    "train_loader": generator_state.clone(),
+                    "val_loader": None,
+                },
+            },
         },
         path,
     )
@@ -123,8 +211,10 @@ def test_run_owned_config_uses_only_relative_paths(tmp_path: Path) -> None:
     assert config["runtime"]["training_metrics_jsonl"] == (
         "results/runs/run-a/training_metrics.jsonl"
     )
+    assert config["runtime"]["dataloader_seed"] == 42
     router = config["modules"]["residual_frequency"]["cross_level_router"]
     assert router["policy"] == "prior_anchored_learned"
+    assert router["prior_anchor_decay_end_epoch"] == 100
     assert router["h3_schedule_path"] == (
         "results/runs/run-a/prior/prior.json"
     )
@@ -210,6 +300,105 @@ def test_resume_does_not_silently_skip_corrupt_latest_checkpoint(
         find_latest_resume_checkpoint(
             checkpoint_dir,
             expected_config=config,
+            verify_current_lineage=False,
+        )
+
+
+def test_resume_rejects_rng_tensor_that_cannot_be_restored(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    checkpoint = run_dir / "checkpoints" / "ckpt_epoch0010.pt"
+    _write_checkpoint(checkpoint, epoch=10, config=config)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["rng"]["torch_cpu"] = torch.zeros(1, dtype=torch.uint8)
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(RunnerError, match="not restorable"):
+        find_latest_resume_checkpoint(
+            checkpoint.parent,
+            expected_config=config,
+            verify_current_lineage=False,
+        )
+
+
+def test_resume_rejects_full_config_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    checkpoint = run_dir / "checkpoints" / "ckpt_epoch0010.pt"
+    _write_checkpoint(checkpoint, epoch=10, config=config)
+    changed = copy.deepcopy(config)
+    changed["experiment"]["seed"] += 1
+
+    with pytest.raises(RunnerError, match="configuration differs"):
+        inspect_resume_checkpoint(
+            checkpoint,
+            expected_config=changed,
+            root=tmp_path,
+            verify_current_lineage=False,
+        )
+
+
+def test_resume_rejects_absolute_checkpoint_owned_resume_path(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    checkpoint = run_dir / "checkpoints" / "ckpt_epoch0010.pt"
+    _write_checkpoint(checkpoint, epoch=10, config=config)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["config"]["training"]["resume_from"] = "C:/other/run/ckpt.pt"
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(RunnerError, match="repository-relative"):
+        inspect_resume_checkpoint(
+            checkpoint,
+            expected_config=config,
+            root=tmp_path,
+            verify_current_lineage=False,
+        )
+
+
+def test_resume_rejects_lineage_that_differs_from_current_cache_metadata(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    checkpoint_lineage = _write_current_lineage(tmp_path)
+    checkpoint = run_dir / "checkpoints" / "ckpt_epoch0010.pt"
+    _write_checkpoint(
+        checkpoint,
+        epoch=10,
+        config=config,
+        lineage=checkpoint_lineage,
+    )
+    current = dict(checkpoint_lineage)
+    current["cache_payload_sha256"] = "9" * 64
+    current.pop("cache_metadata_sha256")
+    canonical = json.dumps(
+        current,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    current["cache_metadata_sha256"] = hashlib.sha256(canonical).hexdigest()
+    (
+        tmp_path / "cache" / "tensors_main" / "cache_lineage.json"
+    ).write_text(json.dumps(current), encoding="utf-8")
+
+    with pytest.raises(RunnerError, match="differs from current cache"):
+        inspect_resume_checkpoint(
+            checkpoint,
+            expected_config=config,
+            root=tmp_path,
+            verify_current_lineage=True,
         )
 
 
@@ -230,7 +419,185 @@ def test_resume_rejects_only_best_checkpoint_instead_of_restarting(
         find_latest_resume_checkpoint(
             checkpoint_dir,
             expected_config=config,
+            verify_current_lineage=False,
         )
+
+
+def test_resume_fails_closed_when_no_numbered_checkpoint_exists(
+    tmp_path: Path,
+) -> None:
+    """Resume must never silently restart from epoch 0."""
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+
+    # Fresh-run introspection: an empty dir is a legitimate "nothing yet".
+    assert (
+        find_latest_resume_checkpoint(
+            checkpoint_dir,
+            expected_config=config,
+            require=False,
+            verify_current_lineage=False,
+        )
+        is None
+    )
+
+    # Resume context: the same empty dir must fail closed, not restart.
+    with pytest.raises(RunnerError, match="refusing to restart"):
+        find_latest_resume_checkpoint(
+            checkpoint_dir,
+            expected_config=config,
+            require=True,
+            verify_current_lineage=False,
+        )
+
+
+def _write_metrics(path: Path, *, final_epoch: int = 100) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        json.dumps(
+            {
+                "schema_version": 1,
+                "epoch": epoch,
+                "step": epoch * 7,
+                "phase": runner_module._expected_router_phase(epoch),
+                "train": {
+                    "loss": 1.0 / epoch,
+                    "frequency/route_native_mass": 0.4,
+                    "frequency/route_shallow_mass": 0.1,
+                    "frequency/route_null_mass": 0.5,
+                },
+                "eval": (
+                    {"loss/total": 1.0 / epoch}
+                    if epoch % 10 == 0
+                    else None
+                ),
+                "validation": (
+                    {"val/mae": 1.0 / epoch}
+                    if epoch % 10 == 0
+                    else None
+                ),
+            }
+        )
+        for epoch in range(1, final_epoch + 1)
+    ]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_complete_metrics_requires_exact_ordered_1_to_100(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    metrics_path = run_dir / "training_metrics.jsonl"
+    _write_metrics(metrics_path)
+
+    result = validate_complete_metrics_jsonl(config, root=tmp_path)
+
+    assert result["epochs"] == list(range(1, 101))
+    assert result["path"] == metrics_path
+
+
+def test_complete_metrics_rejects_checkpoint_only_completion(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    _write_metrics(run_dir / "training_metrics.jsonl", final_epoch=99)
+
+    with pytest.raises(RunnerError, match="exact ordered epoch ledger"):
+        validate_complete_metrics_jsonl(config, root=tmp_path)
+
+
+def test_complete_metrics_rejects_nonincreasing_steps(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    metrics_path = run_dir / "training_metrics.jsonl"
+    _write_metrics(metrics_path)
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[1]["step"] = rows[0]["step"]
+    metrics_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RunnerError, match="increase strictly"):
+        validate_complete_metrics_jsonl(config, root=tmp_path)
+
+
+def test_complete_metrics_rejects_non_trainer_metric_values(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    metrics_path = run_dir / "training_metrics.jsonl"
+    _write_metrics(metrics_path)
+    rows = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[2]["train"]["loss"] = ["not", "a", "trainer metric"]
+    metrics_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RunnerError, match="finite number or null"):
+        validate_complete_metrics_jsonl(config, root=tmp_path)
+
+
+def test_complete_metrics_final_step_must_match_checkpoint(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "results" / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    config = _materialized_config(tmp_path, run_dir)
+    _write_metrics(run_dir / "training_metrics.jsonl")
+
+    with pytest.raises(RunnerError, match="does not match"):
+        validate_complete_metrics_jsonl(
+            config,
+            root=tmp_path,
+            expected_final_step=999,
+        )
+
+
+def test_fresh_setup_failure_is_persisted_in_runner_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "_require_cuda", lambda: None)
+    args = runner_module.parse_args(
+        [
+            "--config",
+            "configs/missing.yaml",
+            "--run-dir",
+            "results/runs/run-a",
+        ]
+    )
+
+    with pytest.raises(FileNotFoundError):
+        runner_module.run_cloud(args, root=tmp_path)
+
+    state = json.loads(
+        (tmp_path / "results" / "runs" / "run-a" / "state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["status"] == "FAILED"
+    assert state["current_stage"] == "cloud_input_preflight"
+    assert state["failure"].startswith("FileNotFoundError:")
 
 
 def test_prior_artifact_requires_six_dense_curves(tmp_path: Path) -> None:

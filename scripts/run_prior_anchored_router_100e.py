@@ -205,7 +205,12 @@ def validate_base_config(
         "losses",
         "spectral_router_regularization",
     )
-    if int(training.get("num_epochs", -1)) != TOTAL_EPOCHS:
+    configured_epochs = training.get("num_epochs")
+    if (
+        isinstance(configured_epochs, bool)
+        or not isinstance(configured_epochs, int)
+        or configured_epochs != TOTAL_EPOCHS
+    ):
         raise RunnerError(f"training.num_epochs must be {TOTAL_EPOCHS}")
     if training.get("init_from") is not None:
         raise RunnerError("The cloud template must set training.init_from=null")
@@ -216,7 +221,12 @@ def validate_base_config(
     if runtime.get("early_stopping", {}).get("enabled") is not False:
         raise RunnerError("Early stopping must remain disabled for the 100e budget")
     for key in ("eval_interval", "save_interval", "sample_interval"):
-        if int(runtime.get(key, -1)) != 10:
+        value = runtime.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value != 10
+        ):
             raise RunnerError(f"runtime.{key} must be 10")
     if router.get("policy") != "prior_anchored_learned":
         raise RunnerError(
@@ -229,14 +239,31 @@ def validate_base_config(
         "prior_destination_ramp_epochs": 10,
         "prior_anchor_decay_end_epoch": 100,
     }
-    observed_phase = {key: int(router.get(key, -1)) for key in expected_phase}
+    observed_phase = {key: router.get(key) for key in expected_phase}
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in observed_phase.values()
+    ):
+        raise RunnerError(
+            "Router phase schedule values must be exact integers"
+        )
     if observed_phase != expected_phase:
         raise RunnerError(
             f"Router phase schedule mismatch: {observed_phase}"
         )
-    observed_epochs = tuple(
-        int(value) for value in router.get("phase_observation_epochs", ())
-    )
+    raw_observed_epochs = router.get("phase_observation_epochs", ())
+    if (
+        not isinstance(raw_observed_epochs, Sequence)
+        or isinstance(raw_observed_epochs, (str, bytes))
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in raw_observed_epochs
+        )
+    ):
+        raise RunnerError(
+            "phase_observation_epochs must contain exact integers"
+        )
+    observed_epochs = tuple(raw_observed_epochs)
     if observed_epochs != PHASE_OBSERVATION_EPOCHS:
         raise RunnerError(
             "phase_observation_epochs must be 10/20/30/40/100"
@@ -704,10 +731,202 @@ def _checkpoint_epoch_from_name(path: Path) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _validate_checkpoint_rng(
+    rng: Any,
+    *,
+    require_cuda: bool,
+) -> None:
+    """Require the weights-only-safe RNG schema used for exact continuation."""
+
+    import random
+
+    import numpy as np
+    import torch
+
+    if not isinstance(rng, Mapping):
+        raise RunnerError("Checkpoint cannot resume; rng state is missing")
+    if rng.get("schema_version") != 2:
+        raise RunnerError(
+            "Checkpoint cannot resume; rng.schema_version must be 2"
+        )
+    python_state = rng.get("python_random")
+    if python_state is None:
+        raise RunnerError(
+            "Checkpoint cannot resume; Python RNG state is missing"
+        )
+    try:
+        random.Random().setstate(python_state)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(
+            "Checkpoint cannot resume; Python RNG state is invalid"
+        ) from exc
+
+    numpy_state = rng.get("numpy")
+    numpy_keys = {
+        "bit_generator",
+        "state",
+        "pos",
+        "has_gauss",
+        "cached_gaussian",
+    }
+    if (
+        not isinstance(numpy_state, Mapping)
+        or not numpy_keys.issubset(numpy_state)
+        or not torch.is_tensor(numpy_state.get("state"))
+        or numpy_state["state"].device.type != "cpu"
+    ):
+        raise RunnerError(
+            "Checkpoint cannot resume; NumPy RNG state is incomplete or unsafe"
+        )
+    numpy_tensor = numpy_state["state"]
+    if (
+        numpy_state.get("bit_generator") != "MT19937"
+        or numpy_tensor.ndim != 1
+        or numpy_tensor.numel() != 624
+        or numpy_tensor.dtype != torch.int64
+    ):
+        raise RunnerError(
+            "Checkpoint cannot resume; NumPy RNG tensor has invalid shape/dtype"
+        )
+    numpy_pos = numpy_state.get("pos")
+    numpy_has_gauss = numpy_state.get("has_gauss")
+    numpy_cached = numpy_state.get("cached_gaussian")
+    if (
+        isinstance(numpy_pos, bool)
+        or not isinstance(numpy_pos, int)
+        or not 0 <= numpy_pos <= 624
+        or isinstance(numpy_has_gauss, bool)
+        or not isinstance(numpy_has_gauss, int)
+        or numpy_has_gauss not in (0, 1)
+        or isinstance(numpy_cached, bool)
+        or not isinstance(numpy_cached, (int, float))
+        or not np.isfinite(float(numpy_cached))
+    ):
+        raise RunnerError(
+            "Checkpoint cannot resume; NumPy RNG scalar state is invalid"
+        )
+    try:
+        np.random.RandomState().set_state(
+            (
+                str(numpy_state["bit_generator"]),
+                numpy_tensor.numpy().astype(np.uint32, copy=True),
+                int(numpy_state["pos"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            )
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RunnerError(
+            "Checkpoint cannot resume; NumPy RNG state is invalid"
+        ) from exc
+
+    def _validate_cpu_generator_state(state: Any, label: str) -> None:
+        if (
+            not torch.is_tensor(state)
+            or state.device.type != "cpu"
+            or state.dtype != torch.uint8
+            or state.ndim != 1
+        ):
+            raise RunnerError(
+                f"Checkpoint cannot resume; {label} has invalid type/dtype"
+            )
+        try:
+            generator = torch.Generator(device="cpu")
+            generator.set_state(state.clone())
+        except (TypeError, RuntimeError) as exc:
+            raise RunnerError(
+                f"Checkpoint cannot resume; {label} is not restorable"
+            ) from exc
+
+    torch_cpu = rng.get("torch_cpu")
+    _validate_cpu_generator_state(torch_cpu, "Torch CPU RNG state")
+
+    loader_states = rng.get("loader_generators")
+    if not isinstance(loader_states, Mapping):
+        raise RunnerError(
+            "Checkpoint cannot resume; loader_generators is missing"
+        )
+    for loader_name in ("train_loader", "val_loader"):
+        state = loader_states.get(loader_name)
+        if state is None:
+            # The trainer records None when a DataLoader has no explicit
+            # ``generator=`` (see ``Trainer._rng_state_dict``); this matches
+            # the sampler_generators.val_loader handling below.  A None entry
+            # only means "loader-level RNG was not captured" and does not
+            # block finalization of a completed run.  Exact mid-training
+            # resume is still fail-closed by ``Trainer._load_rng_state``.
+            continue
+        _validate_cpu_generator_state(
+            state,
+            f"loader_generators.{loader_name}",
+        )
+
+    sampler_states = rng.get("sampler_generators")
+    if not isinstance(sampler_states, Mapping):
+        raise RunnerError(
+            "Checkpoint cannot resume; sampler_generators is missing"
+        )
+    train_sampler_state = sampler_states.get("train_loader")
+    if train_sampler_state is not None:
+        _validate_cpu_generator_state(
+            train_sampler_state,
+            "sampler_generators.train_loader",
+        )
+    val_sampler_state = sampler_states.get("val_loader")
+    if val_sampler_state is not None:
+        _validate_cpu_generator_state(
+            val_sampler_state,
+            "sampler_generators.val_loader",
+        )
+
+    if require_cuda:
+        cuda_states = rng.get("torch_cuda_all")
+        if (
+            not isinstance(cuda_states, Sequence)
+            or isinstance(cuda_states, (str, bytes))
+            or not cuda_states
+            or any(
+                not torch.is_tensor(state) or state.device.type != "cpu"
+                for state in cuda_states
+            )
+        ):
+            raise RunnerError(
+                "CUDA run checkpoint cannot resume; CUDA RNG state is missing"
+            )
+        for index, state in enumerate(cuda_states):
+            if (
+                state.dtype != torch.uint8
+                or state.ndim != 1
+                or state.numel() == 0
+            ):
+                raise RunnerError(
+                    "CUDA run checkpoint cannot resume; CUDA RNG state "
+                    f"{index} has invalid shape/dtype"
+                )
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if len(cuda_states) != device_count:
+                raise RunnerError(
+                    "CUDA run checkpoint cannot resume on a different CUDA "
+                    "device topology"
+                )
+            for index, state in enumerate(cuda_states):
+                try:
+                    generator = torch.Generator(device=f"cuda:{index}")
+                    generator.set_state(state.clone())
+                except (TypeError, RuntimeError) as exc:
+                    raise RunnerError(
+                        "CUDA run checkpoint cannot resume; CUDA RNG state "
+                        f"{index} is not restorable"
+                    ) from exc
+
+
 def inspect_resume_checkpoint(
     path: Path,
     *,
     expected_config: Mapping[str, Any],
+    root: Path = ROOT,
+    verify_current_lineage: bool = True,
 ) -> dict[str, Any]:
     import torch
 
@@ -731,11 +950,24 @@ def inspect_resume_checkpoint(
         )
     if not 0 < payload_epoch <= TOTAL_EPOCHS:
         raise RunnerError(f"Checkpoint epoch is outside 1..{TOTAL_EPOCHS}")
-    required = ("model", "optimizer", "scheduler", "ema", "step", "config")
+    required = (
+        "model",
+        "optimizer",
+        "scheduler",
+        "ema",
+        "step",
+        "config",
+        "rng",
+    )
     missing = [key for key in required if key not in payload]
     if missing:
         raise RunnerError(
             f"Checkpoint cannot resume; missing state: {', '.join(missing)}"
+        )
+    step = payload["step"]
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise RunnerError(
+            "Checkpoint cannot resume; step must be a non-negative integer"
         )
     checkpoint_config = payload["config"]
     if not isinstance(checkpoint_config, Mapping):
@@ -744,11 +976,64 @@ def inspect_resume_checkpoint(
     observed_name = _mapping_at(checkpoint_config, "experiment").get("name")
     if observed_name != expected_name:
         raise RunnerError("Checkpoint experiment identity mismatch")
-    observed_epochs = int(
-        _mapping_at(checkpoint_config, "training").get("num_epochs", -1)
-    )
-    if observed_epochs != TOTAL_EPOCHS:
+    observed_epochs = _mapping_at(
+        checkpoint_config,
+        "training",
+    ).get("num_epochs")
+    if (
+        isinstance(observed_epochs, bool)
+        or not isinstance(observed_epochs, int)
+        or observed_epochs != TOTAL_EPOCHS
+    ):
         raise RunnerError("Checkpoint was not created with a 100-epoch budget")
+    observed_resume_from = _mapping_at(
+        checkpoint_config,
+        "training",
+    ).get("resume_from")
+    if observed_resume_from is not None:
+        if not isinstance(observed_resume_from, str):
+            raise RunnerError(
+                "Checkpoint training.resume_from must be a relative path"
+            )
+        try:
+            observed_resume_relative = normalize_repo_relative(
+                observed_resume_from,
+                root=root,
+            )
+        except ValueError as exc:
+            raise RunnerError(
+                "Checkpoint training.resume_from must be a repository-relative "
+                "path"
+            ) from exc
+        checkpoint_dir_relative = normalize_repo_relative(
+            str(
+                _mapping_at(expected_config, "training").get(
+                    "checkpoint_dir",
+                    "",
+                )
+            ),
+            root=root,
+        )
+        resume_posix = PurePosixPath(observed_resume_relative)
+        if (
+            resume_posix.parent.as_posix() != checkpoint_dir_relative
+            or CHECKPOINT_PATTERN.fullmatch(resume_posix.name) is None
+        ):
+            raise RunnerError(
+                "Checkpoint training.resume_from must name a numbered "
+                "checkpoint in this run's checkpoint directory"
+            )
+    expected_identity = copy.deepcopy(dict(expected_config))
+    observed_identity = copy.deepcopy(dict(checkpoint_config))
+    for identity in (expected_identity, observed_identity):
+        identity_training = identity.get("training")
+        if isinstance(identity_training, dict):
+            # The CLI injects only this run-owned pointer during resume.
+            identity_training["resume_from"] = None
+    if observed_identity != expected_identity:
+        raise RunnerError(
+            "Checkpoint configuration differs from the run-owned config"
+        )
     expected_router = _mapping_at(
         expected_config,
         "modules",
@@ -771,13 +1056,224 @@ def inspect_resume_checkpoint(
     ):
         if observed_router.get(key) != expected_router.get(key):
             raise RunnerError(f"Checkpoint router contract mismatch: {key}")
-    if bool(_mapping_at(expected_config, "data").get("require_cache_lineage")):
-        if not isinstance(payload.get("data_lineage"), Mapping):
-            raise RunnerError("Strict run checkpoint is missing data_lineage")
+    strict_lineage = bool(
+        _mapping_at(expected_config, "data").get("require_cache_lineage")
+    )
+    embedded_lineage = payload.get("data_lineage")
+    if strict_lineage or isinstance(embedded_lineage, Mapping):
+        from src.data.lineage import (
+            CacheLineageError,
+            load_checkpoint_data_lineage,
+            validate_checkpoint_data_lineage,
+        )
+
+        try:
+            expected_lineage = (
+                load_checkpoint_data_lineage(expected_config, root=root)
+                if verify_current_lineage
+                else (
+                    dict(embedded_lineage)
+                    if isinstance(embedded_lineage, Mapping)
+                    else None
+                )
+            )
+            validate_checkpoint_data_lineage(
+                payload,
+                expected_lineage,
+                required=strict_lineage,
+                context=f"resume checkpoint {path.name}",
+            )
+        except CacheLineageError as exc:
+            raise RunnerError(str(exc)) from exc
+    _validate_checkpoint_rng(
+        payload["rng"],
+        require_cuda=bool(
+            _mapping_at(expected_config, "runtime").get("require_cuda")
+        ),
+    )
     return {
         "epoch": payload_epoch,
-        "step": int(payload["step"]),
+        "step": step,
         "path": path,
+    }
+
+
+def _expected_router_phase(epoch: int) -> str:
+    if epoch <= 10:
+        return "prior_frozen"
+    if epoch <= 20:
+        return "active_ramp"
+    if epoch <= 30:
+        return "active_only_hold"
+    if epoch <= 40:
+        return "destination_ramp"
+    return "full_adaptive"
+
+
+def validate_complete_metrics_jsonl(
+    config: Mapping[str, Any],
+    *,
+    root: Path = ROOT,
+    expected_final_step: int | None = None,
+) -> dict[str, Any]:
+    """Require the exact epoch 1..100 monitoring ledger before COMPLETE."""
+
+    import math
+
+    metrics_value = _mapping_at(config, "runtime").get(
+        "training_metrics_jsonl"
+    )
+    if not isinstance(metrics_value, str):
+        raise RunnerError(
+            "Run config is missing runtime.training_metrics_jsonl"
+        )
+    metrics_path = resolve_repo_path(metrics_value, root=root)
+    if not metrics_path.is_file():
+        raise RunnerError(
+            "Training cannot be marked COMPLETE without training metrics JSONL"
+        )
+
+    def _validate_metric_section(
+        section: Any,
+        *,
+        label: str,
+        allow_none: bool,
+    ) -> None:
+        if section is None and allow_none:
+            return
+        if not isinstance(section, Mapping) or not section:
+            raise RunnerError(f"{label} must be a non-empty metrics object")
+        for key, value in section.items():
+            if not isinstance(key, str) or not key:
+                raise RunnerError(f"{label} contains an invalid metric name")
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise RunnerError(
+                    f"{label}.{key} must be a finite number or null"
+                )
+
+    epochs: list[int] = []
+    steps: list[int] = []
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            if not raw.strip():
+                raise RunnerError(
+                    f"Training metrics JSONL has a blank line at {line_number}"
+                )
+            try:
+                record = json.loads(
+                    raw,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON value {value}")
+                    ),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise RunnerError(
+                    "Training metrics JSONL has invalid JSON at line "
+                    f"{line_number}: {exc}"
+                ) from exc
+            if not isinstance(record, Mapping):
+                raise RunnerError(
+                    f"Training metrics record {line_number} is not an object"
+                )
+            epoch = record.get("epoch")
+            if isinstance(epoch, bool) or not isinstance(epoch, int):
+                raise RunnerError(
+                    f"Training metrics line {line_number} lacks integer epoch"
+                )
+            step = record.get("step")
+            if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+                raise RunnerError(
+                    f"Training metrics line {line_number} has invalid step"
+                )
+            if steps and step <= steps[-1]:
+                raise RunnerError(
+                    "Training metrics step must increase strictly; "
+                    f"line {line_number} has {step} after {steps[-1]}"
+                )
+            if record.get("schema_version") != 1:
+                raise RunnerError(
+                    f"Training metrics line {line_number} has invalid schema"
+                )
+            expected_phase = _expected_router_phase(epoch)
+            if record.get("phase") != expected_phase:
+                raise RunnerError(
+                    "Training metrics line "
+                    f"{line_number} has phase {record.get('phase')!r}; "
+                    f"expected {expected_phase!r}"
+                )
+            train = record.get("train")
+            _validate_metric_section(
+                train,
+                label=f"training metrics line {line_number}.train",
+                allow_none=False,
+            )
+            _validate_metric_section(
+                record.get("eval"),
+                label=f"training metrics line {line_number}.eval",
+                allow_none=True,
+            )
+            _validate_metric_section(
+                record.get("validation"),
+                label=f"training metrics line {line_number}.validation",
+                allow_none=True,
+            )
+            if epoch % 10 == 0 and (
+                not isinstance(record.get("eval"), Mapping)
+                or not record["eval"]
+                or not isinstance(record.get("validation"), Mapping)
+                or not record["validation"]
+            ):
+                raise RunnerError(
+                    f"Epoch {epoch} lacks its configured validation observation"
+                )
+            required_route_metrics = {
+                "frequency/route_native_mass",
+                "frequency/route_shallow_mass",
+                "frequency/route_null_mass",
+            }
+            if epoch in PHASE_OBSERVATION_EPOCHS and (
+                not required_route_metrics.issubset(train)
+                or any(train[key] is None for key in required_route_metrics)
+            ):
+                raise RunnerError(
+                    f"Epoch {epoch} lacks canonical route-mass observations"
+                )
+            epochs.append(epoch)
+            steps.append(step)
+
+    expected = list(range(1, TOTAL_EPOCHS + 1))
+    if epochs != expected:
+        raise RunnerError(
+            "Training metrics JSONL must be the exact ordered epoch ledger "
+            f"1..{TOTAL_EPOCHS}; found {epochs}"
+        )
+    missing_observations = sorted(
+        set(PHASE_OBSERVATION_EPOCHS).difference(epochs)
+    )
+    if missing_observations:
+        raise RunnerError(
+            f"Training metrics lack phase observations: {missing_observations}"
+        )
+    final_step = steps[-1]
+    if (
+        expected_final_step is not None
+        and final_step != expected_final_step
+    ):
+        raise RunnerError(
+            "Final training metrics step does not match the final checkpoint: "
+            f"{final_step} != {expected_final_step}"
+        )
+    return {
+        "path": metrics_path,
+        "sha256": sha256_file(metrics_path),
+        "epochs": epochs,
+        "final_step": final_step,
     }
 
 
@@ -785,7 +1281,17 @@ def find_latest_resume_checkpoint(
     checkpoint_dir: Path,
     *,
     expected_config: Mapping[str, Any],
+    require: bool = False,
+    root: Path = ROOT,
+    verify_current_lineage: bool = True,
 ) -> dict[str, Any] | None:
+    """Return the highest-epoch numbered checkpoint.
+
+    With ``require=False`` (fresh-run introspection) an empty directory returns
+    ``None``.  With ``require=True`` (resume) the absence of a numbered
+    checkpoint is fail-closed: resume must never silently restart from epoch
+    zero over an existing run directory.
+    """
     numbered: list[tuple[int, Path]] = []
     if checkpoint_dir.is_dir():
         for path in checkpoint_dir.glob("ckpt_epoch*.pt"):
@@ -803,11 +1309,20 @@ def find_latest_resume_checkpoint(
                 "Checkpoint files exist but no numbered resume checkpoint is "
                 "available; refusing to restart from epoch zero."
             )
+        if require:
+            raise RunnerError(
+                "Resume requested but no numbered checkpoint was found in "
+                f"{checkpoint_dir}; refusing to restart from epoch zero "
+                "disguised as a resume. Start a fresh run-dir or explicitly "
+                "delete this one."
+            )
         return None
     numbered.sort(key=lambda item: item[0], reverse=True)
     return inspect_resume_checkpoint(
         numbered[0][1],
         expected_config=expected_config,
+        root=root,
+        verify_current_lineage=verify_current_lineage,
     )
 
 
@@ -871,6 +1386,15 @@ def _verify_run_inputs(config: Mapping[str, Any], *, root: Path) -> None:
         raise RunnerError(
             "Cloud runtime inputs are missing: " + "; ".join(missing)
         )
+    if bool(data.get("require_cache_lineage")):
+        from src.data.lineage import CacheLineageError, load_checkpoint_data_lineage
+
+        try:
+            load_checkpoint_data_lineage(config, root=root)
+        except CacheLineageError as exc:
+            raise RunnerError(
+                f"Cloud cache lineage validation failed: {exc}"
+            ) from exc
 
 
 def _resume_context(
@@ -889,21 +1413,61 @@ def _resume_context(
         raise RunnerError("Resume state pipeline identity mismatch")
     if state.get("run_dir") != portable_path(run_dir, root=root):
         raise RunnerError("Resume state run directory mismatch")
+    expected_config_path = portable_path(config_path, root=root)
+    if state.get("resolved_config") != expected_config_path:
+        raise RunnerError("Resume state resolved_config path mismatch")
     expected_config_hash = state.get("resolved_config_sha256")
     if expected_config_hash != sha256_file(config_path):
         raise RunnerError("Run-owned resolved config changed after launch")
     prior = _mapping_at(config, "prior_anchored_run")
-    prior_path = resolve_repo_path(
+    if prior.get("pipeline_id") != PIPELINE_ID:
+        raise RunnerError("Run metadata pipeline identity mismatch")
+    if prior.get("run_dir") != portable_path(run_dir, root=root):
+        raise RunnerError("Run metadata directory mismatch")
+    prior_total_epochs = prior.get("total_epochs")
+    if (
+        isinstance(prior_total_epochs, bool)
+        or not isinstance(prior_total_epochs, int)
+        or prior_total_epochs != TOTAL_EPOCHS
+    ):
+        raise RunnerError("Run metadata must declare exactly 100 epochs")
+    if state.get("total_epochs") != TOTAL_EPOCHS:
+        raise RunnerError("Runner state must declare exactly 100 epochs")
+    if state.get("phase_observation_epochs") != list(
+        PHASE_OBSERVATION_EPOCHS
+    ):
+        raise RunnerError("Runner state phase observation contract mismatch")
+    prior_relative = normalize_repo_relative(
         str(prior.get("prior_artifact_path", "")),
+        root=root,
+    )
+    prior_sha256 = prior.get("prior_artifact_sha256")
+    if state.get("prior_artifact") != prior_relative:
+        raise RunnerError("Runner state prior artifact path mismatch")
+    if state.get("prior_artifact_sha256") != prior_sha256:
+        raise RunnerError("Runner state prior artifact hash mismatch")
+    router = _mapping_at(
+        config,
+        "modules",
+        "residual_frequency",
+        "cross_level_router",
+    )
+    if (
+        router.get("h3_schedule_path") != prior_relative
+        or router.get("h3_schedule_sha256") != prior_sha256
+    ):
+        raise RunnerError("Router prior path/hash differs from run metadata")
+    prior_path = resolve_repo_path(
+        prior_relative,
         root=root,
     )
     if not prior_path.is_file():
         raise RunnerError("Run-owned prior artifact is missing")
-    if sha256_file(prior_path) != prior.get("prior_artifact_sha256"):
+    if sha256_file(prior_path) != prior_sha256:
         raise RunnerError("Run-owned prior artifact SHA-256 mismatch")
     validate_prior_artifact(
         prior_path,
-        expected_sha256=str(prior.get("prior_artifact_sha256", "")),
+        expected_sha256=str(prior_sha256 or ""),
         root=root,
         strict_runtime=True,
     )
@@ -914,7 +1478,9 @@ def _resume_context(
     if not mean_path.is_file():
         raise RunnerError("Selected mean checkpoint is missing on resume")
     expected_mean_hash = state.get("mean_checkpoint_sha256")
-    if expected_mean_hash and sha256_file(mean_path) != expected_mean_hash:
+    if not isinstance(expected_mean_hash, str):
+        raise RunnerError("Runner state lacks selected mean checkpoint hash")
+    if sha256_file(mean_path) != expected_mean_hash:
         raise RunnerError("Selected mean checkpoint changed after launch")
     return config, state
 
@@ -959,116 +1525,222 @@ def run_cloud(args: argparse.Namespace, *, root: Path = ROOT) -> dict[str, Any]:
 
     if resume:
         run_dir = resolve_repo_path(run_relative, root=root)
-        if not run_dir.is_dir():
-            raise RunnerError(f"Resume run directory does not exist: {run_relative}")
-        config, state = _resume_context(run_dir, root=root)
-        _verify_run_inputs(config, root=root)
-        checkpoint_dir = _checkpoint_dir_from_config(config, root=root)
-        latest = find_latest_resume_checkpoint(
-            checkpoint_dir,
-            expected_config=config,
-        )
+        try:
+            if not run_dir.is_dir():
+                raise RunnerError(
+                    f"Resume run directory does not exist: {run_relative}"
+                )
+            config, state = _resume_context(run_dir, root=root)
+            _verify_run_inputs(config, root=root)
+            checkpoint_dir = _checkpoint_dir_from_config(config, root=root)
+            latest = find_latest_resume_checkpoint(
+                checkpoint_dir,
+                expected_config=config,
+                require=True,
+                root=root,
+                verify_current_lineage=True,
+            )
+        except KeyboardInterrupt:
+            if run_dir.is_dir():
+                try:
+                    update_state(
+                        run_dir,
+                        root=root,
+                        status="INTERRUPTED",
+                        interrupted_at_utc=utc_now(),
+                    )
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if run_dir.is_dir():
+                try:
+                    update_state(
+                        run_dir,
+                        root=root,
+                        status="FAILED",
+                        failure=f"{type(exc).__name__}: {exc}",
+                        failed_at_utc=utc_now(),
+                    )
+                except Exception:
+                    pass
+            raise
         if latest is not None and int(latest["epoch"]) == TOTAL_EPOCHS:
             update_state(
                 run_dir,
                 root=root,
-                status="COMPLETE",
-                current_stage=None,
-                latest_checkpoint=portable_path(latest["path"], root=root),
-                latest_epoch=TOTAL_EPOCHS,
-                note="Training was already complete; no restart was attempted.",
+                status="RUNNING",
+                current_stage="finalization",
             )
+            try:
+                metrics = validate_complete_metrics_jsonl(
+                    config,
+                    root=root,
+                    expected_final_step=int(latest["step"]),
+                )
+                update_state(
+                    run_dir,
+                    root=root,
+                    status="COMPLETE",
+                    current_stage=None,
+                    latest_checkpoint=portable_path(
+                        latest["path"],
+                        root=root,
+                    ),
+                    latest_epoch=TOTAL_EPOCHS,
+                    training_metrics=portable_path(
+                        metrics["path"],
+                        root=root,
+                    ),
+                    training_metrics_sha256=metrics["sha256"],
+                    completed_at_utc=utc_now(),
+                    note=(
+                        "Training and the exact 1..100 metrics ledger were "
+                        "already complete; no restart was attempted."
+                    ),
+                )
+            except KeyboardInterrupt:
+                update_state(
+                    run_dir,
+                    root=root,
+                    status="INTERRUPTED",
+                    current_stage="finalization",
+                    interrupted_at_utc=utc_now(),
+                )
+                raise
+            except Exception as exc:
+                update_state(
+                    run_dir,
+                    root=root,
+                    status="FAILED",
+                    current_stage="finalization",
+                    failure=f"{type(exc).__name__}: {exc}",
+                    failed_at_utc=utc_now(),
+                )
+                raise
             return {
                 "decision": "ALREADY_COMPLETE",
                 "run_dir": run_relative,
                 "latest_epoch": TOTAL_EPOCHS,
             }
-        resume_path = latest["path"] if latest is not None else None
+        resume_path = latest["path"]
         update_state(
             run_dir,
             root=root,
             status="RUNNING",
             current_stage="training_resume",
             resumed_at_utc=utc_now(),
-            resume_from=(
-                portable_path(resume_path, root=root)
-                if resume_path is not None
-                else None
-            ),
-            latest_epoch=(int(latest["epoch"]) if latest is not None else 0),
+            resume_from=portable_path(resume_path, root=root),
+            latest_epoch=int(latest["epoch"]),
         )
     else:
         run_dir = prepare_fresh_run(run_relative, root=root)
-        base_config = read_yaml(resolve_repo_path(config_relative, root=root))
-        validate_base_config(base_config, root=root)
-        update_state(
-            run_dir,
-            root=root,
-            status="RUNNING",
-            current_stage="cloud_input_preflight",
-            total_epochs=TOTAL_EPOCHS,
-            phase_observation_epochs=list(PHASE_OBSERVATION_EPOCHS),
-        )
-        mean_checkpoint = select_mean_checkpoint(
-            root=root,
-            explicit=args.mean_checkpoint,
-        )
-        mean_hash = sha256_file(
-            resolve_repo_path(mean_checkpoint, root=root)
-        )
-        effective_manifest = (
-            manifest_override
-            or str(_mapping_at(base_config, "data")["split_manifest"])
-        )
-        effective_contract = (
-            contract_override
-            or str(_mapping_at(base_config, "data")["dataset_contract"])
-        )
-        update_state(
-            run_dir,
-            root=root,
-            current_stage="direct_png_prior_estimation",
-            mean_checkpoint=mean_checkpoint,
-            mean_checkpoint_sha256=mean_hash,
-        )
-        prior_path, prior_hash, prior_command = estimate_cloud_prior(
-            run_dir=run_dir,
-            mean_checkpoint=mean_checkpoint,
-            manifest=normalize_repo_relative(effective_manifest, root=root),
-            dataset_contract=normalize_repo_relative(
-                effective_contract,
+        try:
+            update_state(
+                run_dir,
                 root=root,
-            ),
-            png_root=png_override,
-            device=args.device,
-            root=root,
-        )
-        config = materialize_run_config(
-            base_config,
-            run_dir=run_dir,
-            mean_checkpoint=mean_checkpoint,
-            prior_path=prior_path,
-            prior_sha256=prior_hash,
-            manifest=effective_manifest,
-            dataset_contract=effective_contract,
-            root=root,
-        )
-        _verify_run_inputs(config, root=root)
-        config_path = _config_path(run_dir)
-        write_yaml_atomic(config_path, config)
-        config_hash = sha256_file(config_path)
-        update_state(
-            run_dir,
-            root=root,
-            current_stage="training",
-            resolved_config=portable_path(config_path, root=root),
-            resolved_config_sha256=config_hash,
-            prior_artifact=prior_path,
-            prior_artifact_sha256=prior_hash,
-            prior_command=prior_command,
-        )
-        state = read_json(_state_path(run_dir))
-        resume_path = None
+                status="RUNNING",
+                current_stage="cloud_input_preflight",
+                total_epochs=TOTAL_EPOCHS,
+                phase_observation_epochs=list(PHASE_OBSERVATION_EPOCHS),
+            )
+            base_config = read_yaml(
+                resolve_repo_path(config_relative, root=root)
+            )
+            validate_base_config(base_config, root=root)
+            mean_checkpoint = select_mean_checkpoint(
+                root=root,
+                explicit=args.mean_checkpoint,
+            )
+            mean_hash = sha256_file(
+                resolve_repo_path(mean_checkpoint, root=root)
+            )
+            effective_manifest = (
+                manifest_override
+                or str(_mapping_at(base_config, "data")["split_manifest"])
+            )
+            effective_contract = (
+                contract_override
+                or str(_mapping_at(base_config, "data")["dataset_contract"])
+            )
+            input_preflight_config = copy.deepcopy(base_config)
+            input_preflight_data = input_preflight_config.setdefault(
+                "data",
+                {},
+            )
+            input_preflight_data["split_manifest"] = normalize_repo_relative(
+                effective_manifest,
+                root=root,
+            )
+            input_preflight_data["dataset_contract"] = (
+                normalize_repo_relative(effective_contract, root=root)
+            )
+            _verify_run_inputs(input_preflight_config, root=root)
+            update_state(
+                run_dir,
+                root=root,
+                current_stage="direct_png_prior_estimation",
+                mean_checkpoint=mean_checkpoint,
+                mean_checkpoint_sha256=mean_hash,
+            )
+            prior_path, prior_hash, prior_command = estimate_cloud_prior(
+                run_dir=run_dir,
+                mean_checkpoint=mean_checkpoint,
+                manifest=normalize_repo_relative(
+                    effective_manifest,
+                    root=root,
+                ),
+                dataset_contract=normalize_repo_relative(
+                    effective_contract,
+                    root=root,
+                ),
+                png_root=png_override,
+                device=args.device,
+                root=root,
+            )
+            config = materialize_run_config(
+                base_config,
+                run_dir=run_dir,
+                mean_checkpoint=mean_checkpoint,
+                prior_path=prior_path,
+                prior_sha256=prior_hash,
+                manifest=effective_manifest,
+                dataset_contract=effective_contract,
+                root=root,
+            )
+            _verify_run_inputs(config, root=root)
+            config_path = _config_path(run_dir)
+            write_yaml_atomic(config_path, config)
+            config_hash = sha256_file(config_path)
+            update_state(
+                run_dir,
+                root=root,
+                current_stage="training",
+                resolved_config=portable_path(config_path, root=root),
+                resolved_config_sha256=config_hash,
+                prior_artifact=prior_path,
+                prior_artifact_sha256=prior_hash,
+                prior_command=prior_command,
+            )
+            state = read_json(_state_path(run_dir))
+            resume_path = None
+        except KeyboardInterrupt:
+            update_state(
+                run_dir,
+                root=root,
+                status="INTERRUPTED",
+                interrupted_at_utc=utc_now(),
+            )
+            raise
+        except Exception as exc:
+            update_state(
+                run_dir,
+                root=root,
+                status="FAILED",
+                failure=f"{type(exc).__name__}: {exc}",
+                failed_at_utc=utc_now(),
+            )
+            raise
 
     config_path = _config_path(run_dir)
     try:
@@ -1078,6 +1750,13 @@ def run_cloud(args: argparse.Namespace, *, root: Path = ROOT) -> dict[str, Any]:
             resume_checkpoint=resume_path,
             root=root,
         )
+        update_state(
+            run_dir,
+            root=root,
+            current_stage="finalization",
+            training_command=training_command,
+        )
+        config, state = _resume_context(run_dir, root=root)
         checkpoint_dir = _checkpoint_dir_from_config(config, root=root)
         final_path = checkpoint_dir / f"ckpt_epoch{TOTAL_EPOCHS:04d}.pt"
         if not final_path.is_file():
@@ -1087,6 +1766,13 @@ def run_cloud(args: argparse.Namespace, *, root: Path = ROOT) -> dict[str, Any]:
         final_metadata = inspect_resume_checkpoint(
             final_path,
             expected_config=config,
+            root=root,
+            verify_current_lineage=True,
+        )
+        metrics = validate_complete_metrics_jsonl(
+            config,
+            root=root,
+            expected_final_step=int(final_metadata["step"]),
         )
         update_state(
             run_dir,
@@ -1096,6 +1782,8 @@ def run_cloud(args: argparse.Namespace, *, root: Path = ROOT) -> dict[str, Any]:
             training_command=training_command,
             latest_checkpoint=portable_path(final_path, root=root),
             latest_epoch=int(final_metadata["epoch"]),
+            training_metrics=portable_path(metrics["path"], root=root),
+            training_metrics_sha256=metrics["sha256"],
             completed_at_utc=utc_now(),
         )
     except KeyboardInterrupt:
@@ -1103,7 +1791,6 @@ def run_cloud(args: argparse.Namespace, *, root: Path = ROOT) -> dict[str, Any]:
             run_dir,
             root=root,
             status="INTERRUPTED",
-            current_stage="training",
             interrupted_at_utc=utc_now(),
         )
         raise

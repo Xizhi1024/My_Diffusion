@@ -153,9 +153,11 @@ class SpectralRouterRegularizationLoss(LossTerm):
         zero: torch.Tensor,
     ) -> torch.Tensor:
         denominator = mask.sum()
-        if not bool((denominator > 0).item()):
-            return zero
-        return (values * mask).sum() / denominator
+        numerator = (values * mask).sum()
+        mean = numerator / denominator.clamp_min(
+            torch.finfo(denominator.dtype).tiny
+        )
+        return torch.where(denominator > 0, mean, zero)
 
     @classmethod
     def _route_pair(

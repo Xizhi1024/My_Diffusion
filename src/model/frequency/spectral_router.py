@@ -422,6 +422,11 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             and self.native_warmup_epochs > 0
             else 1.0
         )
+        # Keep branch-control values as Python scalars.  Reading a CUDA
+        # buffer with ``.item()`` inside every forward pass introduces a
+        # device-wide synchronization; these values only change at epoch
+        # boundaries, so a host-side mirror is both exact and cheaper.
+        self._routing_progress_value = float(initial_progress)
         self.register_buffer(
             "_routing_progress",
             torch.tensor(initial_progress, dtype=torch.float32),
@@ -530,7 +535,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             self.register_buffer(
                 "_h3_native_active_mass",
                 active_mass,
-                persistent=True,
+                # The schedule is an externally verified input.  Persisting it
+                # in a checkpoint allowed an older checkpoint to overwrite the
+                # schedule that was just loaded and hash-checked for this run.
+                persistent=False,
             )
             self._h3_schedule_metadata = dict(schedule_metadata)
             frozen_modules = (
@@ -551,6 +559,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             )
 
         if effective_policy == "prior_anchored_learned":
+            self._prior_active_progress_value = 0.0
+            self._prior_destination_progress_value = 0.0
+            self._prior_anchor_scale_value = 1.0
             self.register_buffer(
                 "_prior_active_progress",
                 torch.tensor(0.0, dtype=torch.float32),
@@ -612,11 +623,12 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
     @property
     def routing_progress(self) -> float:
-        return float(self._routing_progress.item())
+        return self._routing_progress_value
 
     def set_routing_progress(self, progress: float) -> None:
         """Blend learned routes in gradually from the native-only baseline."""
         value = min(max(float(progress), 0.0), 1.0)
+        self._routing_progress_value = value
         self._routing_progress.fill_(value)
 
     def set_training_epoch(self, epoch: int) -> None:
@@ -633,23 +645,30 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 start_epoch=self.prior_destination_warmup_epochs,
                 ramp_epochs=self.prior_destination_ramp_epochs,
             )
-            decay_fraction = min(
-                max(
-                    (
-                        epoch - self.prior_warmup_epochs
-                    )
-                    / (
-                        self.prior_anchor_decay_end_epoch
-                        - self.prior_warmup_epochs
+            # Configuration and user-facing monitoring use 1-based epoch
+            # numbers while this method receives a 0-based index.  Therefore
+            # ``decay_end_epoch=100`` must reach the exact final scale at
+            # index 99.
+            decay_start_index = self.prior_warmup_epochs
+            decay_end_index = self.prior_anchor_decay_end_epoch - 1
+            if decay_end_index <= decay_start_index:
+                decay_fraction = 1.0 if epoch >= decay_end_index else 0.0
+            else:
+                decay_fraction = min(
+                    max(
+                        (epoch - decay_start_index)
+                        / (decay_end_index - decay_start_index),
+                        0.0,
                     ),
-                    0.0,
-                ),
-                1.0,
-            )
+                    1.0,
+                )
             cosine = 0.5 * (1.0 + math.cos(math.pi * decay_fraction))
             anchor_scale = self.prior_anchor_final_scale + (
                 1.0 - self.prior_anchor_final_scale
             ) * cosine
+            self._prior_active_progress_value = float(active_progress)
+            self._prior_destination_progress_value = float(destination_progress)
+            self._prior_anchor_scale_value = float(anchor_scale)
             self._prior_active_progress.fill_(active_progress)
             self._prior_destination_progress.fill_(destination_progress)
             self._prior_anchor_scale.fill_(anchor_scale)
@@ -676,6 +695,74 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         if epoch < start_epoch:
             return 0.0
         return min(max((epoch - start_epoch + 1) / ramp_epochs, 0.0), 1.0)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Load checkpoints without accepting a checkpoint-owned H3 schedule.
+
+        Older checkpoints persisted ``_h3_native_active_mass``.  The current
+        schedule has already been loaded from an explicitly configured path and
+        verified SHA before checkpoint restoration.  Consume the legacy key for
+        strict-load compatibility, but deliberately do not copy its value.
+        """
+
+        if hasattr(self, "_h3_native_active_mass"):
+            state_dict.pop(prefix + "_h3_native_active_mass", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if self._effective_policy == "prior_anchored_learned":
+            # Checkpoint loading is an infrequent synchronization boundary.
+            # Refresh the host mirrors once so subsequent forwards never need
+            # to read CUDA scalars with ``.item()``.
+            self._prior_active_progress_value = float(
+                self._prior_active_progress.detach().cpu()
+            )
+            self._prior_destination_progress_value = float(
+                self._prior_destination_progress.detach().cpu()
+            )
+            self._prior_anchor_scale_value = float(
+                self._prior_anchor_scale.detach().cpu()
+            )
+
+    def phase_label(self, epoch: int) -> str:
+        """Return the human-facing phase label for a 0-based epoch index.
+
+        Used by the trainer to stamp a ``phase`` field into the top level of
+        each JSONL monitoring record so the phase is not left for the
+        summarizer to infer.  The mapping is derived from this router's own
+        configured phase schedule, not a hardcoded epoch table.
+        """
+        epoch = max(int(epoch), 0)
+        if self._effective_policy != "prior_anchored_learned":
+            return "training"
+        warmup = self.prior_warmup_epochs
+        active_end = warmup + self.prior_active_ramp_epochs
+        dest_start = self.prior_destination_warmup_epochs
+        dest_end = dest_start + self.prior_destination_ramp_epochs
+        if epoch < warmup:
+            return "prior_frozen"
+        if epoch < active_end:
+            return "active_ramp"
+        if epoch < dest_start:
+            return "active_only_hold"
+        if epoch < dest_end:
+            return "destination_ramp"
+        return "full_adaptive"
 
     def _blend_with_native(self, routes: torch.Tensor) -> torch.Tensor:
         if self._effective_policy not in {"learned", "learned_no_null"}:
@@ -801,10 +888,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             timestep=timestep,
             reference=reference,
         )
-        active_progress_value = float(self._prior_active_progress.item())
-        destination_progress_value = float(
-            self._prior_destination_progress.item()
-        )
+        active_progress_value = self._prior_active_progress_value
+        destination_progress_value = self._prior_destination_progress_value
 
         # Do not call a closed branch: this gives grad=None, not merely a zero
         # gradient, and prevents optimizer state from drifting before release.
@@ -813,11 +898,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             active = prior
         else:
             raw_delta = self.prior_active_heads[level_index](evidence).float()
-            active_progress = self._prior_active_progress.to(
-                device=raw_delta.device,
-                dtype=torch.float32,
-            )
-            effective_delta = active_progress * raw_delta
+            effective_delta = active_progress_value * raw_delta
             odds_multiplier = torch.exp(
                 effective_delta.clamp(
                     -self.active_logit_delta_max,
@@ -836,12 +917,8 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             learned_destination = self.prior_destination_heads[level_index](
                 evidence
             ).float()
-            destination_progress = self._prior_destination_progress.to(
-                device=learned_destination.device,
-                dtype=torch.float32,
-            )
             conditional_shallow = (
-                destination_progress * learned_destination[..., 1]
+                destination_progress_value * learned_destination[..., 1]
             )
         conditional_native = 1.0 - conditional_shallow
         native = active * conditional_native
@@ -1341,6 +1418,9 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             "route_l2_entropy": current_residual.new_zeros(()),
             "route_l1_active_mass": current_residual.new_zeros(()),
             "route_l1_entropy": current_residual.new_zeros(()),
+            "route_native_mass": current_residual.new_zeros(()),
+            "route_shallow_mass": current_residual.new_zeros(()),
+            "route_null_mass": current_residual.new_ones(()),
         }
         if self._num_routes == 3:
             one = current_residual.new_ones(())
@@ -1383,8 +1463,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         Returns diagnostics keyed by level so collapse in one layer
         (e.g. L1 null→100%) is visible independently of the other.
         """
-        eps = 1e-8
         result: Dict[str, torch.Tensor] = {}
+        aggregate_native = []
+        aggregate_shallow = []
+        aggregate_null = []
         for level, routes in ((2, routes_l2), (1, routes_l1)):
             flat = routes.flatten(0, 1)  # [B*3, ...]
             prefix = f"route_l{level}"
@@ -1393,9 +1475,18 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             native_prob = flat[..., 0]
             shallow_prob = flat[..., 1] if flat.shape[-1] >= 2 else torch.zeros_like(native_prob)
             active_mass = (native_prob + shallow_prob).mean()
+            aggregate_native.append(native_prob)
+            aggregate_shallow.append(shallow_prob)
+            aggregate_null.append(null_prob)
 
-            # Entropy
-            entropy = -(flat * (flat + eps).log()).sum(dim=-1).mean()
+            # Compute entropy in FP32.  In FP16, 1e-8 rounds to zero and the
+            # previous ``0 * log(0)`` expression produced NaN for exact-null
+            # routes.
+            probabilities = flat.float()
+            entropy = -(
+                probabilities
+                * probabilities.clamp_min(torch.finfo(torch.float32).tiny).log()
+            ).sum(dim=-1).mean()
 
             result[f"{prefix}_active_mass"] = active_mass
             result[f"{prefix}_entropy"] = entropy
@@ -1414,6 +1505,11 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                     sorted_null[int(0.90 * (n - 1))] if n > 0 else reference.new_zeros(())
                 )
 
+        result["route_native_mass"] = torch.cat(aggregate_native).float().mean()
+        result["route_shallow_mass"] = (
+            torch.cat(aggregate_shallow).float().mean()
+        )
+        result["route_null_mass"] = torch.cat(aggregate_null).float().mean()
         return result
 
     def _apply_uncertainty_aware_selection(
@@ -1710,9 +1806,11 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             diagnostics["route_monotonic_violation_fraction"] = (
                 monotonic_excess > 1e-6
             ).float().mean()
-            diagnostics["route_shallow_mass"] = diagnostics[
-                "route_shallow_probability"
-            ].float().mean()
+            # Aggregate prior-specific active diagnostics.  The common
+            # native/shallow/null masses are emitted by ``_route_diagnostics``
+            # for every routing policy.
+            diagnostics["route_prior_active_mean"] = prior_active.mean()
+            diagnostics["route_active_mean"] = active.mean()
         else:
             diagnostics["route_routing_progress"] = self._routing_progress.to(
                 device=current_residual.device,

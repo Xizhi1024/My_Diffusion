@@ -1,5 +1,6 @@
 """Regression tests for deterministic, signed-range-safe trainer monitoring."""
 
+import json
 import os
 import sys
 
@@ -158,6 +159,50 @@ def test_eval_sampling_is_repeatable_without_advancing_outer_rng():
     assert torch.equal(first, second)
 
 
+def test_chunked_eval_sampling_never_exceeds_chunk_size():
+    """A 64-sample tracked batch must reach model.sample in bounded chunks."""
+    observed_batch_sizes: list[int] = []
+
+    class RecordingModel:
+        def sample(self, batch):
+            observed_batch_sizes.append(int(batch["ct"].shape[0]))
+            return {"synthetic_pet": torch.randn_like(batch["ct"])}
+
+    trainer = object.__new__(Trainer)
+    trainer.device = "cpu"
+    trainer.eval_seed = 2026
+    trainer.eval_sample_batch_size = 4
+    trainer.model = RecordingModel()
+    batch = {"ct": torch.zeros(10, 1, 4, 4)}
+
+    result = trainer._sample_with_eval_seed(batch)
+
+    # 10 samples / chunk 4 => chunks of (4, 4, 2); every call is bounded.
+    assert observed_batch_sizes == [4, 4, 2]
+    assert max(observed_batch_sizes) <= trainer.eval_sample_batch_size
+    # The merged output preserves the full batch ordering.
+    assert result["synthetic_pet"].shape[0] == 10
+
+
+def test_chunked_eval_sampling_repeats_under_fixed_seed():
+    """Chunked sampling inside one eval scope is deterministic across calls."""
+    class RandomSampleModel:
+        def sample(self, batch):
+            return {"synthetic_pet": torch.randn_like(batch["ct"])}
+
+    trainer = object.__new__(Trainer)
+    trainer.device = "cpu"
+    trainer.eval_seed = 7
+    trainer.eval_sample_batch_size = 3
+    trainer.model = RandomSampleModel()
+    batch = {"ct": torch.zeros(9, 1, 4, 4)}
+
+    first = trainer._sample_with_eval_seed(batch)["synthetic_pet"]
+    second = trainer._sample_with_eval_seed(batch)["synthetic_pet"]
+
+    assert torch.equal(first, second)
+
+
 def test_eval_rng_scope_is_repeatable_without_advancing_training_rng():
     trainer = object.__new__(Trainer)
     trainer.device = "cpu"
@@ -265,7 +310,13 @@ def test_all_best_checkpoints_capture_one_atomic_monitoring_snapshot(monkeypatch
         "val/failure_rate": 0.0,
     }
     snapshots = []
+    replacements = []
     monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        os,
+        "replace",
+        lambda source, destination: replacements.append((source, destination)),
+    )
     monkeypatch.setattr(
         torch,
         "save",
@@ -275,8 +326,85 @@ def test_all_best_checkpoints_capture_one_atomic_monitoring_snapshot(monkeypatch
     trainer._save_best_checkpoints(metrics)
 
     assert len(snapshots) == 3
+    assert len(replacements) == 3
+    assert all(source.endswith(".pt.tmp") for source, _ in replacements)
+    assert all(not destination.endswith(".tmp") for _, destination in replacements)
     assert all(snapshot == snapshots[0][1] for _, snapshot in snapshots)
     assert snapshots[0][1] == trainer._monitoring_state_dict()
+
+
+def test_sample_grid_failure_prevents_epoch_ledger_and_checkpoint_commit(
+    tmp_path,
+):
+    """Optional sample artifacts must finish before final epoch commits."""
+
+    class FakeModel:
+        priors = {}
+        loss_terms = {}
+
+        def get_trainable_params(self):
+            return 0
+
+        def get_total_params(self):
+            return 0
+
+    class FakeEMA:
+        def apply(self):
+            return None
+
+        def restore(self):
+            return None
+
+    trainer = object.__new__(Trainer)
+    trainer.config = {"training": {"num_epochs": 1}}
+    trainer.device = "cpu"
+    trainer.amp_dtype = torch.float32
+    trainer.torch_compile = False
+    trainer.grad_accum = 1
+    trainer.log_interval = 1
+    trainer.eval_interval = 999
+    trainer.sample_interval = 1
+    trainer.save_interval = 1
+    trainer.val_loader = None
+    trainer.model = FakeModel()
+    trainer.ema = FakeEMA()
+    trainer.epoch_count = 0
+    trainer.step_count = 0
+    trainer._tracked_batch = {
+        "ct": torch.zeros(1, 1, 4, 4),
+        "pet": torch.zeros(1, 1, 4, 4),
+    }
+    trainer._tracked_meta = None
+    trainer.metrics_jsonl = os.fspath(tmp_path / "metrics.jsonl")
+    sample_calls = []
+    checkpoint_calls = []
+
+    def fake_train_epoch():
+        trainer.epoch_count += 1
+        return {
+            "loss/total": 0.0,
+            "perf/epoch_seconds": 0.0,
+            "perf/lr": 0.0,
+        }
+
+    def fake_sample(batch):
+        sample_calls.append(batch)
+        return {"synthetic_pet": torch.zeros(1, 1, 4, 4)}
+
+    def fail_grid(batch, synth):
+        raise OSError("sample artifact disk failure")
+
+    trainer.train_epoch = fake_train_epoch
+    trainer._sample_with_eval_seed = fake_sample
+    trainer._save_sample_grid = fail_grid
+    trainer.save_checkpoint = lambda: checkpoint_calls.append("checkpoint")
+
+    with pytest.raises(OSError, match="sample artifact disk failure"):
+        trainer.run(num_epochs=1)
+
+    assert len(sample_calls) == 1
+    assert checkpoint_calls == []
+    assert not (tmp_path / "metrics.jsonl").exists()
 
 
 def test_early_stopping_patience_is_measured_in_epochs():
@@ -509,3 +637,413 @@ def test_monitoring_state_round_trips_for_resumed_early_stopping():
     assert resumed._best_image_score == pytest.approx(1.5)
     assert resumed._epochs_since_improve == 20
     assert resumed._last_combined_improvement_epoch == 100
+
+
+def test_resume_truncates_stale_metrics_beyond_checkpoint_epoch(tmp_path):
+    """A crash between checkpoints must not yield duplicate epoch records."""
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            json.dumps({"epoch": epoch, "train": {"loss/total": 1.0 / epoch}})
+            for epoch in range(1, 13)
+        ),
+        encoding="utf-8",
+    )
+
+    trainer = object.__new__(Trainer)
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 10
+    trainer._truncate_metrics_jsonl_to_epoch()
+
+    kept = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["epoch"] for row in kept] == list(range(1, 11))
+
+
+def test_resume_leaves_metrics_intact_when_nothing_is_stale(tmp_path):
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    payload = [
+        {"epoch": epoch, "train": {"loss/total": 1.0 / epoch}}
+        for epoch in range(1, 11)
+    ]
+    metrics_path.write_text(
+        "\n".join(json.dumps(record) for record in payload),
+        encoding="utf-8",
+    )
+
+    trainer = object.__new__(Trainer)
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 10
+    trainer._truncate_metrics_jsonl_to_epoch()
+
+    kept = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["epoch"] for row in kept] == list(range(1, 11))
+    # A no-op truncation must not leave a .tmp file behind.
+    assert not (tmp_path / "training_metrics.jsonl.tmp").exists()
+
+
+def test_resume_truncation_preserves_unparseable_lines(tmp_path):
+    """Corrupt lines fail closed instead of being hidden by resume cleanup."""
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(
+        '{"epoch": 1}\nnot-json\n',
+        encoding="utf-8",
+    )
+    trainer = object.__new__(Trainer)
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 1
+
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        trainer._truncate_metrics_jsonl_to_epoch()
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ('{"epoch": 1}\n{"epoch": 1}\n', "duplicate epoch"),
+        ('{"epoch": 0}\n', "epoch must be >= 1"),
+        ('{"epoch": true}\n', "epoch must be an integer"),
+        ('{"epoch": 1}\n\n', "blank line"),
+    ],
+)
+def test_resume_metrics_contract_rejects_invalid_records(
+    tmp_path,
+    content,
+    message,
+):
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(content, encoding="utf-8")
+    trainer = object.__new__(Trainer)
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 1
+
+    with pytest.raises(RuntimeError, match=message):
+        trainer._truncate_metrics_jsonl_to_epoch()
+
+
+def test_resume_rejects_checkpoint_epoch_missing_from_metrics(tmp_path):
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(json.dumps({"epoch": epoch}) for epoch in range(1, 10)),
+        encoding="utf-8",
+    )
+    trainer = object.__new__(Trainer)
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 10
+
+    with pytest.raises(RuntimeError, match=r"does not exactly cover.*1\.\.10"):
+        trainer._truncate_metrics_jsonl_to_epoch()
+
+
+def test_resume_rejects_epoch_outside_configured_range(tmp_path):
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(json.dumps({"epoch": epoch}) for epoch in range(1, 12)),
+        encoding="utf-8",
+    )
+    trainer = object.__new__(Trainer)
+    trainer.config = {"training": {"num_epochs": 10}}
+    trainer.metrics_jsonl = os.fspath(metrics_path)
+    trainer.epoch_count = 10
+
+    with pytest.raises(RuntimeError, match="exceeds configured training range"):
+        trainer._truncate_metrics_jsonl_to_epoch()
+
+
+def test_checkpoint_rng_roundtrip_is_weights_only_safe_and_exact(tmp_path):
+    """A real Trainer checkpoint restores all host and sampling RNG streams."""
+    import random
+
+    from src.data.dataset import build_dataloaders
+
+    config = {
+        "experiment": {"name": "rng-roundtrip", "seed": 37},
+        "data": {
+            "use_fake_data": True,
+            "image_size": 8,
+            "batch_size": 4,
+            "val_batch_size": 4,
+        },
+        "runtime": {
+            "amp": False,
+            "channels_last": False,
+            "num_workers": 0,
+            "persistent_workers": False,
+            "dataloader_seed": 37,
+            "metrics_jsonl": os.fspath(tmp_path / "metrics.jsonl"),
+        },
+        "training": {
+            "num_epochs": 3,
+            "checkpoint_dir": os.fspath(tmp_path / "checkpoints"),
+            "ema": {"decay": 0.9, "update_every": 1},
+        },
+    }
+    train_loader, val_loader = build_dataloaders(
+        config["data"],
+        config["runtime"],
+    )
+    trainer = Trainer(
+        torch.nn.Linear(2, 2),
+        config,
+        train_loader,
+        val_loader,
+        device="cpu",
+    )
+    trainer.epoch_count = 3
+    trainer.step_count = 17
+    # Mirror a real uninterrupted run: the fixed validation cohort is selected
+    # before the first numbered checkpoint and is not itself serialized.
+    trainer._initialize_tracked_batch()
+    assert trainer._tracked_batch is not None
+    expected_tracked_ct = trainer._tracked_batch["ct"].clone()
+    (tmp_path / "metrics.jsonl").write_text(
+        "\n".join(json.dumps({"epoch": epoch}) for epoch in range(1, 4)),
+        encoding="utf-8",
+    )
+
+    random.seed(123)
+    np.random.seed(456)
+    torch.manual_seed(789)
+    trainer.save_checkpoint()
+    checkpoint_path = tmp_path / "checkpoints" / "ckpt_epoch0003.pt"
+    assert not (tmp_path / "checkpoints" / "ckpt_epoch0003.pt.tmp").exists()
+
+    payload = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert payload["rng"]["schema_version"] == 2
+    assert torch.is_tensor(payload["rng"]["numpy"]["state"])
+    assert payload["rng"]["numpy"]["state"].device.type == "cpu"
+    saved_val_generator_state = payload["rng"]["loader_generators"]["val_loader"]
+    expected_host_draws = (
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+    expected_sampler_epoch = list(iter(trainer.train_loader.sampler))
+
+    resumed_train, resumed_val = build_dataloaders(
+        config["data"],
+        config["runtime"],
+    )
+    resumed = Trainer(
+        torch.nn.Linear(2, 2),
+        config,
+        resumed_train,
+        resumed_val,
+        device="cpu",
+    )
+    resumed.load_checkpoint(os.fspath(checkpoint_path))
+
+    assert resumed._tracked_batch is not None
+    assert torch.equal(resumed._tracked_batch["ct"], expected_tracked_ct)
+    assert torch.equal(
+        resumed.val_loader.generator.get_state(),
+        saved_val_generator_state,
+    )
+    actual_host_draws = (
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+    actual_sampler_epoch = list(iter(resumed.train_loader.sampler))
+    assert actual_host_draws[0] == expected_host_draws[0]
+    assert actual_host_draws[1] == expected_host_draws[1]
+    assert torch.equal(actual_host_draws[2], expected_host_draws[2])
+    assert actual_sampler_epoch == expected_sampler_epoch
+    assert resumed.epoch_count == 3
+    assert resumed.step_count == 17
+
+
+def _prior_anchored_resume_config():
+    checkpoint = "results/prior-run/checkpoints/ckpt_epoch0010.pt"
+    return {
+        "prior_anchored_run": {
+            "pipeline_id": "PRIOR_ANCHORED_ROUTER_100E_CLOUD_V1",
+        },
+        "experiment": {"name": "prior-run", "seed": 42},
+        "training": {
+            "num_epochs": 100,
+            "checkpoint_dir": "results/prior-run/checkpoints",
+            "resume_from": checkpoint,
+        },
+        "model": {
+            "base_loss": {
+                "mse_weight": 1.0,
+                "l1_weight": 1.0,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field_path", "replacement"),
+    [
+        (("experiment", "seed"), 43),
+        (("model", "base_loss", "l1_weight"), 0.25),
+    ],
+)
+def test_prior_anchored_resume_rejects_full_config_mismatch(
+    monkeypatch,
+    field_path,
+    replacement,
+):
+    """Seed and loss changes cannot bypass the run-owned runner contract."""
+    import copy
+
+    current = _prior_anchored_resume_config()
+    observed = copy.deepcopy(current)
+    observed["training"]["resume_from"] = None
+    target = observed
+    for key in field_path[:-1]:
+        target = target[key]
+    target[field_path[-1]] = replacement
+
+    trainer = object.__new__(Trainer)
+    trainer.config = current
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: {"config": observed},
+    )
+
+    with pytest.raises(RuntimeError, match="configuration differs"):
+        trainer.load_checkpoint(current["training"]["resume_from"])
+
+
+@pytest.mark.parametrize(
+    ("source", "resume_from", "message"),
+    [
+        (
+            "current",
+            "D:/outside/ckpt_epoch0010.pt",
+            "repository-relative",
+        ),
+        (
+            "current",
+            "results/other-run/checkpoints/ckpt_epoch0010.pt",
+            "inside the current",
+        ),
+        (
+            "checkpoint",
+            "D:/outside/ckpt_epoch0005.pt",
+            "repository-relative",
+        ),
+        (
+            "checkpoint",
+            "results/other-run/checkpoints/ckpt_epoch0005.pt",
+            "inside the current",
+        ),
+        (
+            "current",
+            "results/prior-run/checkpoints/ckpt_best_combined.pt",
+            "ckpt_epochNNNN",
+        ),
+    ],
+)
+def test_prior_anchored_resume_rejects_absolute_or_cross_run_pointer(
+    monkeypatch,
+    source,
+    resume_from,
+    message,
+):
+    """Both current and historical resume pointers are run-directory sealed."""
+    import copy
+
+    current = _prior_anchored_resume_config()
+    observed = copy.deepcopy(current)
+    observed["training"]["resume_from"] = None
+    if source == "current":
+        current["training"]["resume_from"] = resume_from
+        load_path = resume_from
+    else:
+        observed["training"]["resume_from"] = resume_from
+        load_path = current["training"]["resume_from"]
+
+    trainer = object.__new__(Trainer)
+    trainer.config = current
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: {"config": observed},
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        trainer.load_checkpoint(load_path)
+
+
+def test_epoch_stamped_data_is_exact_across_persistent_worker_resume():
+    """Persistent workers cannot perturb stateless epoch/sample augmentation."""
+    from src.data.dataset import build_dataloaders
+
+    data_cfg = {
+        "use_fake_data": True,
+        "image_size": 8,
+        "batch_size": 4,
+        "val_batch_size": 4,
+    }
+    runtime_cfg = {
+        "num_workers": 1,
+        "persistent_workers": True,
+        "dataloader_seed": 91,
+    }
+    continuous_loader, continuous_val = build_dataloaders(
+        data_cfg,
+        runtime_cfg,
+    )
+    continuous = object.__new__(Trainer)
+    continuous.train_loader = continuous_loader
+    continuous.val_loader = continuous_val
+    continuous.epoch_count = 0
+    continuous._set_data_epoch()
+    list(continuous_loader)  # consume epoch 0
+    saved_rng = continuous._rng_state_dict()
+    continuous.epoch_count = 1
+    continuous._set_data_epoch()
+    expected = torch.cat([batch["ct"] for batch in continuous_loader], dim=0)
+
+    resumed_loader, resumed_val = build_dataloaders(data_cfg, runtime_cfg)
+    resumed = object.__new__(Trainer)
+    resumed.train_loader = resumed_loader
+    resumed.val_loader = resumed_val
+    resumed.epoch_count = 1
+    resumed._load_rng_state({"rng": saved_rng})
+    resumed._set_data_epoch()
+    actual = torch.cat([batch["ct"] for batch in resumed_loader], dim=0)
+
+    assert torch.equal(actual, expected)
+
+
+def test_validation_metrics_keep_full_batch_on_cpu(monkeypatch):
+    """Supplying sampled CPU output must not move the tracked batch to CUDA."""
+    import src.model.trainer as trainer_module
+
+    def _forbid_full_batch_transfer(*args, **kwargs):
+        raise AssertionError("full tracked batch was transferred")
+
+    monkeypatch.setattr(trainer_module, "_to_device", _forbid_full_batch_transfer)
+
+    class EvalOnlyModel:
+        def eval(self):
+            return self
+
+    trainer = object.__new__(Trainer)
+    trainer.model = EvalOnlyModel()
+    batch = {
+        "pet": torch.zeros(4, 1, 8, 8),
+        "mask": torch.ones(4, 1, 8, 8),
+    }
+    synth = torch.zeros_like(batch["pet"])
+
+    metrics = trainer._compute_val_sample_metrics(batch, synth)
+
+    assert metrics["val/mae"] == pytest.approx(0.0)

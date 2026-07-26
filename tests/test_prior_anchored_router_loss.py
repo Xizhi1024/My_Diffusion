@@ -285,3 +285,22 @@ def test_route_tensor_shape_contract_is_checked() -> None:
 
     with pytest.raises(ValueError, match="exactly 6 route bands"):
         term(_context(scalars))
+
+
+def test_masked_mean_preserves_fractional_weight_semantics() -> None:
+    values = torch.tensor([2.0])
+    zero = torch.zeros(())
+
+    observed = SpectralRouterRegularizationLoss._masked_mean(
+        values,
+        torch.tensor([0.5]),
+        zero,
+    )
+    empty = SpectralRouterRegularizationLoss._masked_mean(
+        values,
+        torch.tensor([0.0]),
+        zero,
+    )
+
+    assert observed.item() == pytest.approx(2.0)
+    assert empty.item() == pytest.approx(0.0)

@@ -39,6 +39,7 @@ runtime:
   eval_interval: 10
   eval_num_samples: 64
   eval_seed: 42
+  dataloader_seed: 42
   eval_sampling_steps: 20
   sample_interval: 10
   save_interval: 10

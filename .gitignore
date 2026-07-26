@@ -1,6 +1,11 @@
 /Data/
 __pycache__/
 *.pyc
+# Pytest artifacts (never track test-run outputs or caches)
+.pytest_cache/
+.pytest_tmp*/
+# Stale editor/tool backups
+*.bak
 .gitignore
 wandb/
 checkpoints/

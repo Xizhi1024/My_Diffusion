@@ -1,0 +1,133 @@
+# Prior-anchored router: proposed exploratory ablation (A/B/C/D).
+#
+# Status: BLOCKED / NOT RUNNABLE.  This is not H5/H6 formal validation.
+# The current policies do not share one parameterization or amplitude contract,
+# and conditional module construction changes downstream initialization RNG.
+# Consequently no metric delta may be attributed to the router policy alone.
+#
+# Shared configuration intent (checked by tests, but NOT proof of pairing):
+#   - identical experiment.seed
+#   - identical data.split_manifest / data.cache_dir / data.dataset_contract
+#   - identical data.require_cache_lineage
+#   - identical modules.conditional_mean.checkpoint (pathology-excluded mean)
+#   - identical training.num_epochs / learning_rate / weight_decay / optimizer_groups
+#   - identical runtime.eval_seed / dataloader_seed / intervals
+#   - identical model.base_loss and every enabled loss term
+#   - declared overrides are scoped to
+#     modules.residual_frequency.cross_level_router (and its h3_* schedule
+#     inputs, which are policy-specific).
+#
+# Fail-closed blockers:
+#   - A/B/C/D do not have identical registered parameters/state_dict structure
+#   - C bypasses adaptive amplitude heads while A/D use them
+#   - conditional head construction changes later module initialization RNG
+#   - B has no formal decision=PASS H3-v2 schedule
+#
+# Base config: configs/experiments/slmf_png_prior_anchored_router_100e.yaml
+#
+# Variant B (fixed_h3_native_null) is BLOCKED until a formal H3-v2 schedule
+# with decision=PASS exists: the direct-PNG preview is PREVIEW_ONLY and cannot
+# feed the fail-closed formal loader.  See docs/current_model_status.md.
+
+base_config: configs/experiments/slmf_png_prior_anchored_router_100e.yaml
+
+status: BLOCKED
+paired_execution_allowed: false
+causal_attribution_allowed: false
+blocked_reasons:
+  - unequal_parameter_and_state_dict_structure
+  - unequal_amplitude_contract
+  - conditional_construction_changes_initialization_rng
+  - formal_h3_v2_schedule_missing
+
+shared_contract:
+  experiment_seed: 42
+  data_split_manifest: main_data/split_manifest.csv
+  data_cache_dir: cache/tensors_main
+  data_dataset_contract: configs/dataset_contract_stage0a_v1.json
+  data_require_cache_lineage: true
+  mean_checkpoint_field: modules.conditional_mean.checkpoint
+  mean_checkpoint_policy: pathology_excluded
+  num_epochs: 100
+  eval_seed: 42
+  dataloader_seed: 42
+  eval_interval: 10
+  save_interval: 10
+  sample_interval: 10
+  declared_override_scope: modules.residual_frequency.cross_level_router
+
+variants:
+  # A. Plain residual diffusion: frequency module active, but every band is
+  #    routed native ([1,0,0]) with no null / shallow decision and no H3 prior.
+  #    Isolates the value of any routing decision at all.
+  A_no_route:
+    description: "No routing: native_only, no H3 prior, no adaptive head."
+    overrides:
+      modules.residual_frequency.cross_level_router.policy: native_only
+      modules.residual_frequency.cross_level_router.h3_schedule_path: null
+      modules.residual_frequency.cross_level_router.h3_schedule_sha256: null
+      modules.residual_frequency.cross_level_router.h3_schedule_source: formal_h3_v2
+      modules.residual_frequency.cross_level_router.h3_allow_unverified_preview_lineage: false
+
+  # B. Frozen H3 prior, no adaptive correction, no destination head.  Requires
+  #    a FORMAL H3-v2 schedule (decision=PASS, inference_schedule_allowed=true).
+  #    BLOCKED until H3-v2 Stage A1 produces such a file; the preview cannot be
+  #    consumed by the fail-closed formal loader.
+  B_fixed_h3_native_null:
+    description: "Frozen H3 native/null schedule, structurally zero shallow."
+    blocked_until: "formal H3-v2 schedule with decision=PASS exists"
+    overrides:
+      modules.residual_frequency.cross_level_router.policy: h3_native_null
+      modules.residual_frequency.cross_level_router.h3_schedule_source: formal_h3_v2
+      modules.residual_frequency.cross_level_router.h3_allow_unverified_preview_lineage: false
+
+  # C. The main experiment: H3 active prior + bounded adaptive correction +
+  #    conditional destination head.  Identical to the base 100e config.
+  C_h3_prior_anchored_adaptive:
+    description: "H3-prior-anchored adaptive active/destination router."
+    overrides:
+      modules.residual_frequency.cross_level_router.policy: prior_anchored_learned
+      modules.residual_frequency.cross_level_router.h3_schedule_source: direct_png_preview
+      modules.residual_frequency.cross_level_router.h3_allow_unverified_preview_lineage: true
+
+  # D. Unconstrained 3-way softmax router with no H3 anchor.  Its current head
+  #    structure and amplitude behavior are NOT paired with C.
+  D_unconstrained_learned:
+    description: "Unconstrained learned 3-way router (native/shallow/null)."
+    overrides:
+      modules.residual_frequency.cross_level_router.policy: learned
+      modules.residual_frequency.cross_level_router.h3_schedule_path: null
+      modules.residual_frequency.cross_level_router.h3_schedule_sha256: null
+      modules.residual_frequency.cross_level_router.h3_schedule_source: formal_h3_v2
+      modules.residual_frequency.cross_level_router.h3_allow_unverified_preview_lineage: false
+
+# Primary comparisons (all exploratory, no formal gate):
+#   - whole-image MAE / MSE / PSNR / SSIM
+#   - lesion ROI L1
+#   - normalized peak error
+#   - small-lesion underestimation
+#   - outside / inside peak ratio
+#   - false-hotspot proxy
+#   - stripe score
+#   - native / shallow / null mass
+#   - prior deviation (C vs B)
+#   - timestep monotonicity
+primary_comparisons:
+  - val/mae
+  - val/mse
+  - val/psnr
+  - val/ssim
+  - val/lesion_roi_l1
+  - val/lesion_peak_error_norm
+  - val/lesion_topq_peak_error_norm
+  - val/small_lesion_underestimate
+  - val/outside_inside_peak_ratio
+  - val/stripe_score
+  - frequency/route_native_mass
+  - frequency/route_shallow_mass
+  - frequency/route_null_mass
+  - frequency/prior_anchor_prior_active_mae
+  - frequency/prior_anchor_monotonic_violation
+
+scientific_claim_allowed: false
+production_activation_allowed: false
