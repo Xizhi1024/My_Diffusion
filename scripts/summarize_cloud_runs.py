@@ -322,6 +322,8 @@ def _infer_experiment(
     run_dir: Path,
     state: Mapping[str, Any] | None,
     config: Mapping[str, Any] | None,
+    *,
+    root: Path,
 ) -> str:
     """Pick the most informative experiment label for this run."""
     for source in (state, config):
@@ -330,7 +332,11 @@ def _infer_experiment(
             if isinstance(pid, str) and pid:
                 return pid
     # Fall back to the experiment bucket (two levels up: runs/<bucket>/<run>).
-    parts = run_dir.relative_to(ROOT.resolve()).parts if run_dir.is_relative_to(ROOT.resolve()) else run_dir.parts
+    root = root.resolve()
+    parts = (
+        run_dir.relative_to(root).parts
+        if run_dir.is_relative_to(root) else run_dir.parts
+    )
     if len(parts) >= 2:
         return parts[-3] if parts[-2] == "runs" else parts[-2]
     return run_dir.name
@@ -388,10 +394,11 @@ def _router_state(
     delta = out.get("frequency/prior_anchor_active_delta_abs_mean")
     # Mean over the full_adaptive tail (last 50% of observed epochs) so a
     # single noisy epoch does not flip the verdict.
-    tail_start = epochs_with_route[len(epochs_with_route) // 2]
+    tail_idx = len(epochs_with_route) // 2
+    tail_epochs = epochs_with_route[tail_idx:]
     shallow_tail = [
         float(records_by_epoch[e].get("frequency/route_shallow_mass"))
-        for e in epochs_with_route[tail_start <= e:]  # noqa: E203
+        for e in tail_epochs
         if is_number(records_by_epoch[e].get("frequency/route_shallow_mass"))
     ]
     shallow_tail_mean = (
@@ -484,7 +491,7 @@ def classify_run(
             metrics_resolved, total_epochs=total_epochs
         )
 
-    experiment = _infer_experiment(run_dir, state, config)
+    experiment = _infer_experiment(run_dir, state, config, root=root)
     alpha, stripe_penalty = _alpha_stripe_from_config(config)
     records = metrics["records_by_epoch"]
     final_val = _final_val_metrics(records)
@@ -496,7 +503,7 @@ def classify_run(
     # ---- checkpoint (optional, slow) ----
     ckpt: dict[str, Any] = {"inspected": False}
     if with_checkpoint:
-        ckpt = _inspect_checkpoint(run_dir, state, config, total_epochs)
+        ckpt = _inspect_checkpoint(run_dir, state, config, total_epochs, root=root)
 
     # ---- sha (optional, slow on large checkpoints) ----
     metrics_sha = (
@@ -557,6 +564,8 @@ def _inspect_checkpoint(
     state: Mapping[str, Any] | None,
     config: Mapping[str, Any] | None,
     total_epochs: int | None,
+    *,
+    root: Path,
 ) -> dict[str, Any]:
     """Load final checkpoint metadata (weights_only).  Optional / best-effort."""
     info: dict[str, Any] = {"inspected": True, "exists": False}
@@ -573,7 +582,7 @@ def _inspect_checkpoint(
             if isinstance(cd, str) and cd:
                 ckpt_dir = Path(cd)
                 if not ckpt_dir.is_absolute():
-                    ckpt_dir = (ROOT.resolve() / ckpt_dir)
+                    ckpt_dir = (root.resolve() / ckpt_dir)
     if ckpt_dir is None:
         ckpt_dir = run_dir / "checkpoints"
     final_epoch = total_epochs or 0
@@ -589,7 +598,7 @@ def _inspect_checkpoint(
     if ckpt_path is None:
         info["error"] = "no checkpoint file found"
         return info
-    info["path"] = repo_relative(ckpt_path, ROOT.resolve())
+    info["path"] = repo_relative(ckpt_path, root.resolve())
     info["exists"] = True
     try:
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -747,7 +756,9 @@ def sort_summaries(
     )
 
 
-# Leaderboard columns: (csv_header, accessor_into_summary)
+# Leaderboard columns: (csv_header, accessor_into_summary).
+# accessor uses "|" to separate nesting levels so dict keys that themselves
+# contain "/" (e.g. "frequency/route_shallow_mass") survive the split in _cell.
 LEADERBOARD_COLUMNS: Sequence[tuple[str, str]] = (
     ("run_id", "run_id"),
     ("experiment", "experiment"),
@@ -760,15 +771,15 @@ LEADERBOARD_COLUMNS: Sequence[tuple[str, str]] = (
     ("best_combined", "best_combined"),
     ("best_lesion", "best_lesion_score"),
     ("best_image", "best_image_score"),
-    ("final_val_mae", "final_val/val/mae"),
-    ("final_val_ssim", "final_val/val/ssim"),
-    ("final_val_peak_err", "final_val/val/lesion_peak_error_norm"),
-    ("final_val_stripe", "final_val/val/stripe_score"),
-    ("final_shallow_mass", "router/frequency/route_shallow_mass"),
-    ("final_native_mass", "router/frequency/route_native_mass"),
-    ("final_null_mass", "router/frequency/route_null_mass"),
-    ("final_active_delta", "router/frequency/prior_anchor_active_delta_abs_mean"),
-    ("router_noop", "router/noop"),
+    ("final_val_mae", "final_val|val/mae"),
+    ("final_val_ssim", "final_val|val/ssim"),
+    ("final_val_peak_err", "final_val|val/lesion_peak_error_norm"),
+    ("final_val_stripe", "final_val|val/stripe_score"),
+    ("final_shallow_mass", "router|frequency/route_shallow_mass"),
+    ("final_native_mass", "router|frequency/route_native_mass"),
+    ("final_null_mass", "router|frequency/route_null_mass"),
+    ("final_active_delta", "router|frequency/prior_anchor_active_delta_abs_mean"),
+    ("router_noop", "router|noop"),
     ("anomaly_count", "anomaly_count"),
     ("missing_epochs", "missing_epochs_count"),
     ("run_dir", "run_dir"),
@@ -777,7 +788,7 @@ LEADERBOARD_COLUMNS: Sequence[tuple[str, str]] = (
 
 def _cell(summary: Mapping[str, Any], accessor: str) -> Any:
     cursor: Any = summary
-    for part in accessor.split("/"):
+    for part in accessor.split("|"):
         if isinstance(cursor, Mapping) and part in cursor:
             cursor = cursor[part]
         else:
@@ -831,7 +842,18 @@ def build_promoted(
     promote_top: int,
 ) -> dict[str, Any]:
     """Shortlist the top complete runs and explain why each was chosen."""
-    usable = [s for s in summaries if s.get("grade") in ("COMPLETE_STABLE", "COMPLETE_ANOMALY")]
+    # "complete" = passed the completeness gate, regardless of router no-op.
+    # grade() rewrites COMPLETE_STABLE+noop -> ROUTER_NOOP (and
+    # COMPLETE_ANOMALY+noop -> COMPLETE_ANOMALY+ROUTER_NOOP), so those rewritten
+    # labels must count as complete here -- otherwise an inert-but-complete run
+    # would vanish from both the shortlist and the no-op callout.
+    complete_labels = {
+        "COMPLETE_STABLE",
+        "COMPLETE_ANOMALY",
+        "ROUTER_NOOP",
+        "COMPLETE_ANOMALY+ROUTER_NOOP",
+    }
+    usable = [s for s in summaries if s.get("grade") in complete_labels]
     # Among usable, prefer non-router-no-op runs; record no-op ones separately.
     candidates = [s for s in usable if not (s.get("router") or {}).get("noop")]
     noop_within_complete = [s for s in usable if (s.get("router") or {}).get("noop")]
