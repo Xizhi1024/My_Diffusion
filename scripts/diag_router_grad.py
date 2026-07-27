@@ -227,7 +227,7 @@ def _forward_loss_logs(model, batch) -> Tuple[torch.Tensor, Dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Prior-anchored router gradient deadlock probe")
     ap.add_argument("--config", required=True)
-    ap.add_argument("--checkpoint", required=True, help="prior-anchored ckpt_epoch0100.pt")
+    ap.add_argument("--checkpoint", default=None, help="prior-anchored ckpt; omit for fresh-init (verifies experiment D's de-zeroed projections without a trained ckpt overwriting them — then pass a resolved_config as --config)")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -240,21 +240,29 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     print(f"[diag] config     = {args.config}")
-    print(f"[diag] checkpoint = {args.checkpoint}")
-    print(f"[diag] sha256     = {_sha256(args.checkpoint)}")
+    if args.checkpoint:
+        print(f"[diag] checkpoint = {args.checkpoint}")
+        print(f"[diag] sha256     = {_sha256(args.checkpoint)}")
+    else:
+        print("[diag] checkpoint = (none — fresh init; experiment D de-zeroed projections active)")
     print(f"[diag] device={args.device} steps={args.steps} lr={args.lr}")
 
     # 1. config + model + checkpoint. The template has h3_schedule_path=null;
-    #    prefer the run's resolved_config.yaml (authoritative for this ckpt),
-    #    else inject the run's own prior artifact so prior_anchored_learned builds.
+    #    with a checkpoint we prefer its run's resolved_config.yaml, else inject
+    #    the run's prior artifact. Without a checkpoint (--no-checkpoint) the
+    #    --config must already carry a valid h3_schedule (use a resolved_config).
     with open(args.config, "r", encoding="utf-8") as f:
         template = yaml.safe_load(f)
-    config, config_source = _resolve_run_config(template, args.checkpoint)
+    if args.checkpoint:
+        config, config_source = _resolve_run_config(template, args.checkpoint)
+    else:
+        config, config_source = template, os.path.abspath(args.config)
     config.setdefault("runtime", {})
     print(f"[diag] config_src = {config_source}")
     model = SLMFBBDM.from_config(config).to(args.device)
-    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
-    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
+        model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=False)
     model.train()
     _set_router_epoch(model, 99)  # active_progress = destination_progress = 1
 
@@ -277,8 +285,8 @@ def main() -> None:
             "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "config": os.path.abspath(args.config),
             "config_resolved_from": config_source,
-            "checkpoint": os.path.abspath(args.checkpoint),
-            "checkpoint_sha256": _sha256(args.checkpoint),
+            "checkpoint": (os.path.abspath(args.checkpoint) if args.checkpoint else None),
+            "checkpoint_sha256": (_sha256(args.checkpoint) if args.checkpoint else "fresh_init"),
             "device": args.device,
             "seed": args.seed,
             "steps": args.steps,
