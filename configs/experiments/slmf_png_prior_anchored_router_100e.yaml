@@ -236,6 +236,16 @@ losses:
     curvature_weight: 2.0e-4
     budget_weight: 2.0e-3
     shallow_cost_weight: 1.0e-3
+    # INERT DEAD KEY — do NOT bump this to "enable" artifact safety.
+    # The loss factory (src/model/slmf_bbdm.py, branch
+    # spectral_router_regularization) does not fetch this key, and
+    # SpectralRouterRegularizationLoss has no such term/param. The runner
+    # (scripts/run_prior_anchored_router_100e.py) enforces it == 0 with a
+    # default of -1.0, so a MISSING or nonzero value both raise. Activating
+    # artifact safety requires implementing the loss term + factory wiring +
+    # removing the runner guard (see docs/current_model_status.md §7.3).
+    # The only real artifact-safety entity is scripts/validate_artifact_safety.py
+    # (mechanism_validation stage 06), not a training loss.
     artifact_safety_weight: 0.0
   residual_wavelet:
     enabled: false
