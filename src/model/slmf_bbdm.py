@@ -641,6 +641,9 @@ class SLMFBBDM(nn.Module):
                             "initial_destination_native_probability", 0.95
                         )
                     ),
+                    shallow_projection_init_scale=cross_level_router_cfg.get(
+                        "shallow_projection_init_scale", 0.01
+                    ),
                 )
             else:
                 raise ValueError(

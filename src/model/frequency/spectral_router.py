@@ -222,13 +222,20 @@ class UncertaintyAwareRouteSelector(nn.Module):
 
 
 class BiasFreeZeroProjection(nn.Module):
-    """Zero-initialized projection that stays strictly zero for zero input.
+    """Bias-free projection; P(0)=0 guaranteed by construction.
 
-    Unlike ``_ZeroProjection``, this module has **no bias** in any convolution,
-    so P(0) = 0 is guaranteed by construction even after training.
+    Every convolution is bias-free, so a zero input always yields a zero
+    output, even after training (unlike ``_ZeroProjection``). The ``final``
+    1×1 conv is zero-initialized by default so native paths start inert and
+    learn purely from the data. Pass ``init_scale > 0`` to draw
+    ``final.weight ~ N(0, init_scale²)`` instead: this is used on the shallow
+    paths, which are otherwise cold-start-deadlocked (zero init + shallow-mass
+    collapse ⇒ no gradient ⇒ never bootstraps; confirmed by experiment A,
+    2026-07-27). The small non-zero init carries gradient from step 0 while
+    preserving P(0)=0, so there is still no injection for a zero input.
     """
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int, init_scale: float = 0.0) -> None:
         super().__init__()
         hidden = min(32, max(8, out_channels // 4))
         self.features = nn.Sequential(
@@ -236,7 +243,10 @@ class BiasFreeZeroProjection(nn.Module):
             nn.SiLU(),
         )
         self.final = nn.Conv2d(hidden, out_channels, kernel_size=1, bias=False)
-        nn.init.zeros_(self.final.weight)
+        if float(init_scale) > 0.0:
+            nn.init.normal_(self.final.weight, mean=0.0, std=float(init_scale))
+        else:
+            nn.init.zeros_(self.final.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.final(self.features(x))
@@ -311,6 +321,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         prior_anchor_final_scale: float = 0.10,
         active_logit_delta_max: float = 2.0,
         initial_destination_native_probability: float = 0.95,
+        shallow_projection_init_scale: float = 0.01,
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
@@ -411,6 +422,7 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.initial_destination_native_probability = float(
             initial_destination_native_probability
         )
+        self.shallow_projection_init_scale = float(shallow_projection_init_scale)
 
         # Resolve effective policy when legacy flags are used
         effective_policy = self._resolve_policy()
@@ -490,12 +502,29 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
         # Replace base-class _ZeroProjection heads with bias-free variants.
         # The base class stores them as self.projection_heads[0..2]; we rebuild.
+        # Native paths ([0] native_l2→l2, [1] native_l1→l1) always stay zero-
+        # init: the prior sustains ~0.2 native mass, so they receive gradient
+        # and learn. The two shallow paths ([2] shallow_l1→l0, l2_to_l1
+        # shallow_l2→l1) are cold-start-deadlocked under prior_anchored_learned:
+        # zero init + shallow-mass collapse ⇒ ~3.6e-11 data-loss gradient ⇒
+        # shallow never bootstraps (experiment A, 2026-07-27). Only for that
+        # policy do we give them a small non-zero init_scale so they carry
+        # gradient from step 0. Other policies (incl. production `learned`)
+        # keep the exact-no-op-at-init contract unchanged. P(0)=0 holds either
+        # way (bias-free).
+        shallow_init = (
+            float(shallow_projection_init_scale)
+            if self._effective_policy == "prior_anchored_learned"
+            else 0.0
+        )
         self.projection_heads = nn.ModuleList([
             BiasFreeZeroProjection(3, self.output_channels[1]),
             BiasFreeZeroProjection(3, self.output_channels[2]),
-            BiasFreeZeroProjection(1, self.output_channels[3]),
+            BiasFreeZeroProjection(1, self.output_channels[3], init_scale=shallow_init),
         ])
-        self.l2_to_l1_projection = BiasFreeZeroProjection(1, self.output_channels[2])
+        self.l2_to_l1_projection = BiasFreeZeroProjection(
+            1, self.output_channels[2], init_scale=shallow_init
+        )
 
         # Build fixed-route buffers for non-learned policies
         self.register_buffer(

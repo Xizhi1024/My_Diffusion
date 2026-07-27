@@ -153,6 +153,13 @@ modules:
       prior_destination_ramp_epochs: 10
       prior_anchor_decay_end_epoch: 100
       prior_anchor_final_scale: 0.10
+      # Experiment D (2026-07-27): small non-zero init on the two shallow-path
+      # projections (shallow_l1→l0, shallow_l2→l1) to break the cold-start
+      # deadlock diagnosed by scripts/diag_router_grad.py (zero init + shallow-
+      # mass collapse ⇒ ~3.6e-11 data-loss grad ⇒ shallow never bootstraps).
+      # Native-path projections stay zero-init (they learn from sustained native
+      # mass). P(0)=0 is preserved (bias-free), so no injection at init.
+      shallow_projection_init_scale: 0.01
       phase_observation_epochs: [10, 20, 30, 40, 100]
 
   gabor:
@@ -235,7 +242,10 @@ losses:
     monotonic_weight: 2.0e-3
     curvature_weight: 2.0e-4
     budget_weight: 2.0e-3
-    shallow_cost_weight: 1.0e-3
+    # Experiment D bootstrap: set to 0 so the de-zeroed shallow branch is not
+    # penalized while it establishes mass. Restore to ~1.0e-3 once shallow_mass
+    # is observed above ~1e-2 in the route diagnostics.
+    shallow_cost_weight: 0.0
     # INERT DEAD KEY — do NOT bump this to "enable" artifact safety.
     # The loss factory (src/model/slmf_bbdm.py, branch
     # spectral_router_regularization) does not fetch this key, and

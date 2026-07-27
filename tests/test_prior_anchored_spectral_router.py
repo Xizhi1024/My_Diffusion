@@ -328,3 +328,34 @@ def test_prior_forward_does_not_read_progress_buffers_with_item(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "item", guarded_item)
     _, diagnostics = _forward(router)
     assert torch.isfinite(diagnostics["route_active"]).all()
+
+
+def test_shallow_projection_dezero_breaks_cold_start_deadlock():
+    """Experiment D: the shallow-path projection gets a small non-zero init so
+    it carries gradient from step 0, while staying bias-free (P(0)=0 holds)."""
+    from src.model.frequency.spectral_router import BiasFreeZeroProjection
+
+    # Native paths (default init_scale=0.0): zero-init, start inert.
+    native = BiasFreeZeroProjection(3, 8)
+    assert torch.count_nonzero(native.final.weight) == 0
+
+    # Shallow paths (init_scale=0.01): small non-zero init, still bias-free.
+    shallow = BiasFreeZeroProjection(1, 8, init_scale=0.01)
+    assert torch.count_nonzero(shallow.final.weight) > 0
+    assert shallow.final.bias is None
+    # P(0)=0 is preserved by the bias-free construction, not by the init.
+    assert torch.allclose(shallow(torch.zeros(2, 1, 8, 8)), torch.zeros(2, 8, 8, 8))
+    # Init magnitude stays small (bootstrap, not an artifact source).
+    assert shallow.final.weight.abs().mean() < 0.05
+
+
+def test_prior_anchored_router_dezeros_only_shallow_projections(monkeypatch):
+    """The full prior_anchored router de-zeros the two shallow-path projections
+    ([2] and l2_to_l1) but leaves the two native-path projections ([0], [1])
+    zero-init — so the native branch is untouched and only the deadlocked
+    shallow branch is unblocked."""
+    router = _router(monkeypatch)
+    assert torch.count_nonzero(router.projection_heads[0].final.weight) == 0
+    assert torch.count_nonzero(router.projection_heads[1].final.weight) == 0
+    assert torch.count_nonzero(router.projection_heads[2].final.weight) > 0
+    assert torch.count_nonzero(router.l2_to_l1_projection.final.weight) > 0
