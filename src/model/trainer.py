@@ -210,6 +210,87 @@ def _to_unit_interval(array: np.ndarray) -> np.ndarray:
     return np.clip((array.astype(np.float32) + 1.0) * 0.5, 0.0, 1.0)
 
 
+def _compute_body_background_sample_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    ct: np.ndarray,
+    lesion_mask: Optional[np.ndarray],
+    *,
+    lowpass_sigma: float = 4.0,
+    body_threshold: float = 0.03,
+    lesion_exclusion_radius: int = 8,
+) -> Optional[Dict[str, float]]:
+    """Sampled non-lesion body metrics used to select repair checkpoints."""
+    from scipy.ndimage import (
+        binary_closing,
+        binary_dilation,
+        binary_fill_holes,
+        gaussian_filter,
+        label,
+    )
+
+    ct_unit = _to_unit_interval(ct)
+    body = ct_unit > float(body_threshold)
+    body = binary_closing(body, structure=np.ones((5, 5), dtype=bool))
+    body = binary_fill_holes(body)
+    components, count = label(body)
+    if count <= 0:
+        return None
+    sizes = np.bincount(components.reshape(-1))
+    sizes[0] = 0
+    body = components == int(np.argmax(sizes))
+
+    if lesion_mask is None:
+        excluded = np.zeros_like(body, dtype=bool)
+    else:
+        lesion = np.asarray(lesion_mask) > 0.5
+        if lesion_exclusion_radius > 0 and lesion.any():
+            width = 2 * int(lesion_exclusion_radius) + 1
+            excluded = binary_dilation(
+                lesion,
+                structure=np.ones((width, width), dtype=bool),
+            )
+        else:
+            excluded = lesion
+    region = body & ~excluded
+    if not region.any():
+        return None
+
+    pred_unit = _to_unit_interval(pred)
+    target_unit = _to_unit_interval(target)
+    pred_low = gaussian_filter(
+        pred_unit,
+        sigma=float(lowpass_sigma),
+        mode="reflect",
+    )
+    target_low = gaussian_filter(
+        target_unit,
+        sigma=float(lowpass_sigma),
+        mode="reflect",
+    )
+    pred_high = pred_unit - pred_low
+    target_high = target_unit - target_low
+    pred_high_rms = float(np.sqrt(np.mean(np.square(pred_high[region]))))
+    target_high_rms = float(np.sqrt(np.mean(np.square(target_high[region]))))
+
+    metrics = {
+        "body_nonlesion_lowpass_mae": float(
+            np.abs(pred_low[region] - target_low[region]).mean()
+        ),
+        "body_nonlesion_mean_bias": float(
+            (pred_unit[region] - target_unit[region]).mean()
+        ),
+        "body_nonlesion_highpass_energy_ratio": (
+            pred_high_rms / max(target_high_rms, 1.0e-8)
+        ),
+    }
+    for quantile in (90, 95):
+        pred_q = float(np.percentile(pred_unit[region], quantile))
+        target_q = float(np.percentile(target_unit[region], quantile))
+        metrics[f"body_nonlesion_q{quantile}_bias"] = pred_q - target_q
+    return metrics
+
+
 def _compute_pet_sample_metrics(
     pred: np.ndarray,
     target: np.ndarray,
@@ -414,8 +495,13 @@ def _fused_adamw(params, lr: float, wd: float) -> torch.optim.AdamW:
 
 def _spectral_parameter_group(name: str) -> str:
     """Classify trainable parameters for spectral-router learning rates."""
-    if "residual_preconditioner.projection_heads" in name or (
-        "residual_preconditioner.l2_to_l1_projection" in name
+    if any(
+        token in name
+        for token in (
+            "residual_preconditioner.projection_heads",
+            "residual_preconditioner.l2_to_l1_projection",
+            "residual_preconditioner.low_frequency_projection",
+        )
     ):
         return "projection"
     if any(
@@ -426,6 +512,7 @@ def _spectral_parameter_group(name: str) -> str:
             "residual_preconditioner.amplitude_heads",
             "residual_preconditioner.prior_active_heads",
             "residual_preconditioner.prior_destination_heads",
+            "residual_preconditioner.spatial_destination_heads",
         )
     ):
         return "router"
@@ -533,6 +620,69 @@ class Trainer:
         # branch a larger LR without changing legacy configurations.
         training_cfg = config.get("training", {})
         self.optimizer = _build_optimizer(model, training_cfg)
+        self._spectral_original_trainable = {
+            name: bool(parameter.requires_grad)
+            for name, parameter in self.model.named_parameters()
+        }
+        phase_cfg = training_cfg.get("spectral_training_phases", {}) or {}
+        self.spectral_training_phases_enabled = bool(
+            phase_cfg.get("enabled", False)
+        )
+        self.spectral_training_phases: List[Dict[str, Any]] = []
+        self._active_spectral_training_phase = "joint"
+        if self.spectral_training_phases_enabled:
+            allowed_groups = {"base", "projection", "router", "descriptor"}
+            previous_end = 0
+            for raw_phase in phase_cfg.get("phases", []) or []:
+                name = str(raw_phase.get("name", "")).strip()
+                start = int(raw_phase.get("start_epoch", 0))
+                end = int(raw_phase.get("end_epoch", 0))
+                groups = {
+                    str(group)
+                    for group in (raw_phase.get("train_groups", []) or [])
+                }
+                if not name:
+                    raise ValueError(
+                        "spectral training phase names must be non-empty"
+                    )
+                if start < 1 or end < start:
+                    raise ValueError(
+                        f"spectral phase {name!r} must satisfy "
+                        "1 <= start_epoch <= end_epoch"
+                    )
+                if start <= previous_end:
+                    raise ValueError(
+                        "spectral training phases must be ordered and "
+                        "non-overlapping"
+                    )
+                if start != previous_end + 1:
+                    raise ValueError(
+                        "spectral training phases must cover every epoch "
+                        "without gaps"
+                    )
+                unknown = groups.difference(allowed_groups)
+                if unknown or not groups:
+                    raise ValueError(
+                        f"spectral phase {name!r} has invalid train_groups: "
+                        f"{sorted(unknown) if unknown else 'empty'}"
+                    )
+                self.spectral_training_phases.append({
+                    "name": name,
+                    "start_epoch": start,
+                    "end_epoch": end,
+                    "train_groups": groups,
+                })
+                previous_end = end
+            if not self.spectral_training_phases:
+                raise ValueError(
+                    "spectral_training_phases.enabled=true requires phases"
+                )
+            total_epochs = int(training_cfg.get("num_epochs", 0))
+            if self.spectral_training_phases[-1]["end_epoch"] != total_epochs:
+                raise ValueError(
+                    "spectral training phases must end at "
+                    "training.num_epochs"
+                )
 
         # EMA
         ema_cfg = config.get("training", {}).get("ema", {})
@@ -565,6 +715,49 @@ class Trainer:
         self.best_ckpts_enabled = bool(bc_cfg.get("enabled", True))
         self.best_combined_alpha = float(bc_cfg.get("combined_alpha", 0.5))
         self.best_stripe_penalty = float(bc_cfg.get("stripe_penalty", 0.3))
+        self.best_checkpoint_lightweight = bool(
+            bc_cfg.get("lightweight", False)
+        )
+        self.best_background_constraints = dict(
+            bc_cfg.get("background_constraints", {}) or {}
+        )
+        requested_tags = bc_cfg.get(
+            "save_tags",
+            [
+                "best_lesion",
+                "best_image",
+                "best_combined",
+                "best_background",
+            ],
+        )
+        self.best_checkpoint_tags = {
+            str(tag) for tag in (requested_tags or [])
+        }
+        unknown_tags = self.best_checkpoint_tags.difference(
+            {
+                "best_lesion",
+                "best_image",
+                "best_combined",
+                "best_background",
+            }
+        )
+        if unknown_tags:
+            raise ValueError(
+                "runtime.best_checkpoint.save_tags contains unknown tags: "
+                f"{sorted(unknown_tags)}"
+            )
+        background_cfg = (
+            config.get("losses", {}).get("nonlesion_body_lowpass", {}) or {}
+        )
+        self.background_monitoring_sigma = float(
+            background_cfg.get("sigma", 4.0)
+        )
+        self.background_monitoring_body_threshold = float(
+            background_cfg.get("body_threshold", 0.03)
+        )
+        self.background_monitoring_lesion_exclusion_radius = int(
+            background_cfg.get("lesion_exclusion_radius", 8)
+        )
 
         self.early_stopping_enabled = bool(es_cfg.get("enabled", False))
         self.early_stopping_patience = int(es_cfg.get("patience", 40))
@@ -572,6 +765,7 @@ class Trainer:
         self._best_combined_score: float = -1e9
         self._best_lesion_score: float = -1e9
         self._best_image_score: float = -1e9
+        self._best_background_score: float = -1e9
         self._epochs_since_improve: int = 0
         self._last_combined_improvement_epoch: Optional[int] = None
 
@@ -607,18 +801,23 @@ class Trainer:
             "grad/projection_final": ((
                 "residual_preconditioner.projection_heads",
                 "residual_preconditioner.l2_to_l1_projection",
+                "residual_preconditioner.low_frequency_projection",
             ), True),
             "grad/route_final": ((
                 "residual_preconditioner.route_heads",
                 "residual_preconditioner.no_null_route_heads",
                 "residual_preconditioner.prior_active_heads",
                 "residual_preconditioner.prior_destination_heads",
+                "residual_preconditioner.spatial_destination_heads",
             ), True),
             "grad/prior_active_final": ((
                 "residual_preconditioner.prior_active_heads",
             ), True),
             "grad/prior_destination_final": ((
                 "residual_preconditioner.prior_destination_heads",
+            ), True),
+            "grad/spatial_destination_final": ((
+                "residual_preconditioner.spatial_destination_heads",
             ), True),
             "grad/amplitude_final": ((
                 "residual_preconditioner.amplitude_heads",
@@ -650,10 +849,57 @@ class Trainer:
 
     def _set_spectral_router_epoch(self) -> None:
         model = getattr(self.model, "_orig_mod", self.model)
+        model_setter = getattr(model, "set_training_epoch", None)
+        if callable(model_setter):
+            model_setter(self.epoch_count)
         preconditioner = getattr(model, "residual_preconditioner", None)
         setter = getattr(preconditioner, "set_training_epoch", None)
         if callable(setter):
             setter(self.epoch_count)
+
+    def _apply_spectral_training_phase(self) -> None:
+        """Freeze co-adapting groups so destination utility is identifiable."""
+
+        if not getattr(self, "spectral_training_phases_enabled", False):
+            self._active_spectral_training_phase = "joint"
+            self._active_spectral_train_groups = {
+                "base",
+                "projection",
+                "router",
+                "descriptor",
+            }
+            return
+        epoch = self.epoch_count + 1
+        selected = None
+        for phase in self.spectral_training_phases:
+            if phase["start_epoch"] <= epoch <= phase["end_epoch"]:
+                selected = phase
+                break
+        if selected is None:
+            raise RuntimeError(
+                f"No spectral training phase covers epoch {epoch}"
+            )
+        phase_name = selected["name"]
+        train_groups = set(selected["train_groups"])
+        previous = getattr(self, "_active_spectral_training_phase", None)
+        self._active_spectral_training_phase = phase_name
+        self._active_spectral_train_groups = train_groups
+
+        for name, parameter in self.model.named_parameters():
+            originally_trainable = self._spectral_original_trainable.get(
+                name,
+                False,
+            )
+            group = _spectral_parameter_group(name)
+            should_train = originally_trainable and group in train_groups
+            parameter.requires_grad_(should_train)
+            if not should_train:
+                parameter.grad = None
+        if previous != phase_name:
+            print(
+                "  Spectral training phase "
+                f"{phase_name}: train_groups={sorted(train_groups)}"
+            )
 
     def _set_data_epoch(self) -> None:
         """Stamp the next training epoch on an epoch-aware sampler."""
@@ -732,6 +978,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def train_epoch(self) -> Dict[str, float]:
+        self._apply_spectral_training_phase()
         self._set_spectral_router_epoch()
         self._set_data_epoch()
         epoch_start = time.time()
@@ -757,6 +1004,13 @@ class Trainer:
         avg_logs = {k: sum(v) / len(v) for k, v in epoch_logs.items()}
         avg_logs["perf/epoch_seconds"] = time.time() - epoch_start
         avg_logs["perf/lr"] = self.scheduler.get_last_lr()[0]
+        active_groups = getattr(
+            self,
+            "_active_spectral_train_groups",
+            {"base", "projection", "router", "descriptor"},
+        )
+        for group in ("base", "projection", "router", "descriptor"):
+            avg_logs[f"phase/train_{group}"] = float(group in active_groups)
 
         if self.device == "cuda":
             avg_logs["perf/gpu_memory_mb"] = torch.cuda.max_memory_allocated() / 1024**2
@@ -778,6 +1032,14 @@ class Trainer:
 
     def _router_phase_label(self) -> Optional[str]:
         """Return the configured router phase label for the current epoch, if any."""
+        if getattr(self, "spectral_training_phases_enabled", False):
+            return str(
+                getattr(
+                    self,
+                    "_active_spectral_training_phase",
+                    "joint",
+                )
+            )
         model = getattr(self.model, "_orig_mod", self.model)
         for attr in ("residual_preconditioner", "preconditioner"):
             preconditioner = getattr(model, attr, None)
@@ -1054,7 +1316,9 @@ class Trainer:
                     f"base={avg_eval.get('loss/base_diffusion', float('nan')):.4f}  "
                     f"roi={avg_eval.get('loss/lesion_roi_l1/loss', float('nan')):.4f}  "
                     f"topk={avg_eval.get('loss/topk_lesion/loss', float('nan')):.4f}  "
-                    f"ranking={avg_eval.get('loss/outside_peak_ranking/loss', float('nan')):.4f}"
+                    f"ranking={avg_eval.get('loss/outside_peak_ranking/loss', float('nan')):.4f}  "
+                    "background="
+                    f"{avg_eval.get('loss/nonlesion_body_lowpass/loss', float('nan')):.4f}"
                 )
 
                 if val_metrics is not None:
@@ -1249,6 +1513,8 @@ class Trainer:
         # computation never creates a second batch-sized GPU allocation.
         synth = synth.detach().cpu()
         target = batch["pet"].detach().cpu()
+        raw_ct = batch.get("ct")
+        ct = raw_ct.detach().cpu() if torch.is_tensor(raw_ct) else raw_ct
         raw_mask = batch.get("mask")
         mask = raw_mask.detach().cpu() if torch.is_tensor(raw_mask) else raw_mask
 
@@ -1261,6 +1527,9 @@ class Trainer:
         mae_vals, mse_vals, ssim_vals, stripe_vals, psnr_vals = [], [], [], [], []
         peak_err_vals, topq_peak_err_vals = [], []
         centroid_vals, oir_vals, roi_l1_vals = [], [], []
+        background_lowpass_vals, background_bias_vals = [], []
+        background_q90_bias_vals, background_q95_bias_vals = [], []
+        background_highpass_ratio_vals = []
         failure_count = 0
         small_under_count = 0
         small_total = 0
@@ -1281,8 +1550,52 @@ class Trainer:
                 ssim_vals.append(float(_ssim(t, p, data_range=2.0)))
             except Exception:
                 pass
+            mi = (
+                mask[i, 0].float().cpu().numpy()
+                if mask is not None
+                else None
+            )
+            if ct is not None:
+                background_metrics = _compute_body_background_sample_metrics(
+                    p,
+                    t,
+                    ct[i, 0].float().cpu().numpy(),
+                    mi,
+                    lowpass_sigma=getattr(
+                        self,
+                        "background_monitoring_sigma",
+                        4.0,
+                    ),
+                    body_threshold=getattr(
+                        self,
+                        "background_monitoring_body_threshold",
+                        0.03,
+                    ),
+                    lesion_exclusion_radius=getattr(
+                        self,
+                        "background_monitoring_lesion_exclusion_radius",
+                        8,
+                    ),
+                )
+                if background_metrics is not None:
+                    background_lowpass_vals.append(
+                        background_metrics["body_nonlesion_lowpass_mae"]
+                    )
+                    background_bias_vals.append(
+                        background_metrics["body_nonlesion_mean_bias"]
+                    )
+                    background_q90_bias_vals.append(
+                        background_metrics["body_nonlesion_q90_bias"]
+                    )
+                    background_q95_bias_vals.append(
+                        background_metrics["body_nonlesion_q95_bias"]
+                    )
+                    background_highpass_ratio_vals.append(
+                        background_metrics[
+                            "body_nonlesion_highpass_energy_ratio"
+                        ]
+                    )
             if mask is not None:
-                mi = mask[i, 0].float().cpu().numpy()
                 lesion_metrics = _compute_pet_sample_metrics(
                     p, t, mi, area_quantiles=area_quantiles
                 )
@@ -1308,6 +1621,21 @@ class Trainer:
         metrics["val/psnr"] = _mean(psnr_vals)
         metrics["val/ssim"] = _mean(ssim_vals)
         metrics["val/stripe_score"] = _mean(stripe_vals)
+        metrics["val/body_nonlesion_lowpass_mae"] = _mean(
+            background_lowpass_vals
+        )
+        metrics["val/body_nonlesion_mean_bias"] = _mean(
+            background_bias_vals
+        )
+        metrics["val/body_nonlesion_q90_bias"] = _mean(
+            background_q90_bias_vals
+        )
+        metrics["val/body_nonlesion_q95_bias"] = _mean(
+            background_q95_bias_vals
+        )
+        metrics["val/body_nonlesion_highpass_energy_ratio"] = _mean(
+            background_highpass_ratio_vals
+        )
         metrics["val/lesion_peak_error_norm"] = _mean(peak_err_vals)
         metrics["val/lesion_topq_peak_error_norm"] = _mean(topq_peak_err_vals)
         metrics["val/lesion_centroid_distance"] = _mean(centroid_vals)
@@ -1389,11 +1717,16 @@ class Trainer:
             "best_combined_score": self._best_combined_score,
             "best_lesion_score": self._best_lesion_score,
             "best_image_score": self._best_image_score,
+            "best_background_score": getattr(
+                self,
+                "_best_background_score",
+                -1e9,
+            ),
             "epochs_since_improve": self._epochs_since_improve,
             "last_combined_improvement_epoch": self._last_combined_improvement_epoch,
             "resumed_elapsed": (
-                time.time() - self.start_time
-                if self.start_time is not None
+                time.time() - getattr(self, "start_time", None)
+                if getattr(self, "start_time", None) is not None
                 else 0.0
             ),
         }
@@ -1589,6 +1922,12 @@ class Trainer:
         self._best_image_score = float(
             state.get("best_image_score", self._best_image_score)
         )
+        self._best_background_score = float(
+            state.get(
+                "best_background_score",
+                getattr(self, "_best_background_score", -1e9),
+            )
+        )
         self._epochs_since_improve = int(
             state.get("epochs_since_improve", self._epochs_since_improve)
         )
@@ -1606,10 +1945,44 @@ class Trainer:
 
     def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
         lesion, image, combined = self._model_selection_scores(metrics)
+        background_mae = float(
+            metrics.get("val/body_nonlesion_lowpass_mae", float("nan"))
+        )
+        background = (
+            -background_mae if math.isfinite(background_mae) else -1e9
+        )
+        constraint_metrics = {
+            "max_failure_rate": "val/failure_rate",
+            "max_lesion_peak_error_norm": "val/lesion_peak_error_norm",
+            "max_lesion_topq_peak_error_norm": (
+                "val/lesion_topq_peak_error_norm"
+            ),
+        }
+        background_eligible = math.isfinite(background_mae)
+        for config_key, metric_key in constraint_metrics.items():
+            limit = getattr(
+                self,
+                "best_background_constraints",
+                {},
+            ).get(config_key)
+            if limit is None:
+                continue
+            value = float(metrics.get(metric_key, float("nan")))
+            if not math.isfinite(value) or value > float(limit):
+                background_eligible = False
         improvements = {
             "best_lesion": lesion > self._best_lesion_score,
             "best_image": image > self._best_image_score,
             "best_combined": combined > self._best_combined_score,
+            "best_background": (
+                background_eligible
+                and background
+                > getattr(
+                    self,
+                    "_best_background_score",
+                    -1e9,
+                )
+            ),
         }
         combined_improved = improvements["best_combined"]
         if combined_improved:
@@ -1628,6 +2001,8 @@ class Trainer:
             self._best_image_score = image
         if combined_improved:
             self._best_combined_score = combined
+        if improvements["best_background"]:
+            self._best_background_score = background
 
         save_dir = ""
         if self.best_ckpts_enabled:
@@ -1635,21 +2010,41 @@ class Trainer:
             os.makedirs(save_dir, exist_ok=True)
 
         def _save(tag: str, score: float) -> None:
-            if not self.best_ckpts_enabled or not improvements[tag]:
+            enabled_tags = getattr(
+                self,
+                "best_checkpoint_tags",
+                {
+                    "best_lesion",
+                    "best_image",
+                    "best_combined",
+                    "best_background",
+                },
+            )
+            if (
+                not self.best_ckpts_enabled
+                or tag not in enabled_tags
+                or not improvements[tag]
+            ):
                 return
             path = os.path.join(save_dir, f"ckpt_{tag}.pt")
             checkpoint = {
+                # Called inside Trainer.ema_scope(): this state dict already
+                # contains the EMA weights used to compute the selection score.
                 "model": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
-                "ema": self.ema.state_dict(),
                 "epoch": self.epoch_count,
                 "step": self.step_count,
                 "score": score,
                 "metrics": metrics,
                 "config": self.config,
                 "monitoring": self._monitoring_state_dict(),
+                "checkpoint_weights": "ema_materialized_as_model",
             }
+            if not getattr(self, "best_checkpoint_lightweight", False):
+                checkpoint.update({
+                    "optimizer": self.optimizer.state_dict(),
+                    "scheduler": self.scheduler.state_dict(),
+                    "ema": self.ema.state_dict(),
+                })
             _atomic_torch_save(
                 attach_data_lineage(
                     checkpoint, getattr(self, "data_lineage", None)
@@ -1661,6 +2056,7 @@ class Trainer:
         _save("best_lesion", lesion)
         _save("best_image", image)
         _save("best_combined", combined)
+        _save("best_background", background)
         return combined_improved
 
     def _check_early_stopping(self, improved: bool) -> bool:

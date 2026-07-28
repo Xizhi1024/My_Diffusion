@@ -334,17 +334,26 @@ class SLMFBBDM(nn.Module):
         self.conditional_mean_enabled = bool(mean_cfg.get("enabled", False))
         self.residual_bridge_enabled = bool(residual_cfg.get("enabled", False))
         self.residual_frequency_enabled = bool(frequency_cfg.get("enabled", False))
+        self.residual_frequency_frozen = bool(frequency_cfg.get("freeze", False))
         self.residual_frequency_mode = str(frequency_cfg.get("mode", "legacy"))
         dct_descriptor_cfg = frequency_cfg.get("dct_descriptor", {})
         gabor_descriptor_cfg = frequency_cfg.get("gabor_descriptor", {})
         cross_level_router_cfg = frequency_cfg.get("cross_level_router", {})
         ct_support_cfg = frequency_cfg.get("ct_support_head", {})
         self.mean_checkpoint = mean_cfg.get("checkpoint")
+        self.mean_checkpoint_format = str(
+            mean_cfg.get("checkpoint_format", "mean")
+        ).strip().lower()
         self.mean_frozen = bool(mean_cfg.get("freeze", False))
         self.mean_detach_bridge = bool(mean_cfg.get("detach_bridge", True))
         self.mean_loss_weight = float(mean_cfg.get("loss_weight", 1.0))
         self.mean_charbonnier_eps = float(mean_cfg.get("charbonnier_eps", 1e-3))
 
+        if self.mean_checkpoint_format not in {"mean", "full_model"}:
+            raise ValueError(
+                "modules.conditional_mean.checkpoint_format must be "
+                "'mean' or 'full_model'"
+            )
         if self.conditional_mean_enabled and self.mean_frozen and not self.mean_checkpoint:
             raise ValueError(
                 "modules.conditional_mean.freeze=true requires a pretrained checkpoint"
@@ -394,6 +403,23 @@ class SLMFBBDM(nn.Module):
             raise ValueError(
                 "losses.gabor_consistency requires modules.gabor.use_for_loss=true"
             )
+        route_utility_cfg = configured_losses.get(
+            "route_utility_supervision",
+            {},
+        )
+        if (
+            route_utility_cfg.get("enabled", False)
+            and not bool(
+                cross_level_router_cfg.get(
+                    "spatial_destination_enabled",
+                    False,
+                )
+            )
+        ):
+            raise ValueError(
+                "losses.route_utility_supervision requires "
+                "cross_level_router.spatial_destination_enabled=true"
+            )
 
         self.mean_predictor: Optional[nn.Module] = None
         if self.conditional_mean_enabled:
@@ -416,11 +442,6 @@ class SLMFBBDM(nn.Module):
                 )
                 if not isinstance(checkpoint, dict):
                     raise ValueError("Conditional-mean checkpoint must contain a mapping")
-                if checkpoint.get("format_version") not in (1, 2):
-                    raise ValueError(
-                        "Unsupported conditional-mean checkpoint format_version: "
-                        f"{checkpoint.get('format_version')!r}; expected 1 or 2"
-                    )
                 from src.data.lineage import validate_checkpoint_data_lineage
                 validate_checkpoint_data_lineage(
                     checkpoint,
@@ -428,13 +449,34 @@ class SLMFBBDM(nn.Module):
                     required=require_checkpoint_lineage,
                     context=f"conditional-mean checkpoint {checkpoint_path}",
                 )
-                mean_state = checkpoint.get("model")
-                if not isinstance(mean_state, dict):
+                checkpoint_state = checkpoint.get("model")
+                if not isinstance(checkpoint_state, dict):
                     raise ValueError(
                         "Conditional-mean checkpoint is missing the 'model' state dict"
                     )
+                if self.mean_checkpoint_format == "mean":
+                    if checkpoint.get("format_version") not in (1, 2):
+                        raise ValueError(
+                            "Unsupported conditional-mean checkpoint format_version: "
+                            f"{checkpoint.get('format_version')!r}; expected 1 or 2"
+                        )
+                    mean_state = checkpoint_state
+                else:
+                    prefix = "mean_predictor."
+                    mean_state = {
+                        key[len(prefix):]: value
+                        for key, value in checkpoint_state.items()
+                        if key.startswith(prefix)
+                    }
+                    if not mean_state:
+                        raise ValueError(
+                            "Full-model checkpoint contains no 'mean_predictor.*' tensors"
+                        )
                 self.mean_predictor.load_state_dict(mean_state, strict=True)
-                print(f"[SLMF-BBDM] Loaded conditional mean from {checkpoint_path}")
+                print(
+                    "[SLMF-BBDM] Loaded conditional mean "
+                    f"({self.mean_checkpoint_format}) from {checkpoint_path}"
+                )
             if self.mean_frozen:
                 for parameter in self.mean_predictor.parameters():
                     parameter.requires_grad_(False)
@@ -644,12 +686,89 @@ class SLMFBBDM(nn.Module):
                     shallow_projection_init_scale=cross_level_router_cfg.get(
                         "shallow_projection_init_scale", 0.01
                     ),
+                    destination_bootstrap_probability=(
+                        cross_level_router_cfg.get(
+                            "destination_bootstrap_probability",
+                            0.0,
+                        )
+                    ),
+                    destination_probability_floor=(
+                        cross_level_router_cfg.get(
+                            "destination_probability_floor",
+                            0.0,
+                        )
+                    ),
+                    destination_probability_ceiling=(
+                        cross_level_router_cfg.get(
+                            "destination_probability_ceiling",
+                            1.0,
+                        )
+                    ),
+                    spatial_destination_enabled=(
+                        cross_level_router_cfg.get(
+                            "spatial_destination_enabled",
+                            False,
+                        )
+                    ),
+                    spatial_destination_hidden_channels=(
+                        cross_level_router_cfg.get(
+                            "spatial_destination_hidden_channels",
+                            16,
+                        )
+                    ),
+                    spatial_destination_delta_max=(
+                        cross_level_router_cfg.get(
+                            "spatial_destination_delta_max",
+                            3.0,
+                        )
+                    ),
+                    low_frequency_background_enabled=(
+                        frequency_cfg.get(
+                            "low_frequency_background_enabled",
+                            False,
+                        )
+                    ),
+                    low_frequency_gate_max=frequency_cfg.get(
+                        "low_frequency_gate_max",
+                        0.10,
+                    ),
+                    low_frequency_projection_init_scale=(
+                        frequency_cfg.get(
+                            "low_frequency_projection_init_scale",
+                            0.005,
+                        )
+                    ),
                 )
             else:
                 raise ValueError(
                     "modules.residual_frequency.mode must be 'legacy', "
                     "'boundary_reliable', or 'spectral_evidence_router'"
                 )
+        destination_mode = str(
+            cross_level_router_cfg.get("destination_mode", "learned")
+        ).strip().lower()
+        if destination_mode != "learned":
+            if (
+                self.residual_preconditioner is None
+                or self.residual_frequency_mode != "spectral_evidence_router"
+            ):
+                raise ValueError(
+                    "modules.residual_frequency.cross_level_router."
+                    "destination_mode requires the spectral evidence router"
+                )
+            self.residual_preconditioner.set_inference_destination_intervention(
+                destination_mode
+            )
+        self.residual_frequency_destination_mode = destination_mode
+        if self.residual_frequency_frozen:
+            if self.residual_preconditioner is None:
+                raise ValueError(
+                    "modules.residual_frequency.freeze=true requires "
+                    "modules.residual_frequency.enabled=true"
+                )
+            for parameter in self.residual_preconditioner.parameters():
+                parameter.requires_grad_(False)
+            self.residual_preconditioner.eval()
         self._last_frequency_diagnostics: Dict[str, torch.Tensor] = {}
 
         # ---- Metadata FiLM ----
@@ -713,8 +832,43 @@ class SLMFBBDM(nn.Module):
         # ---- Loss stack ----
         loss_cfgs = loss_configs or {}
         self.loss_terms = nn.ModuleDict()
+        self._training_epoch_index = 0
+        self.loss_epoch_ramps: Dict[str, tuple[int, int]] = {}
+        self.loss_epoch_windows: Dict[str, tuple[int, int]] = {}
         for name, cfg in loss_cfgs.items():
             self.loss_terms[name] = self._build_loss(name, cfg)
+            ramp = cfg.get("epoch_warmup")
+            if ramp is not None:
+                if (
+                    not isinstance(ramp, (list, tuple))
+                    or len(ramp) != 2
+                ):
+                    raise ValueError(
+                        f"losses.{name}.epoch_warmup must be [start, end]"
+                    )
+                start, end = int(ramp[0]), int(ramp[1])
+                if start < 1 or end < start:
+                    raise ValueError(
+                        f"losses.{name}.epoch_warmup must satisfy "
+                        "1 <= start <= end"
+                    )
+                self.loss_epoch_ramps[name] = (start, end)
+            window = cfg.get("epoch_window")
+            if window is not None:
+                if (
+                    not isinstance(window, (list, tuple))
+                    or len(window) != 2
+                ):
+                    raise ValueError(
+                        f"losses.{name}.epoch_window must be [start, end]"
+                    )
+                start, end = int(window[0]), int(window[1])
+                if start < 1 or end < start:
+                    raise ValueError(
+                        f"losses.{name}.epoch_window must satisfy "
+                        "1 <= start <= end"
+                    )
+                self.loss_epoch_windows[name] = (start, end)
 
         # ---- Condition dropout ----
         drop_cfg = condition_dropout_config or {}
@@ -728,11 +882,36 @@ class SLMFBBDM(nn.Module):
         )
 
     def train(self, mode: bool = True) -> SLMFBBDM:
-        """Set training mode while keeping a frozen conditional mean deterministic."""
+        """Set training mode while keeping frozen auxiliary modules deterministic."""
         super().train(mode)
         if self.mean_frozen and self.mean_predictor is not None:
             self.mean_predictor.eval()
+        if (
+            self.residual_frequency_frozen
+            and self.residual_preconditioner is not None
+        ):
+            self.residual_preconditioner.eval()
         return self
+
+    def set_training_epoch(self, epoch_index: int) -> None:
+        """Set the 0-based epoch used by true epoch-wise loss curricula."""
+
+        self._training_epoch_index = max(int(epoch_index), 0)
+
+    def _loss_epoch_scale(self, name: str) -> float:
+        epoch = self._training_epoch_index + 1
+        window = self.loss_epoch_windows.get(name)
+        if window is not None and not window[0] <= epoch <= window[1]:
+            return 0.0
+        ramp = self.loss_epoch_ramps.get(name)
+        if ramp is None:
+            return 1.0
+        start, end = ramp
+        if epoch < start:
+            return 0.0
+        if end == start or epoch >= end:
+            return 1.0
+        return float(epoch - start) / float(end - start)
 
     # ------------------------------------------------------------------
     # Builder helpers
@@ -945,6 +1124,49 @@ class SLMFBBDM(nn.Module):
                 active_tau_max=cfg.get("active_tau_max", 0.7),
                 enabled=enabled, weight=weight,
             )
+        elif name == "nonlesion_body_lowpass":
+            from .loss_terms.nonlesion_body_lowpass import (
+                NonLesionBodyLowpassLoss,
+            )
+            return NonLesionBodyLowpassLoss(
+                sigma=cfg.get("sigma", 4.0),
+                body_threshold=cfg.get("body_threshold", 0.03),
+                body_closing_radius=cfg.get("body_closing_radius", 2),
+                lesion_exclusion_radius=cfg.get(
+                    "lesion_exclusion_radius", 8
+                ),
+                tail_quantile=cfg.get("tail_quantile", 0.75),
+                tail_weight=cfg.get("tail_weight", 2.0),
+                tail_temperature=cfg.get("tail_temperature", 0.02),
+                charbonnier_eps=cfg.get("charbonnier_eps", 1.0e-3),
+                active_tau_max=cfg.get("active_tau_max", 0.70),
+                enabled=enabled,
+                weight=weight,
+            )
+        elif name == "route_utility_supervision":
+            from .loss_terms.route_utility_supervision import (
+                RouteUtilitySupervisionLoss,
+            )
+            return RouteUtilitySupervisionLoss(
+                lesion_dilate_radius=cfg.get(
+                    "lesion_dilate_radius",
+                    3,
+                ),
+                spatial_weight=cfg.get("spatial_weight", 1.0),
+                global_weight=cfg.get("global_weight", 0.25),
+                spatial_tv_weight=cfg.get(
+                    "spatial_tv_weight",
+                    1.0e-3,
+                ),
+                positive_weight=cfg.get("positive_weight", 4.0),
+                background_target=cfg.get("background_target", 0.02),
+                lesion_target=cfg.get("lesion_target", 0.90),
+                global_target_min=cfg.get("global_target_min", 0.05),
+                global_target_max=cfg.get("global_target_max", 0.55),
+                active_tau_max=cfg.get("active_tau_max", 0.70),
+                enabled=enabled,
+                weight=weight,
+            )
         elif name == "outside_peak_ranking":
             from .loss_terms.lesion_roi import OutsidePeakRankingLoss
             return OutsidePeakRankingLoss(
@@ -1144,6 +1366,15 @@ class SLMFBBDM(nn.Module):
                 router_confidence=router_confidence,
             )
             self._last_frequency_diagnostics = diagnostics
+            for level in (2, 1):
+                spatial_key = (
+                    f"route_spatial_conditional_shallow_l{level}"
+                )
+                spatial_route = diagnostics.get(spatial_key)
+                if spatial_route is not None:
+                    condition.maps[
+                        f"spectral_route_spatial_shallow_l{level}"
+                    ] = spatial_route
             condition.scalars["frequency_gate_tv"] = diagnostics["gate_tv"]
             condition.scalars["spectral_route_temporal_smoothness"] = diagnostics[
                 "route_temporal_smoothness"
@@ -1482,10 +1713,20 @@ class SLMFBBDM(nn.Module):
 
         # Pluggable loss terms
         for name, term in self.loss_terms.items():
+            epoch_scale = self._loss_epoch_scale(name)
+            if epoch_scale <= 0.0:
+                logs[f"loss/{name}/enabled"] = x0.new_tensor(
+                    float(term.enabled)
+                )
+                logs[f"loss/{name}/epoch_scale"] = x0.new_zeros(())
+                continue
             loss_val, loss_logs = term(ctx)
-            total_loss = total_loss + loss_val
+            total_loss = total_loss + epoch_scale * loss_val
             for k, v in loss_logs.items():
                 logs[f"loss/{k}"] = v.detach() if torch.is_tensor(v) else v
+            logs[f"loss/{name}/epoch_scale"] = x0.new_tensor(
+                epoch_scale
+            )
 
         logs["loss/total"] = total_loss.detach()
 
@@ -1515,6 +1756,15 @@ class SLMFBBDM(nn.Module):
         )
         logs["module/residual_frequency"] = torch.tensor(
             1.0 if self.residual_frequency_enabled else 0.0, device=device
+        )
+        logs["module/residual_frequency_frozen"] = torch.tensor(
+            1.0 if self.residual_frequency_frozen else 0.0, device=device
+        )
+        logs["module/residual_frequency_native_only"] = torch.tensor(
+            1.0
+            if self.residual_frequency_destination_mode == "native_only"
+            else 0.0,
+            device=device,
         )
         if self.residual_frequency_mode == "boundary_reliable":
             for level, key in ((2, "gates_l2"), (1, "gates_l1")):
@@ -1673,6 +1923,27 @@ class SLMFBBDM(nn.Module):
                 rms_val = self._last_frequency_diagnostics.get(f"injection/l{lvl}_rms")
                 if rms_val is not None:
                     logs[f"frequency/injection_l{lvl}_rms"] = rms_val.detach()
+            for diagnostic_key, log_key in (
+                ("effective/native_l2_rms", "effective_native_l2_rms"),
+                ("effective/native_l1_rms", "effective_native_l1_rms"),
+                (
+                    "effective/shallow_l2_to_l1_rms",
+                    "effective_shallow_l2_to_l1_rms",
+                ),
+                (
+                    "effective/shallow_l1_to_l0_rms",
+                    "effective_shallow_l1_to_l0_rms",
+                ),
+                (
+                    "effective/low_frequency_l1_rms",
+                    "effective_low_frequency_l1_rms",
+                ),
+                ("route_spatial_l2_std", "route_spatial_l2_std"),
+                ("route_spatial_l1_std", "route_spatial_l1_std"),
+            ):
+                value = self._last_frequency_diagnostics.get(diagnostic_key)
+                if value is not None:
+                    logs[f"frequency/{log_key}"] = value.detach()
             # Gate TV
             gate_tv = self._last_frequency_diagnostics.get("gate_tv")
             if gate_tv is not None:

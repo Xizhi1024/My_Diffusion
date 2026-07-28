@@ -700,6 +700,13 @@ def _select_checkpoint_state(
     if weights != "ema":
         raise ValueError(f"Unknown checkpoint weights: {weights!r}")
 
+    if checkpoint.get("checkpoint_weights") == "ema_materialized_as_model":
+        if not isinstance(raw_state, dict):
+            raise ValueError(
+                "EMA-materialized checkpoint is missing the 'model' state dict"
+            )
+        return raw_state, "model (ema_materialized)"
+
     for key in ("ema_model", "model_ema"):
         state = checkpoint.get(key)
         if isinstance(state, dict):

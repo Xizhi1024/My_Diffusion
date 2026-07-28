@@ -1,0 +1,292 @@
+# Optimizer-fresh background repair from the balanced Epoch 100 EMA weights.
+#
+# The same-checkpoint audit showed no meaningful destination-head contribution,
+# so the spectral module is frozen and shallow routing is forced off.  The new
+# loss supervises the CT-body, non-lesion low-frequency PET field and softly
+# upweights the target's upper physiological-uptake quartile.
+#
+# Cloud command (from repository root):
+#   pixi run python -u scripts/train_v2.py --config configs/experiments/slmf_png_background_tail_repair_e100.yaml
+
+experiment:
+  name: slmf_png_background_tail_repair_e100
+  seed: 42
+
+data:
+  mode: png
+  cache_dir: cache/tensors_main
+  cache_lineage: cache/tensors_main/cache_lineage.json
+  dataset_contract: configs/dataset_contract_stage0a_v1.json
+  split_manifest: main_data/split_manifest.csv
+  require_cache_lineage: true
+  use_fake_data: false
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys: [ct, pet, mask]
+  optional_keys: []
+
+runtime:
+  device: cuda
+  require_cuda: true
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 5
+  eval_num_samples: 64
+  eval_sample_batch_size: 4
+  eval_seed: 42
+  dataloader_seed: 42
+  eval_sampling_steps: 50
+  sample_interval: 5
+  # The lightweight best-background checkpoint is the only model artifact.
+  # No numbered full-state checkpoint is emitted during this 50-epoch run.
+  save_interval: 999
+  tracked_sample_ids: []
+  gradient_diagnostics: false
+  best_checkpoint:
+    enabled: true
+    lightweight: true
+    combined_alpha: 0.5
+    stripe_penalty: 0.3
+    save_tags: [best_background]
+    # Save the lowest-background-MAE checkpoint only if it remains within the
+    # predeclared Epoch-100/50-step lesion non-inferiority envelope.
+    background_constraints:
+      max_failure_rate: 0.265625
+      max_lesion_peak_error_norm: 0.1365
+      max_lesion_topq_peak_error_norm: 0.1720
+  # This run covers only the effective Epoch 101-150 repair window. Keep the
+  # full trajectory and select by the saved background/lesion checkpoints.
+  early_stopping:
+    enabled: false
+    patience: 50
+    min_epochs: 50
+
+training:
+  stage: background_tail_repair
+  num_epochs: 50
+  checkpoint_dir: results/background_tail_repair_e100/checkpoints
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  lr_min: 1.0e-6
+  init_from: results/prior_anchored_router_300e/checkpoints/ckpt_epoch0100.pt
+  init_weights: ema
+  resume_from: null
+  optimizer_groups:
+    enabled: false
+  ema:
+    decay: 0.995
+    update_every: 1
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  conditional_mean:
+    enabled: true
+    levels: 2
+    base_channels: 32
+    loss_weight: 0.0
+    charbonnier_eps: 1.0e-3
+    detach_bridge: true
+    freeze: true
+    checkpoint: checkpoints/freq_mean_excluded_v1/mean_best.pt
+
+  residual_bridge:
+    enabled: true
+
+  wavelet_unet:
+    enabled: false
+
+  residual_frequency:
+    enabled: true
+    freeze: true
+    mode: spectral_evidence_router
+    output_channels: [256, 256, 128, 64]
+    band_scales: [0.5, 0.25]
+    use_noise_release: true
+    use_ct_reliability: true
+    use_content_reliability: true
+    use_subband_gates: true
+    use_directional_reliability: false
+    use_gabor_gate: false
+    ct_reliability_floor_l2: 0.25
+    ct_reliability_floor_l1: 0.50
+    use_gabor_agreement: false
+    gabor_agreement_alpha: 0.10
+    gabor_agreement_l2: false
+    gabor_agreement_l1: true
+    detach_gabor_descriptor: true
+    gabor_orientations: 8
+    gate_max: 0.25
+    snr_center: 0.0
+    snr_temperature: 2.0
+    cross_temperature: 1.0
+    content_hidden_channels: 16
+    amplitude_delta_min: -0.05
+    amplitude_delta_max: 0.10
+    dct_descriptor:
+      enabled: true
+      pooled_size: 8
+      selected_frequencies: 12
+    gabor_descriptor:
+      enabled: true
+    cross_level_router:
+      enabled: true
+      hidden_channels: 32
+      hard_all_null: false
+      policy: prior_anchored_learned
+      # Audit-selected intervention: preserve H3 active/null availability and
+      # send every active packet to its native level.
+      destination_mode: native_only
+      fixed_prior: [0.05, 0.05, 0.90]
+      h3_schedule_path: results/prior_anchored_router_100e/runs/run-20260726T133123.363531Z/prior/h3_prior_preview.json
+      h3_schedule_sha256: dfe9a5627cf12417396387f6ea595ef18dbedd46e9b13467555516d0cbf82611
+      h3_schedule_source: direct_png_preview
+      h3_repository_root: .
+      h3_allow_unverified_preview_lineage: true
+      initial_null_probability: 0.90
+      active_logit_delta_max: 2.0
+      initial_destination_native_probability: 0.95
+      # Fine-tuning restarts its local epoch counter at one. Keep adaptive
+      # availability closed for this entire 50-epoch repair window.
+      prior_warmup_epochs: 100
+      prior_active_ramp_epochs: 10
+      prior_destination_warmup_epochs: 110
+      prior_destination_ramp_epochs: 10
+      prior_anchor_decay_end_epoch: 150
+      prior_anchor_final_scale: 0.10
+      shallow_projection_init_scale: 0.01
+      phase_observation_epochs: [1, 25, 50]
+
+  gabor:
+    enabled: true
+    scales: 4
+    orientations: 8
+    kernel_size: 15
+    parameter_delta: 0.25
+    inject_adapter: false
+    use_for_noise: false
+    use_for_hotspot: false
+    use_for_loss: false
+
+  organ_prior:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  semantic_prior:
+    enabled: false
+  zero_adapter:
+    enabled: false
+  condition_dropout:
+    enabled: false
+  bbdm_bridge:
+    name: bbdm_bridge
+    num_train_timesteps: 1000
+    m_schedule: linear
+
+losses:
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+  topk_lesion:
+    enabled: true
+    weight: 0.15
+    topk_percent: 0.10
+    active_tau_max: 0.40
+  normalized_lesion_peak:
+    enabled: true
+    weight: 0.10
+    topk_percent: 0.10
+    min_k: 3
+    max_k: 16
+    beta: 0.02
+    active_tau_max: 0.40
+    cold_weight: 1.0
+    cold_tolerance: 0.02
+
+  nonlesion_body_lowpass:
+    enabled: true
+    weight: 0.20
+    sigma: 4.0
+    body_threshold: 0.03
+    body_closing_radius: 2
+    lesion_exclusion_radius: 8
+    tail_quantile: 0.75
+    tail_weight: 2.0
+    tail_temperature: 0.02
+    charbonnier_eps: 1.0e-3
+    active_tau_max: 0.70
+
+  outside_peak_ranking:
+    enabled: false
+    weight: 0.1
+  boundary_frequency:
+    enabled: false
+    weight: 0.05
+  frequency_gate_tv:
+    enabled: false
+    weight: 0.001
+  # Router is frozen and native-only; its regularizers would be constant.
+  spectral_router_regularization:
+    enabled: false
+    weight: 1.0
+  residual_wavelet:
+    enabled: false
+    weight: 0.05
+  gabor_consistency:
+    enabled: false
+    weight: 0.02
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false
+  roi_suv:
+    enabled: false
+  organ_consistency:
+    enabled: false
+  false_hotspot:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  heteroscedastic_nll:
+    enabled: false
+  segmenter_consistency:
+    enabled: false
+
+metadata:
+  enabled: false
+segmenter:
+  enabled: false
+
+evaluation:
+  mc_samples: 1
+  physical_suv_available: false
+  small_lesion_quantile: 0.25
+  small_lesion_underestimate_tolerance: 0.05
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

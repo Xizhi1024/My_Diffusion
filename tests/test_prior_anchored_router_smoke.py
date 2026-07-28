@@ -432,6 +432,41 @@ def test_prior_anchored_router_end_to_end_on_cpu(tmp_path: Path) -> None:
     assert not Path("checkpoints/prior_anchored_smoke").exists()
 
 
+def test_background_repair_freezes_router_and_forces_native_destination(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path
+    prior_path = _write_preview(repo_root)
+    config = _smoke_config(repo_root, prior_path)
+    frequency = config["modules"]["residual_frequency"]
+    frequency["freeze"] = True
+    frequency["cross_level_router"]["destination_mode"] = "native_only"
+    config["losses"]["spectral_router_regularization"]["enabled"] = False
+    config["losses"]["nonlesion_body_lowpass"] = {
+        "enabled": True,
+        "weight": 0.2,
+        "sigma": 2.0,
+        "body_threshold": 0.03,
+        "lesion_exclusion_radius": 4,
+        "tail_quantile": 0.75,
+        "tail_weight": 2.0,
+    }
+
+    from src.model.slmf_bbdm import SLMFBBDM
+
+    model = SLMFBBDM.from_config(config)
+    router = model.residual_preconditioner
+
+    assert model.residual_frequency_frozen is True
+    assert model.residual_frequency_destination_mode == "native_only"
+    assert router.inference_destination_mode == "native_only"
+    assert all(not parameter.requires_grad for parameter in router.parameters())
+    assert model.loss_terms["nonlesion_body_lowpass"].enabled is True
+
+    model.train()
+    assert router.training is False
+
+
 def test_smoke_prior_load_is_fail_closed_against_hash_tamper(tmp_path: Path) -> None:
     """The smoke prior loader must reject a tampered SHA-256."""
     from src.model.frequency.prior_anchor_schedule import load_prior_anchor_schedule
@@ -449,3 +484,199 @@ def test_smoke_prior_load_is_fail_closed_against_hash_tamper(tmp_path: Path) -> 
             repository_root=tmp_path,
             allow_unverified_preview_lineage=True,
         )
+
+
+def test_prior_destination_inference_interventions_preserve_availability(
+    tmp_path: Path,
+) -> None:
+    prior_path = _write_preview(tmp_path)
+    model = _build_model(tmp_path, prior_path)
+    router = model.residual_preconditioner
+    router.set_training_epoch(5)
+
+    residual = torch.randn(3, 1, 32, 32)
+    ct = torch.randn_like(residual)
+    timestep = torch.tensor([20, 20, 20])
+    state_before = {
+        key: value.detach().clone()
+        for key, value in router.state_dict().items()
+    }
+
+    router.set_inference_destination_intervention("learned")
+    _, learned = router(
+        residual,
+        timestep,
+        model.noise_schedule,
+        ct,
+    )
+    learned_active = learned["route_active"].detach().clone()
+
+    router.set_inference_destination_intervention("native_only")
+    _, native_only = router(
+        residual,
+        timestep,
+        model.noise_schedule,
+        ct,
+    )
+    torch.testing.assert_close(native_only["route_active"], learned_active)
+    assert torch.count_nonzero(
+        native_only["route_conditional_shallow"]
+    ).item() == 0
+    torch.testing.assert_close(
+        native_only["routes_l2"][..., 0],
+        learned_active[:, 0],
+    )
+    torch.testing.assert_close(
+        native_only["routes_l1"][..., 0],
+        learned_active[:, 1],
+    )
+
+    fixed_l2 = (0.20, 0.30, 0.40)
+    fixed_l1 = (0.05, 0.06, 0.07)
+    router.set_inference_destination_intervention(
+        "fixed",
+        fixed_l2=fixed_l2,
+        fixed_l1=fixed_l1,
+    )
+    _, fixed = router(
+        residual,
+        timestep,
+        model.noise_schedule,
+        ct,
+    )
+    torch.testing.assert_close(fixed["route_active"], learned_active)
+    torch.testing.assert_close(
+        fixed["route_conditional_shallow"][:, 0],
+        torch.tensor(fixed_l2).view(1, 3).expand(3, 3),
+    )
+    torch.testing.assert_close(
+        fixed["route_conditional_shallow"][:, 1],
+        torch.tensor(fixed_l1).view(1, 3).expand(3, 3),
+    )
+    torch.testing.assert_close(
+        fixed["routes_l2"].sum(dim=-1),
+        torch.ones(3, 3),
+    )
+    torch.testing.assert_close(
+        fixed["routes_l1"].sum(dim=-1),
+        torch.ones(3, 3),
+    )
+
+    router.set_inference_destination_intervention(
+        "shuffled_destination",
+        shuffle_seed=17,
+    )
+    _, shuffled = router(
+        residual,
+        timestep,
+        model.noise_schedule,
+        ct,
+    )
+    torch.testing.assert_close(shuffled["route_active"], learned_active)
+    assert shuffled["routes_l2"].shape == learned["routes_l2"].shape
+    assert router.inference_destination_intervention() == {
+        "mode": "shuffled_destination",
+        "shuffle_seed": 17,
+    }
+
+    state_after = router.state_dict()
+    assert state_after.keys() == state_before.keys()
+    for key, value in state_before.items():
+        torch.testing.assert_close(state_after[key], value)
+
+
+def test_router_background_suite_runs_all_interventions_on_cpu(
+    tmp_path: Path,
+) -> None:
+    from scripts.eval_router_background_suite import _main, build_parser
+
+    prior_path = _write_preview(tmp_path)
+    config = _smoke_config(tmp_path, prior_path)
+    config["data"]["use_fake_data"] = True
+    config["data"]["require_cache_lineage"] = False
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(config, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    model = _build_model(tmp_path, prior_path)
+    model.residual_preconditioner.set_training_epoch(5)
+    checkpoint_path = tmp_path / "ckpt_epoch0005.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "epoch": 5,
+            "step": 10,
+            "config": config,
+        },
+        checkpoint_path,
+    )
+    fixed_values = {
+        "frequency/prior_anchor_l2_lh_conditional_shallow": 0.20,
+        "frequency/prior_anchor_l2_hl_conditional_shallow": 0.30,
+        "frequency/prior_anchor_l2_hh_conditional_shallow": 0.40,
+        "frequency/prior_anchor_l1_lh_conditional_shallow": 0.05,
+        "frequency/prior_anchor_l1_hl_conditional_shallow": 0.06,
+        "frequency/prior_anchor_l1_hh_conditional_shallow": 0.07,
+    }
+    metrics_path = tmp_path / "training_metrics.jsonl"
+    metrics_path.write_text(
+        json.dumps({"epoch": 5, "train": fixed_values}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "suite"
+    args = build_parser().parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--checkpoint",
+            str(checkpoint_path),
+            "--metrics",
+            str(metrics_path),
+            "--weights",
+            "raw",
+            "--device",
+            "cpu",
+            "--max-samples",
+            "2",
+            "--batch-size",
+            "2",
+            "--steps",
+            "1",
+            "--modes",
+            "learned",
+            "--frequency-modes",
+            "full,detail_off,ll_off,all_frequency_off",
+            "--grid-samples",
+            "0",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert _main(args) == 0
+    summary = json.loads(
+        (output_dir / "suite_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["manifest"]["schema_version"] == 2
+    assert summary["manifest"]["frequency_modes"] == [
+        "full",
+        "detail_off",
+        "ll_off",
+        "all_frequency_off",
+    ]
+    assert len(summary["runs"]) == 4
+    assert {
+        row["frequency_mode"] for row in summary["runs"]
+    } == {
+        "full",
+        "detail_off",
+        "ll_off",
+        "all_frequency_off",
+    }
+    assert {row["mode"] for row in summary["runs"]} == {"learned"}
+    assert (output_dir / "paired_comparisons_vs_learned.csv").is_file()
+    assert (
+        output_dir / "paired_comparisons_vs_learned_full.csv"
+    ).is_file()

@@ -156,6 +156,46 @@ class BoundedActiveLogitDeltaHead(nn.Module):
         return self.maximum_absolute_delta * torch.tanh(raw)
 
 
+class SpatialDestinationDeltaHead(nn.Module):
+    """Predict a zero-mean spatial correction to global destination logits.
+
+    The global head controls the patient/band operating point.  Removing the
+    spatial mean prevents this head from becoming a second global bias while
+    still allowing lesion-local and background-local routing to differ.
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int = 16,
+        maximum_absolute_delta: float = 3.0,
+    ) -> None:
+        super().__init__()
+        if hidden_channels <= 0:
+            raise ValueError("spatial hidden_channels must be positive")
+        if maximum_absolute_delta <= 0:
+            raise ValueError("spatial maximum_absolute_delta must be positive")
+        self.maximum_absolute_delta = float(maximum_absolute_delta)
+        self.features = nn.Sequential(
+            nn.Conv2d(6, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.final = nn.Conv2d(hidden_channels, 3, kernel_size=1)
+        nn.init.zeros_(self.final.weight)
+        nn.init.zeros_(self.final.bias)
+
+    def forward(self, evidence: torch.Tensor) -> torch.Tensor:
+        raw = self.final(self.features(evidence))
+        bounded = torch.tanh(raw)
+        bounded = bounded - bounded.mean(dim=(-2, -1), keepdim=True)
+        # Mean removal can make the absolute range slightly larger than one.
+        # A per-map positive rescale preserves the exact zero mean while
+        # enforcing the configured logit-delta bound.
+        maximum = bounded.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        return self.maximum_absolute_delta * bounded / maximum
+
+
 class UncertaintyAwareRouteSelector(nn.Module):
     """Abstain to a frozen H3 route schedule when evidence is uncertain.
 
@@ -322,6 +362,15 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         active_logit_delta_max: float = 2.0,
         initial_destination_native_probability: float = 0.95,
         shallow_projection_init_scale: float = 0.01,
+        destination_bootstrap_probability: float = 0.0,
+        destination_probability_floor: float = 0.0,
+        destination_probability_ceiling: float = 1.0,
+        spatial_destination_enabled: bool = False,
+        spatial_destination_hidden_channels: int = 16,
+        spatial_destination_delta_max: float = 3.0,
+        low_frequency_background_enabled: bool = False,
+        low_frequency_gate_max: float = 0.10,
+        low_frequency_projection_init_scale: float = 0.005,
         **base_kwargs,
     ) -> None:
         if hidden_channels <= 0:
@@ -371,6 +420,32 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         if not 0.5 < initial_destination_native_probability < 1.0:
             raise ValueError(
                 "initial_destination_native_probability must be in (0.5, 1)"
+            )
+        if not 0.0 <= destination_bootstrap_probability <= 1.0:
+            raise ValueError(
+                "destination_bootstrap_probability must be in [0, 1]"
+            )
+        if not (
+            0.0
+            <= destination_probability_floor
+            < destination_probability_ceiling
+            <= 1.0
+        ):
+            raise ValueError(
+                "destination probability bounds must satisfy "
+                "0 <= floor < ceiling <= 1"
+            )
+        if spatial_destination_hidden_channels <= 0:
+            raise ValueError(
+                "spatial_destination_hidden_channels must be positive"
+            )
+        if spatial_destination_delta_max <= 0:
+            raise ValueError("spatial_destination_delta_max must be positive")
+        if not 0.0 < low_frequency_gate_max <= 0.5:
+            raise ValueError("low_frequency_gate_max must be in (0, 0.5]")
+        if low_frequency_projection_init_scale < 0:
+            raise ValueError(
+                "low_frequency_projection_init_scale must be non-negative"
             )
         if ct_support_band not in {"l2_lh", "l2_hl", "l2_hh"}:
             raise ValueError("ct_support_band must be an L2 Haar detail band")
@@ -423,6 +498,20 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             initial_destination_native_probability
         )
         self.shallow_projection_init_scale = float(shallow_projection_init_scale)
+        self.destination_bootstrap_probability = float(
+            destination_bootstrap_probability
+        )
+        self.destination_probability_floor = float(
+            destination_probability_floor
+        )
+        self.destination_probability_ceiling = float(
+            destination_probability_ceiling
+        )
+        self.spatial_destination_enabled = bool(spatial_destination_enabled)
+        self.low_frequency_background_enabled = bool(
+            low_frequency_background_enabled
+        )
+        self.low_frequency_gate_max = float(low_frequency_gate_max)
 
         # Resolve effective policy when legacy flags are used
         effective_policy = self._resolve_policy()
@@ -499,6 +588,20 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 )
                 for _ in range(2)
             )
+        self.spatial_destination_heads = nn.ModuleList()
+        if self.spatial_destination_enabled:
+            if effective_policy != "prior_anchored_learned":
+                raise ValueError(
+                    "spatial_destination_enabled requires "
+                    "route_policy='prior_anchored_learned'"
+                )
+            self.spatial_destination_heads.extend(
+                SpatialDestinationDeltaHead(
+                    hidden_channels=spatial_destination_hidden_channels,
+                    maximum_absolute_delta=spatial_destination_delta_max,
+                )
+                for _ in range(2)
+            )
 
         # Replace base-class _ZeroProjection heads with bias-free variants.
         # The base class stores them as self.projection_heads[0..2]; we rebuild.
@@ -525,6 +628,13 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         self.l2_to_l1_projection = BiasFreeZeroProjection(
             1, self.output_channels[2], init_scale=shallow_init
         )
+        self.low_frequency_projection: Optional[BiasFreeZeroProjection] = None
+        if self.low_frequency_background_enabled:
+            self.low_frequency_projection = BiasFreeZeroProjection(
+                2,
+                self.output_channels[2],
+                init_scale=float(low_frequency_projection_init_scale),
+            )
 
         # Build fixed-route buffers for non-learned policies
         self.register_buffer(
@@ -607,6 +717,23 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 persistent=True,
             )
 
+        # Inference-only destination interventions used by the same-checkpoint
+        # mechanism audit.  These host-side values are deliberately absent from
+        # the state dict: loading a checkpoint must never alter the requested
+        # evaluation intervention, and selecting an intervention must never
+        # mutate learned weights.
+        self._inference_destination_mode = "learned"
+        self._inference_fixed_destination: tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ] | None = None
+        self._inference_destination_shuffle_seed = 0
+        self._inference_frequency_mode = "full"
+        self._inference_route_actions: tuple[
+            tuple[str, str, str],
+            tuple[str, str, str],
+        ] | None = None
+
         # Uncertainty-aware route selector (H4-v2 interface).  OFF by default;
         # when enabled it abstains element-wise to a frozen fixed-policy route
         # whenever the externally-supplied per-(level, band) confidence is below
@@ -653,6 +780,225 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
     @property
     def routing_progress(self) -> float:
         return self._routing_progress_value
+
+    @property
+    def inference_destination_mode(self) -> str:
+        """Return the active inference-only destination intervention."""
+        return self._inference_destination_mode
+
+    @staticmethod
+    def _validate_fixed_destination(
+        values: Sequence[float],
+        *,
+        label: str,
+    ) -> tuple[float, float, float]:
+        converted = tuple(float(value) for value in values)
+        if len(converted) != 3:
+            raise ValueError(f"{label} must contain LH/HL/HH values")
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in converted):
+            raise ValueError(f"{label} values must be finite and in [0, 1]")
+        return converted
+
+    def set_inference_destination_intervention(
+        self,
+        mode: str = "learned",
+        *,
+        fixed_l2: Optional[Sequence[float]] = None,
+        fixed_l1: Optional[Sequence[float]] = None,
+        shuffle_seed: int = 0,
+    ) -> None:
+        """Override only the destination decision during inference.
+
+        ``active`` and ``1-active`` remain exactly as produced by the loaded
+        prior-anchored checkpoint.  The intervention therefore isolates the
+        native-vs-shallow destination head without changing availability,
+        projection weights, amplitudes, or the H3 schedule.
+        """
+        allowed = {"learned", "native_only", "fixed", "shuffled_destination"}
+        normalized = str(mode).strip().lower()
+        if normalized not in allowed:
+            raise ValueError(
+                f"Unknown destination intervention {mode!r}; expected one of "
+                f"{sorted(allowed)}"
+            )
+        if (
+            normalized != "learned"
+            and self._effective_policy != "prior_anchored_learned"
+        ):
+            raise RuntimeError(
+                "Destination interventions require "
+                "policy='prior_anchored_learned'"
+            )
+        fixed = None
+        if normalized == "fixed":
+            if fixed_l2 is None or fixed_l1 is None:
+                raise ValueError("fixed mode requires both fixed_l2 and fixed_l1")
+            fixed = (
+                self._validate_fixed_destination(fixed_l2, label="fixed_l2"),
+                self._validate_fixed_destination(fixed_l1, label="fixed_l1"),
+            )
+        elif fixed_l2 is not None or fixed_l1 is not None:
+            raise ValueError("fixed destination values are valid only in fixed mode")
+        self._inference_destination_mode = normalized
+        self._inference_fixed_destination = fixed
+        self._inference_destination_shuffle_seed = int(shuffle_seed)
+
+    def inference_destination_intervention(self) -> Dict[str, object]:
+        """Return a JSON-serialisable description of the active intervention."""
+        payload: Dict[str, object] = {
+            "mode": self._inference_destination_mode,
+            "shuffle_seed": self._inference_destination_shuffle_seed,
+        }
+        if self._inference_fixed_destination is not None:
+            payload["fixed_l2"] = list(self._inference_fixed_destination[0])
+            payload["fixed_l1"] = list(self._inference_fixed_destination[1])
+        return payload
+
+    @staticmethod
+    def _validate_route_actions(
+        values: Sequence[str],
+        *,
+        label: str,
+    ) -> tuple[str, str, str]:
+        converted = tuple(str(value).strip().lower() for value in values)
+        if len(converted) != 3:
+            raise ValueError(f"{label} must contain LH/HL/HH actions")
+        allowed = {"learned", "native", "shallow", "null"}
+        unknown = sorted(set(converted).difference(allowed))
+        if unknown:
+            raise ValueError(
+                f"{label} contains unknown route actions {unknown}; "
+                f"expected actions from {sorted(allowed)}"
+            )
+        return converted
+
+    def set_inference_route_action_intervention(
+        self,
+        *,
+        actions_l2: Optional[Sequence[str]] = None,
+        actions_l1: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Apply exact per-(level, band) route actions during inference.
+
+        The action order for each level is ``LH, HL, HH``.  ``native``,
+        ``native`` and ``shallow`` preserve the checkpoint's active mass while
+        assigning all of it to the requested destination.  ``null`` sets active
+        mass to zero.  The override is applied after learned spatial
+        redistribution; ``learned`` preserves the checkpoint route for that
+        band.  Passing both arguments as ``None`` clears the intervention.
+
+        These host-side values are intentionally absent from ``state_dict``.
+        They are intended only for same-checkpoint counterfactual and oracle
+        evaluation.
+        """
+
+        if actions_l2 is None and actions_l1 is None:
+            self._inference_route_actions = None
+            return
+        if actions_l2 is None or actions_l1 is None:
+            raise ValueError(
+                "route action intervention requires both actions_l2 and "
+                "actions_l1, or neither to clear it"
+            )
+        self._inference_route_actions = (
+            self._validate_route_actions(actions_l2, label="actions_l2"),
+            self._validate_route_actions(actions_l1, label="actions_l1"),
+        )
+
+    def inference_route_action_intervention(self) -> Dict[str, object]:
+        """Return the exact per-band route-action intervention."""
+
+        if self._inference_route_actions is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "actions_l2": list(self._inference_route_actions[0]),
+            "actions_l1": list(self._inference_route_actions[1]),
+            "band_order": ["LH", "HL", "HH"],
+        }
+
+    def _apply_route_action_intervention(
+        self,
+        *,
+        route_native: torch.Tensor,
+        route_shallow: torch.Tensor,
+        level_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        actions = self._inference_route_actions
+        if actions is None:
+            return route_native, route_shallow
+
+        level_actions = actions[level_index]
+        device = route_native.device
+        dtype = route_native.dtype
+        shape = (1, 3, 1, 1)
+        active = route_native + route_shallow
+        keep = torch.tensor(
+            [action == "learned" for action in level_actions],
+            device=device,
+            dtype=dtype,
+        ).view(shape)
+        force_native = torch.tensor(
+            [action == "native" for action in level_actions],
+            device=device,
+            dtype=dtype,
+        ).view(shape)
+        force_shallow = torch.tensor(
+            [action == "shallow" for action in level_actions],
+            device=device,
+            dtype=dtype,
+        ).view(shape)
+        return (
+            keep * route_native + force_native * active,
+            keep * route_shallow + force_shallow * active,
+        )
+
+    @property
+    def inference_frequency_mode(self) -> str:
+        """Return the active inference-only frequency-branch intervention."""
+        return self._inference_frequency_mode
+
+    def set_inference_frequency_intervention(
+        self,
+        mode: str = "full",
+    ) -> None:
+        """Select which frequency branches may enter the decoder skips.
+
+        This same-checkpoint mechanism audit changes no weights, route
+        probabilities, amplitudes, or projection computations:
+
+        ``full``
+            Keep routed Haar detail and the unrouted LL branch.
+        ``detail_off``
+            Zero native/shallow detail injections while retaining LL.
+        ``ll_off``
+            Zero the LL injection while retaining routed detail.
+        ``all_frequency_off``
+            Zero every frequency injection, leaving only the main backbone
+            (and any separately configured non-frequency adapter).
+        """
+        allowed = {
+            "full",
+            "detail_off",
+            "ll_off",
+            "all_frequency_off",
+        }
+        normalized = str(mode).strip().lower()
+        if normalized not in allowed:
+            raise ValueError(
+                f"Unknown frequency intervention {mode!r}; expected one of "
+                f"{sorted(allowed)}"
+            )
+        self._inference_frequency_mode = normalized
+
+    def inference_frequency_intervention(self) -> Dict[str, object]:
+        """Return a JSON-serialisable description of the active intervention."""
+        mode = self._inference_frequency_mode
+        return {
+            "mode": mode,
+            "detail_enabled": mode in {"full", "ll_off"},
+            "low_frequency_enabled": mode in {"full", "detail_off"},
+        }
 
     def set_routing_progress(self, progress: float) -> None:
         """Blend learned routes in gradually from the native-only baseline."""
@@ -940,15 +1286,64 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             active = torch.where(prior <= 0.0, torch.zeros_like(active), active)
             active = torch.where(prior >= 1.0, torch.ones_like(active), active)
 
-        if destination_progress_value <= 0.0:
-            conditional_shallow = torch.zeros_like(active)
+        bootstrap_destination = torch.full_like(
+            active,
+            self.destination_bootstrap_probability,
+        )
+        if (
+            destination_progress_value <= 0.0
+            and self._inference_destination_mode == "learned"
+        ):
+            # A non-zero fixed bootstrap keeps both projections observable
+            # before the learned destination head is released.
+            conditional_shallow = bootstrap_destination
         else:
+            destination_evidence = evidence
+            if (
+                self._inference_destination_mode == "shuffled_destination"
+                and evidence.shape[0] > 1
+            ):
+                # A deterministic non-identity cyclic permutation preserves the
+                # batch evidence marginal without consuming the sampling RNG.
+                # This is important for paired DDIM comparisons: intervention
+                # selection must not change the initial diffusion noise.
+                shift = 1 + (
+                    self._inference_destination_shuffle_seed
+                    % (int(evidence.shape[0]) - 1)
+                )
+                destination_evidence = torch.roll(
+                    evidence,
+                    shifts=shift,
+                    dims=0,
+                )
             learned_destination = self.prior_destination_heads[level_index](
-                evidence
+                destination_evidence
             ).float()
-            conditional_shallow = (
-                destination_progress_value * learned_destination[..., 1]
+            if self._inference_destination_mode == "native_only":
+                destination = torch.zeros_like(active)
+            elif self._inference_destination_mode == "fixed":
+                if self._inference_fixed_destination is None:
+                    raise RuntimeError("fixed destination intervention is unset")
+                fixed = reference.new_tensor(
+                    self._inference_fixed_destination[level_index],
+                    dtype=torch.float32,
+                )
+                destination = fixed.view(1, 3).expand_as(active)
+            else:
+                destination = learned_destination[..., 1]
+            destination = destination.clamp(
+                self.destination_probability_floor,
+                self.destination_probability_ceiling,
             )
+            if self._inference_destination_mode == "learned":
+                conditional_shallow = bootstrap_destination + (
+                    destination_progress_value
+                    * (destination - bootstrap_destination)
+                )
+            else:
+                # Same-checkpoint interventions must be exact even when an
+                # early-phase checkpoint is audited.
+                conditional_shallow = destination
         conditional_native = 1.0 - conditional_shallow
         native = active * conditional_native
         shallow = active * conditional_shallow
@@ -1410,6 +1805,66 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             signed = -signed
         return torch.sigmoid(signed).clamp(0.0, 1.0)
 
+    def _spatial_destination_map(
+        self,
+        *,
+        level_index: int,
+        global_destination: torch.Tensor,
+        residual_details,
+        ct_details,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand a global route into a leakage-free spatial destination map."""
+
+        height, width = residual_details[0].shape[-2:]
+        expanded = global_destination[..., None, None].expand(
+            -1,
+            -1,
+            height,
+            width,
+        )
+        if not self.spatial_destination_enabled:
+            return expanded, torch.zeros_like(expanded)
+        if self._inference_destination_mode == "native_only":
+            return torch.zeros_like(expanded), torch.zeros_like(expanded)
+        if self._inference_destination_mode == "fixed":
+            return expanded, torch.zeros_like(expanded)
+
+        residual = _stack_details(residual_details)
+        ct = _stack_details(ct_details)
+        residual_scale = residual.abs().mean(
+            dim=(-2, -1),
+            keepdim=True,
+        ).clamp_min(1e-6)
+        ct_scale = ct.abs().mean(
+            dim=(-2, -1),
+            keepdim=True,
+        ).clamp_min(1e-6)
+        evidence = torch.cat(
+            (
+                torch.tanh(residual / residual_scale),
+                torch.tanh(ct / ct_scale),
+            ),
+            dim=1,
+        )
+        delta = self.spatial_destination_heads[level_index](evidence)
+        if (
+            self._inference_destination_mode == "shuffled_destination"
+            and delta.shape[0] > 1
+        ):
+            shift = 1 + (
+                self._inference_destination_shuffle_seed
+                % (int(delta.shape[0]) - 1)
+            )
+            delta = torch.roll(delta, shifts=shift, dims=0)
+        eps = torch.finfo(torch.float32).eps
+        base = expanded.float().clamp(eps, 1.0 - eps)
+        destination = torch.sigmoid(torch.logit(base) + delta.float())
+        destination = destination.clamp(
+            self.destination_probability_floor,
+            self.destination_probability_ceiling,
+        )
+        return destination.to(expanded), delta.to(expanded)
+
     def _zero_result(
         self, current_residual: torch.Tensor
     ) -> tuple[list[torch.Tensor], Dict[str, torch.Tensor]]:
@@ -1637,8 +2092,10 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
 
         # Training-only masks are accepted for integration compatibility but never routed.
         _ = lesion_score, topq_mask
-        _, residual_details1, residual_details2 = self.decompose(current_residual)
-        _, ct_details1, ct_details2 = self.decompose(ct)
+        residual_ll1, residual_details1, residual_details2 = self.decompose(
+            current_residual
+        )
+        ct_ll1, ct_details1, ct_details2 = self.decompose(ct)
         noise = self.noise_reliability(timestep, schedule).to(current_residual)
         gates_l2 = self._level_gates(
             0,
@@ -1767,6 +2224,96 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
             routes_l1 = selector_diagnostics["router_selected_routes_l1"]
             diagnostics.update(selector_diagnostics)
 
+        route_native_l2 = routes_l2[..., 0, None, None]
+        route_shallow_l2 = routes_l2[..., 1, None, None]
+        route_native_l1 = routes_l1[..., 0, None, None]
+        route_shallow_l1 = routes_l1[..., 1, None, None]
+        if self.spatial_destination_enabled:
+            active_l2 = routes_l2[..., 0] + routes_l2[..., 1]
+            active_l1 = routes_l1[..., 0] + routes_l1[..., 1]
+            conditional_l2 = routes_l2[..., 1] / active_l2.clamp_min(1e-8)
+            conditional_l1 = routes_l1[..., 1] / active_l1.clamp_min(1e-8)
+            spatial_l2, spatial_delta_l2 = self._spatial_destination_map(
+                level_index=0,
+                global_destination=conditional_l2,
+                residual_details=residual_details2,
+                ct_details=ct_details2,
+            )
+            spatial_l1, spatial_delta_l1 = self._spatial_destination_map(
+                level_index=1,
+                global_destination=conditional_l1,
+                residual_details=residual_details1,
+                ct_details=ct_details1,
+            )
+            route_shallow_l2 = active_l2[..., None, None] * spatial_l2
+            route_native_l2 = active_l2[..., None, None] * (1.0 - spatial_l2)
+            route_shallow_l1 = active_l1[..., None, None] * spatial_l1
+            route_native_l1 = active_l1[..., None, None] * (1.0 - spatial_l1)
+
+            # Route summaries now describe the route actually applied rather
+            # than only the global head before spatial redistribution.
+            routes_l2 = torch.stack(
+                (
+                    route_native_l2.mean(dim=(-2, -1)),
+                    route_shallow_l2.mean(dim=(-2, -1)),
+                    1.0 - active_l2,
+                ),
+                dim=-1,
+            )
+            routes_l1 = torch.stack(
+                (
+                    route_native_l1.mean(dim=(-2, -1)),
+                    route_shallow_l1.mean(dim=(-2, -1)),
+                    1.0 - active_l1,
+                ),
+                dim=-1,
+            )
+            diagnostics.update({
+                "route_spatial_conditional_shallow_l2": spatial_l2,
+                "route_spatial_conditional_shallow_l1": spatial_l1,
+                "route_spatial_delta_l2": spatial_delta_l2,
+                "route_spatial_delta_l1": spatial_delta_l1,
+                "route_spatial_l2_std": spatial_l2.float().std(),
+                "route_spatial_l1_std": spatial_l1.float().std(),
+            })
+
+        route_native_l2, route_shallow_l2 = (
+            self._apply_route_action_intervention(
+                route_native=route_native_l2,
+                route_shallow=route_shallow_l2,
+                level_index=0,
+            )
+        )
+        route_native_l1, route_shallow_l1 = (
+            self._apply_route_action_intervention(
+                route_native=route_native_l1,
+                route_shallow=route_shallow_l1,
+                level_index=1,
+            )
+        )
+        if self._inference_route_actions is not None:
+            null_l2 = 1.0 - route_native_l2 - route_shallow_l2
+            null_l1 = 1.0 - route_native_l1 - route_shallow_l1
+            routes_l2 = torch.stack(
+                (
+                    route_native_l2.mean(dim=(-2, -1)),
+                    route_shallow_l2.mean(dim=(-2, -1)),
+                    null_l2.mean(dim=(-2, -1)),
+                ),
+                dim=-1,
+            )
+            routes_l1 = torch.stack(
+                (
+                    route_native_l1.mean(dim=(-2, -1)),
+                    route_shallow_l1.mean(dim=(-2, -1)),
+                    null_l1.mean(dim=(-2, -1)),
+                ),
+                dim=-1,
+            )
+            diagnostics["route_action_intervention_enabled"] = (
+                current_residual.new_tensor(1.0)
+            )
+
         # Update route diagnostics
         diagnostics.update(
             self._route_diagnostics(routes_l2, routes_l1, current_residual)
@@ -1856,31 +2403,89 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
         )
 
         # Route application: flexible number of routes
-        native_l2 = gated_l2 * routes_l2[..., 0, None, None]
-        shallow_l2 = gated_l2 * routes_l2[..., 1, None, None]
-        native_l1 = gated_l1 * routes_l1[..., 0, None, None]
-        shallow_l1 = gated_l1 * routes_l1[..., 1, None, None]
+        native_l2 = gated_l2 * route_native_l2
+        shallow_l2 = gated_l2 * route_shallow_l2
+        native_l1 = gated_l1 * route_native_l1
+        shallow_l1 = gated_l1 * route_shallow_l1
 
         batch, _, height, width = current_residual.shape
         l3 = current_residual.new_zeros(
             batch, self.output_channels[0], height // 8, width // 8
         )
-        l2 = self.projection_heads[0](native_l2)
-        l1 = self.projection_heads[1](native_l1)
-        l1 = l1 + self.l2_to_l1_projection(
+        native_l2_injection = self.projection_heads[0](native_l2)
+        native_l1_injection = self.projection_heads[1](native_l1)
+        shallow_l2_injection = self.l2_to_l1_projection(
             self.reconstruct_l0(_split_details(shallow_l2))
         )
-        l0 = self.projection_heads[2](
+        shallow_l1_injection = self.projection_heads[2](
             self.reconstruct_l0(_split_details(shallow_l1))
         )
+        low_frequency_l1_injection = torch.zeros_like(native_l1_injection)
+        if (
+            self.low_frequency_background_enabled
+            and self.low_frequency_projection is not None
+        ):
+            low_frequency_input = torch.cat(
+                (
+                    torch.tanh(residual_ll1 / 0.5),
+                    torch.tanh(ct_ll1 / 0.5),
+                ),
+                dim=1,
+            )
+            low_frequency_gate = (
+                self.low_frequency_gate_max
+                * noise[:, 1, None, None, None].to(low_frequency_input)
+            )
+            low_frequency_l1_injection = self.low_frequency_projection(
+                low_frequency_input * low_frequency_gate
+            )
+
+        frequency_mode = self._inference_frequency_mode
+        detail_enabled = frequency_mode in {"full", "ll_off"}
+        low_frequency_enabled = frequency_mode in {"full", "detail_off"}
+        if not detail_enabled:
+            native_l2_injection = torch.zeros_like(native_l2_injection)
+            native_l1_injection = torch.zeros_like(native_l1_injection)
+            shallow_l2_injection = torch.zeros_like(shallow_l2_injection)
+            shallow_l1_injection = torch.zeros_like(shallow_l1_injection)
+        if not low_frequency_enabled:
+            low_frequency_l1_injection = torch.zeros_like(
+                low_frequency_l1_injection
+            )
+
+        l2 = native_l2_injection
+        l1 = (
+            native_l1_injection
+            + shallow_l2_injection
+            + low_frequency_l1_injection
+        )
+        l0 = shallow_l1_injection
 
         # Injection RMS per level — scale-invariant per-element energy
         # so L0/L1/L2 are comparable despite different resolutions and channels.
         injections = [l3, l2, l1, l0]
         injection_norms = {}
-        for idx, inj in enumerate(injections):
+        for level, inj in zip((3, 2, 1, 0), injections):
             rms = inj.float().square().flatten(1).mean(dim=1).sqrt().mean().detach()
-            injection_norms[f"injection/l{idx}_rms"] = rms
+            injection_norms[f"injection/l{level}_rms"] = rms
+
+        branch_injections = {
+            "effective/native_l2_rms": native_l2_injection,
+            "effective/native_l1_rms": native_l1_injection,
+            "effective/shallow_l2_to_l1_rms": shallow_l2_injection,
+            "effective/shallow_l1_to_l0_rms": shallow_l1_injection,
+            "effective/low_frequency_l1_rms": low_frequency_l1_injection,
+        }
+        for key, value in branch_injections.items():
+            injection_norms[key] = (
+                value.float()
+                .square()
+                .flatten(1)
+                .mean(dim=1)
+                .sqrt()
+                .mean()
+                .detach()
+            )
 
         diagnostics.update(
             {
@@ -1891,6 +2496,12 @@ class SpectralEvidenceFrequencyRouter(BoundaryReliableFrequencyInjector):
                 "routes_l2": routes_l2,
                 "routes_l1": routes_l1,
                 "noise_reliability": noise,
+                "inference_frequency_detail_enabled": (
+                    current_residual.new_tensor(float(detail_enabled))
+                ),
+                "inference_frequency_low_enabled": (
+                    current_residual.new_tensor(float(low_frequency_enabled))
+                ),
                 "gate_tv": 0.5
                 * (_total_variation(amplitude_l2) + _total_variation(amplitude_l1)),
                 "route_temporal_smoothness": temporal_smoothness,

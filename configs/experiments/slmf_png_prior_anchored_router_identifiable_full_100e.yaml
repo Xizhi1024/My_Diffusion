@@ -1,0 +1,349 @@
+# Full repair run for the prior-anchored hierarchical router.
+# Every mechanism below is independently switchable for ordered degradation:
+# phase decoupling, destination utility, spatial routing, low-frequency branch.
+
+experiment:
+  name: slmf_png_prior_anchored_router_identifiable_full_100e
+  seed: 42
+
+data:
+  mode: png
+  cache_dir: cache/tensors_main
+  cache_lineage: cache/tensors_main/cache_lineage.json
+  dataset_contract: configs/dataset_contract_stage0a_v1.json
+  split_manifest: main_data/split_manifest.csv
+  require_cache_lineage: true
+  use_fake_data: false
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys: [ct, pet, mask]
+  optional_keys: []
+
+runtime:
+  device: cuda
+  require_cuda: true
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 10
+  eval_num_samples: 64
+  eval_seed: 42
+  dataloader_seed: 42
+  eval_sampling_steps: 50
+  sample_interval: 10
+  save_interval: 10
+  tracked_sample_ids: []
+  gradient_diagnostics: true
+  best_checkpoint:
+    enabled: true
+    lightweight: true
+    save_tags:
+      - best_lesion
+      - best_image
+      - best_combined
+      - best_background
+    combined_alpha: 0.5
+    stripe_penalty: 0.3
+    background_constraints:
+      max_failure_rate: 0.265625
+      max_lesion_peak_error_norm: 0.1365
+      max_lesion_topq_peak_error_norm: 0.1720
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_epochs: 60
+
+training:
+  num_epochs: 100
+  checkpoint_dir: results/prior_anchored_router_identifiable_full_100e/checkpoints
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  lr_min: 1.0e-6
+  init_from: null
+  resume_from: null
+  optimizer_groups:
+    enabled: true
+    projection_lr: 3.0e-4
+    router_lr: 5.0e-4
+    descriptor_lr: 1.0e-4
+    no_decay_bias_and_offsets: true
+  # Phase A learns two usable branches under a fixed q=0.25.
+  # Phase B freezes their causal effects and identifies the router.
+  # Phase C freezes the router so late image fitting cannot turn it into a
+  # layer constant or trade route probability against projection scale.
+  spectral_training_phases:
+    enabled: true
+    phases:
+      - name: branch_bootstrap
+        start_epoch: 1
+        end_epoch: 25
+        train_groups: [base, projection]
+      - name: route_identification
+        start_epoch: 26
+        end_epoch: 40
+        train_groups: [router, descriptor]
+      - name: frozen_route_stabilization
+        start_epoch: 41
+        end_epoch: 100
+        train_groups: [base, projection]
+  ema:
+    decay: 0.995
+    update_every: 1
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  conditional_mean:
+    enabled: true
+    levels: 2
+    base_channels: 32
+    loss_weight: 0.0
+    charbonnier_eps: 1.0e-3
+    detach_bridge: true
+    freeze: true
+    checkpoint: results/prior_anchored_router_300e/ckpt_best_lesion.pt
+    checkpoint_format: full_model
+
+  residual_bridge:
+    enabled: true
+
+  wavelet_unet:
+    enabled: false
+
+  residual_frequency:
+    enabled: true
+    freeze: false
+    mode: spectral_evidence_router
+    output_channels: [256, 256, 128, 64]
+    band_scales: [0.5, 0.25]
+    use_noise_release: true
+    use_ct_reliability: true
+    use_content_reliability: true
+    use_subband_gates: true
+    use_directional_reliability: false
+    use_gabor_gate: false
+    ct_reliability_floor_l2: 0.25
+    ct_reliability_floor_l1: 0.50
+    use_gabor_agreement: false
+    detach_gabor_descriptor: true
+    gabor_orientations: 8
+    gate_max: 0.25
+    snr_center: 0.0
+    snr_temperature: 2.0
+    cross_temperature: 1.0
+    content_hidden_channels: 16
+    amplitude_delta_min: -0.05
+    amplitude_delta_max: 0.10
+    # Explicit LL/low-frequency path for the non-lesion physiological field.
+    low_frequency_background_enabled: true
+    low_frequency_gate_max: 0.10
+    low_frequency_projection_init_scale: 0.005
+    dct_descriptor:
+      enabled: true
+      pooled_size: 8
+      selected_frequencies: 12
+    gabor_descriptor:
+      enabled: true
+    cross_level_router:
+      enabled: true
+      destination_mode: learned
+      hidden_channels: 32
+      hard_all_null: false
+      policy: prior_anchored_learned
+      fixed_prior: [0.05, 0.05, 0.90]
+      h3_schedule_sha256: 3c3b518b267fc2a3f5cf6c29c30d3f929297e265a22d7a9ed07becd55eb79499
+      h3_schedule_source: direct_png_preview
+      h3_schedule_path: results/h3_png_prior_preview/h3_prior_preview.json
+      h3_repository_root: .
+      h3_allow_unverified_preview_lineage: true
+      initial_null_probability: 0.90
+      active_logit_delta_max: 2.0
+      initial_destination_native_probability: 0.75
+      # Both projections are active from epoch 1; the learned head is blended
+      # in only after branch bootstrap.
+      destination_bootstrap_probability: 0.25
+      destination_probability_floor: 0.02
+      destination_probability_ceiling: 0.75
+      prior_warmup_epochs: 5
+      prior_active_ramp_epochs: 5
+      prior_destination_warmup_epochs: 25
+      prior_destination_ramp_epochs: 5
+      prior_anchor_decay_end_epoch: 100
+      prior_anchor_final_scale: 0.10
+      shallow_projection_init_scale: 0.01
+      # Patient/band global route plus zero-mean local redistribution.
+      spatial_destination_enabled: true
+      spatial_destination_hidden_channels: 16
+      spatial_destination_delta_max: 3.0
+      phase_observation_epochs: [5, 10, 25, 30, 40, 60, 80, 100]
+
+  gabor:
+    enabled: true
+    scales: 4
+    orientations: 8
+    kernel_size: 15
+    parameter_delta: 0.25
+    inject_adapter: false
+    use_for_noise: false
+    use_for_hotspot: false
+    use_for_loss: false
+
+  organ_prior:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  semantic_prior:
+    enabled: false
+  zero_adapter:
+    enabled: false
+  condition_dropout:
+    enabled: false
+  bbdm_bridge:
+    name: bbdm_bridge
+    num_train_timesteps: 1000
+    m_schedule: linear
+
+losses:
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+    epoch_warmup: [1, 10]
+
+  topk_lesion:
+    enabled: true
+    weight: 0.15
+    topk_percent: 0.10
+    active_tau_max: 0.40
+    epoch_warmup: [10, 25]
+
+  normalized_lesion_peak:
+    enabled: true
+    weight: 0.10
+    topk_percent: 0.10
+    min_k: 3
+    max_k: 16
+    beta: 0.02
+    active_tau_max: 0.40
+    cold_weight: 1.0
+    cold_tolerance: 0.02
+    epoch_warmup: [15, 30]
+
+  # Direct supervision for "which level is useful" and "where shallow is
+  # useful". It is active only in the router-only identification phase.
+  route_utility_supervision:
+    enabled: true
+    weight: 0.05
+    lesion_dilate_radius: 3
+    spatial_weight: 1.0
+    global_weight: 0.25
+    spatial_tv_weight: 0.001
+    positive_weight: 4.0
+    background_target: 0.02
+    lesion_target: 0.90
+    global_target_min: 0.05
+    global_target_max: 0.55
+    active_tau_max: 0.70
+    epoch_warmup: [26, 30]
+    epoch_window: [26, 40]
+
+  # Low-frequency supervision begins after the route has been identified and
+  # cannot pull the destination toward a background-driven layer constant.
+  nonlesion_body_lowpass:
+    enabled: true
+    weight: 0.05
+    sigma: 4.0
+    body_threshold: 0.03
+    body_closing_radius: 2
+    lesion_exclusion_radius: 8
+    tail_quantile: 0.75
+    tail_weight: 1.5
+    tail_temperature: 0.02
+    charbonnier_eps: 0.001
+    active_tau_max: 0.70
+    epoch_warmup: [41, 60]
+
+  residual_wavelet:
+    enabled: true
+    weight: 0.02
+    lesion_weight: 2.0
+    band_weights: [0.5, 1.0, 1.5]
+    active_tau_max: 0.70
+    epoch_warmup: [15, 35]
+
+  spectral_router_regularization:
+    enabled: true
+    weight: 1.0
+    temporal_weight: 0.0
+    dct_weight: 1.0e-4
+    gabor_weight: 1.0e-4
+    active_mass_weight: 0.0
+    active_mass_floor: 0.0
+    prior_anchor_weight: 5.0e-3
+    monotonic_weight: 2.0e-3
+    curvature_weight: 2.0e-4
+    budget_weight: 2.0e-3
+    shallow_cost_weight: 0.0
+    artifact_safety_weight: 0.0
+
+  outside_peak_ranking:
+    enabled: false
+  boundary_frequency:
+    enabled: false
+  frequency_gate_tv:
+    enabled: false
+  gabor_consistency:
+    enabled: false
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false
+  roi_suv:
+    enabled: false
+  organ_consistency:
+    enabled: false
+  false_hotspot:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  heteroscedastic_nll:
+    enabled: false
+  segmenter_consistency:
+    enabled: false
+
+metadata:
+  enabled: false
+segmenter:
+  enabled: false
+
+evaluation:
+  mc_samples: 1
+  physical_suv_available: false
+  small_lesion_quantile: 0.25
+  small_lesion_underestimate_tolerance: 0.05
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

@@ -87,6 +87,9 @@ def _save_run_metadata(
         "conditional_mean": bool(model.conditional_mean_enabled),
         "residual_bridge": bool(model.residual_bridge_enabled),
         "residual_frequency": bool(model.residual_frequency_enabled),
+        "residual_frequency_frozen": bool(
+            getattr(model, "residual_frequency_frozen", False)
+        ),
     })
     enabled_losses = {
         name: bool(loss.enabled)
@@ -121,6 +124,11 @@ def _save_run_metadata(
         "resume_from": training_cfg.get("resume_from"),
         "enabled_modules": enabled_modules,
         "enabled_losses": enabled_losses,
+        "residual_frequency_destination_mode": getattr(
+            model,
+            "residual_frequency_destination_mode",
+            "learned",
+        ),
         "lesion_aware_posttraining": {
             "enabled": lesion_posttrain_enabled,
             "source_checkpoint": training_cfg.get("init_from"),

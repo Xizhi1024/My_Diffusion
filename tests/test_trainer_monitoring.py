@@ -491,6 +491,20 @@ def test_evaluator_can_overlay_old_checkpoint_ema_shadow():
     assert raw_state["weight"].item() == 1.0
 
 
+def test_evaluator_recognizes_lightweight_materialized_ema_checkpoint():
+    from scripts.evaluate import _select_checkpoint_state
+
+    checkpoint = {
+        "model": {"weight": torch.tensor([2.0])},
+        "checkpoint_weights": "ema_materialized_as_model",
+    }
+
+    state, source = _select_checkpoint_state(checkpoint, weights="ema")
+
+    assert source == "model (ema_materialized)"
+    assert state["weight"].item() == 2.0
+
+
 def test_evaluator_builds_fixed_stratified_lesion_subset():
     from scripts.evaluate import _build_stratified_subset
 
