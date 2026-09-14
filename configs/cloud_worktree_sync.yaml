@@ -1,0 +1,202 @@
+# cloud_worktree_sync.yaml
+#
+# One-upload, manifest-driven distribution of source files into the router
+# mainline and the feature-emergence interpretability branch.  "物理共存、逻辑隔离":
+# code is distributed per-group into the two worktrees; data/cache/checkpoints
+# are shared read-only and NEVER copied here; outputs and COMPLETE markers are
+# owned exclusively by each worktree's own run directories.
+#
+# Every path below is resolved against the repo root (the directory that
+# contains this config).  Change a root → the sync tool refuses to copy across
+# the allowed boundary.
+
+roots:
+  # Canonical source: the uploaded payload.  On the cloud machine this is where
+  # you drop the single upload archive; on the local dev machine it is the main
+  # checkout.
+  source: "."
+  router: ".worktrees/spectral-router-v5"
+  feature: ".worktrees/lesion-feature-emergence"
+  manifests: "cloud_sync/manifests"
+  backups: "cloud_sync/backups"
+
+# ---------------------------------------------------------------------------
+# Explicit allowlist groups.
+#
+# A group entry may be a literal file path or a glob (``*`` = within one path
+# segment, ``**`` = across segments, both anchored to the whole relative path).
+# Literals that do not exist in the source are ignored, so the same allowlist
+# can be shared verbatim by both worktrees.  Everything NOT listed here (and
+# not excluded below) is simply never distributed.
+#
+# classification intent:
+#   * src/model/frequency/**  → router mainline only (spectral-router training)
+#   * src/mechanism_validation/feature_*.py → feature branch only
+#     (interpretability; reads mainline checkpoints but is not part of them)
+#   * src/data, src/model (minus frequency), scripts (minus feature_*/run_*),
+#     configs/experiments, docs → shared working files
+# ---------------------------------------------------------------------------
+
+groups:
+  common:
+    - "src/__init__.py"
+    - "src/data/__init__.py"
+    - "src/data/dataset.py"
+    - "src/data/lineage.py"
+    - "src/model/__init__.py"
+    - "src/model/slmf_bbdm.py"
+    - "src/model/config_utils.py"
+    - "src/model/trainer.py"
+    - "src/model/registry.py"
+    - "src/model/ema.py"
+    - "src/model/interfaces.py"
+    - "src/model/bbdm_unet.py"
+    - "src/model/conditioning/**"
+    - "src/model/noise/**"
+    - "src/model/priors/**"
+    - "src/model/loss_terms/**"
+    - "src/mechanism_validation/__init__.py"
+    - "src/mechanism_validation/common.py"
+    - "scripts/evaluate.py"
+    - "scripts/train_v2.py"
+    - "scripts/gpu_info.py"
+    - "scripts/inspect_model.py"
+    - "scripts/check_ts.py"
+    - "scripts/run_all_mechanism_validations.py"
+    - "scripts/run_mechanism_stage0_data_audit.py"
+    - "scripts/run_v2_main_pipeline.py"
+    - "scripts/run_cloud_stage0c_gate.py"
+    - "scripts/summarize_cloud_runs.py"
+    - "scripts/audit_checkpoint_lineage.py"
+    - "scripts/audit_v2_freeze_integrity.py"
+    - "scripts/audit_v2_inference_admissibility.py"
+    - "scripts/audit_prior_anchored_run.py"
+    - "scripts/summarize_prior_anchored_run.py"
+    - "scripts/freeze_h4_v2_internal_cv_plan.py"
+    - "scripts/freeze_v2_main_integration_contract.py"
+    - "scripts/freeze_v2_stage_protocols.py"
+    - "scripts/run_h4_v2_internal_exploratory_pipeline.py"
+    - "scripts/run_h4_v2_pipeline.py"
+    - "scripts/calibrate_h3_v2_full_timestep_native_null.py"
+    - "scripts/audit_h3_fixed_schedule_inference.py"
+    - "scripts/estimate_h3_prior_from_png.py"
+    - "scripts/analyze_h3_v2_experiment.py"
+    - "scripts/analyze_ct_frequency_lesion_predictability.py"
+    - "scripts/analyze_ct_pet_frequency_geometry.py"
+    - "scripts/compare_v4_results.py"
+    - "scripts/eval_oracle_destination.py"
+    - "scripts/eval_run_metrics.py"
+    - "scripts/evaluate_v5_checkpoint_trajectory.py"
+    - "scripts/diag_router_grad.py"
+    - "scripts/diag_gabor_adapter.py"
+    - "scripts/validate_h1_local_spectral_asymmetry.py"
+    - "scripts/validate_h2_pathology_excluded_residual.py"
+    - "scripts/validate_h3_logsnr_recoverability.py"
+    - "scripts/validate_artifact_safety.py"
+    - "scripts/validate_ct_support_head.py"
+    - "scripts/export_v2_production_calibration_bundle.py"
+    - "scripts/pretrain_conditional_mean.py"
+    - "scripts/diagnose_loss.py"
+    - "scripts/filter_nomask.py"
+    - "scripts/visualize_eval.py"
+    - "configs/dataset_contract_stage0a_v1.json"
+    - "configs/experiments/slmf_baseline.yaml"
+    - "configs/experiments/slmf_full.yaml"
+    - "configs/experiments/slmf_png_baseline.yaml"
+    - "configs/experiments/slmf_png_boundary_reliable.yaml"
+    - "configs/experiments/slmf_png_residual_frequency.yaml"
+    - "configs/experiments/slmf_png_spectral_router_v5.yaml"
+    - "configs/experiments/slmf_png_prior_anchored_router_100e.yaml"
+    - "configs/experiments/slmf_png_prior_anchored_router_300e.yaml"
+    - "configs/experiments/slmf_png_prior_anchored_router_identifiable_full_100e.yaml"
+    - "configs/experiments/prior_anchored_paired_ablation_v1.yaml"
+    - "configs/experiments/spectral_router_ablation_plan_v5.yaml"
+    - "configs/experiments/spectral_router_cold_bias_plan_v7.yaml"
+    - "configs/experiments/spectral_router_final_calibration_plan_v8.yaml"
+    - "configs/experiments/boundary_reliable_ablation_plan_v3.yaml"
+    - "configs/experiments/boundary_reliable_ablation_plan_v4.yaml"
+    - "configs/experiments/frequency_ablation_plan.yaml"
+    - "configs/experiments/frequency_ablation_plan_v2.yaml"
+    - "configs/experiments/ablations.yaml"
+    - "configs/mechanism_validation_pipeline_v1.json"
+    - "configs/mechanism_validation_pipeline_v2.json"
+    - "configs/h3_fixed_schedule_inference_v1.json"
+    - "configs/h3_v2_full_timestep_native_null_v1.json"
+    - "configs/h4_v2_internal_exploratory_nested_cv_v1.json"
+    - "docs/mechanism_validation_h4_v2.md"
+    - "docs/current_model_status.md"
+    - "docs/freeze_gap_checklist.md"
+    - "docs/h3_direct_png_prior.md"
+
+  router_only:
+    - "src/model/frequency/**"
+    - "scripts/run_spectral_router_v5.py"
+    - "scripts/run_prior_anchored_router_100e.py"
+    - "scripts/run_boundary_reliable_v4.py"
+    - "scripts/run_frequency_ablations.py"
+    - "scripts/run_v5_t0_c1_300.py"
+    - "scripts/build_h3_v2_experiment_configs.py"
+    - "scripts/run_h3_fixed_schedule_overnight.py"
+    - "scripts/run_h3_v2_overnight.py"
+    - "scripts/validate_h5_router_role_separation.py"
+    - "scripts/validate_h6_final_integration.py"
+    - "scripts/eval_router_background_suite.py"
+    - "scripts/diagnose_stripes.py"
+    - "scripts/analyze_medoid_zero_training.py"
+    - "scripts/eval_action_axis_screen.py"
+    - "configs/experiments/slmf_png_background_tail_repair_e100.yaml"
+    - "configs/experiments/slmf_png_boundary_reliable_v4.yaml"
+
+  feature_only:
+    - "src/mechanism_validation/feature_emergence.py"
+    - "src/mechanism_validation/feature_causality.py"
+    - "src/mechanism_validation/feature_provenance.py"
+    - "scripts/eval_feature_emergence.py"
+    - "scripts/eval_feature_causality.py"
+
+# ---------------------------------------------------------------------------
+# Exclusion patterns: a file must be allowlisted AND not match any of these.
+# These trees are shared read-only on the cloud machine and must never be
+# distributed as code.  ``.git`` is unconditionally protected.
+# ---------------------------------------------------------------------------
+
+exclude:
+  - "(^|/)\\.git($|/)"
+  - "(^|/)\\.worktrees($|/)"
+  - "(^|/)main_data($|/)"
+  - "(^|/)Data($|/)"
+  - "(^|/)data($|/)"
+  - "(^|/)cache($|/)"
+  - "(^|/)checkpoints($|/)"
+  - "(^|/)results($|/)"
+  - "(^|/)cloud_runs($|/)"
+  - "(^|/)cloud_sync($|/)"
+  - "(^|/)logs($|/)"
+  - "(^|/)outputs($|/)"
+  - "(^|/)samples($|/)"
+  - "(^|/)vis_epoch1000($|/)"
+  - "(^|/)wandb($|/)"
+  - "(^|/)__pycache__($|/)"
+  - "(^|/)\\.pytest_cache($|/)"
+  - "(^|/)\\.pytest_tmp"
+  - "(^|/)node_modules($|/)"
+  - "\\.pyc$"
+  - "\\.pt$"
+  - "\\.pth$"
+  - "\\.ckpt$"
+  - "\\.npy$"
+  - "\\.npz$"
+  - "\\.png$"
+  - "\\.nii$"
+  - "\\.nii\\.gz$"
+  - "\\.zip$"
+  - "\\.patch$"
+  - "\\.bundle$"
+  - "(^|/)package(-lock)?\\.json$"
+  - "(^|/)playwright\\.config\\.js$"
+  - "(^|/)e2e($|/)"
+  - "(^|/)\\.github($|/)"
+  - "(^|/)artifacts($|/)"
+  - "(^|/)My_diffusion($|/)"
+  - "(^|/)diffusion 论文($|/)"
+  - "(^|/)python$"

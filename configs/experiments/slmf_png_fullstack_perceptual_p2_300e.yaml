@@ -1,0 +1,319 @@
+# FULL-STACK + P2 PERCEPTUAL combined arm, 300 epochs.
+#
+# Base: configs/experiments/slmf_png_prior_anchored_router_300e.yaml VERBATIM
+# (the full mechanism stack that produced the best five-fold diffusion numbers:
+#  excluded-mean conditional mean + residual bridge + spectral router + lesion
+#  losses).  The ONLY deltas vs that config:
+#   1. losses.perceptual_x0 enabled with the P2_FEAT_GLOBAL settings that won
+#      the Stage-A ablation (global region mode, charbonnier, uniform tau).
+#   2. experiment.name / checkpoint_dir -> new dir, nothing overwritten.
+#   3. data.cache_dir / cache_lineage pinned to the cloud main-dir cache
+#      (absolute) — same cache the perceptual-x0 ablation arms actually used.
+# Everything else (seed, split, optimizer groups, router block, mean ckpt,
+# h3 prior schedule, eval settings) is byte-identical to the 300e run, so
+# fullstack_perceptual_p2_300e vs prior_anchored_300e isolates the perceptual
+# term ON TOP of the full stack.
+#
+# Bridge-space note (verified src/model/slmf_bbdm.py:1677-1683): with
+# residual_bridge on, ctx.pred_x0 = mean + residual (full PET), so the
+# perceptual loss compares full reconstructed PET vs full target PET —
+# gradients reach the residual branch only (mean is frozen/detached).
+#
+# Run on the cloud box (PowerShell, from the pfm_simple_20260803_retry root
+# AFTER the DEPLOY steps in DEPLOY.md):
+#   pixi run python -u scripts\train_v2.py --config configs\experiments\slmf_png_fullstack_perceptual_p2_300e.yaml
+
+experiment:
+  name: fullstack_perceptual_p2_300e
+  seed: 42
+
+data:
+  mode: png
+  cache_dir: D:/ECPC-IDS-SEVEN-Work3/My_diffusion/cache/tensors_main
+  cache_lineage: D:/ECPC-IDS-SEVEN-Work3/My_diffusion/cache/tensors_main/cache_lineage.json
+  dataset_contract: configs/dataset_contract_stage0a_v1.json
+  split_manifest: main_data/split_manifest.csv
+  require_cache_lineage: true
+  use_fake_data: false
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys: [ct, pet, mask]
+  optional_keys: []
+
+runtime:
+  device: cuda
+  require_cuda: true
+  amp: true
+  channels_last: true
+  torch_compile: false          # Windows-native cloud has no triton
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 10
+  eval_num_samples: 64
+  eval_seed: 42
+  dataloader_seed: 42
+  eval_sampling_steps: 20
+  sample_interval: 10
+  save_interval: 10
+  tracked_sample_ids: []
+  gradient_diagnostics: true
+  best_checkpoint:
+    enabled: true
+    combined_alpha: 0.5
+    stripe_penalty: 0.3
+  early_stopping:
+    enabled: false
+    patience: 300
+    min_epochs: 300
+
+training:
+  num_epochs: 300
+  checkpoint_dir: results/fullstack_perceptual_p2_300e/checkpoints
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  lr_min: 1.0e-6
+  init_from: null
+  resume_from: null
+  optimizer_groups:
+    enabled: true
+    projection_lr: 5.0e-4
+    router_lr: 5.0e-4
+    descriptor_lr: 2.0e-4
+    no_decay_bias_and_offsets: true
+  ema:
+    decay: 0.995
+    update_every: 1
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  conditional_mean:
+    enabled: true
+    levels: 2
+    base_channels: 32
+    loss_weight: 0.0
+    charbonnier_eps: 1.0e-3
+    detach_bridge: true
+    freeze: true
+    checkpoint: checkpoints/freq_mean_excluded_v1/mean_best.pt
+
+  residual_bridge:
+    enabled: true
+
+  wavelet_unet:
+    enabled: false
+
+  residual_frequency:
+    enabled: true
+    mode: spectral_evidence_router
+    output_channels: [256, 256, 128, 64]
+    band_scales: [0.5, 0.25]
+    use_noise_release: true
+    use_ct_reliability: true
+    use_content_reliability: true
+    use_subband_gates: true
+    use_directional_reliability: false
+    use_gabor_gate: false
+    ct_reliability_floor_l2: 0.25
+    ct_reliability_floor_l1: 0.50
+    use_gabor_agreement: false
+    gabor_agreement_alpha: 0.10
+    gabor_agreement_l2: false
+    gabor_agreement_l1: true
+    detach_gabor_descriptor: true
+    gabor_orientations: 8
+    gate_max: 0.25
+    snr_center: 0.0
+    snr_temperature: 2.0
+    cross_temperature: 1.0
+    content_hidden_channels: 16
+    amplitude_delta_min: -0.05
+    amplitude_delta_max: 0.10
+    dct_descriptor:
+      enabled: true
+      pooled_size: 8
+      selected_frequencies: 12
+    gabor_descriptor:
+      enabled: true
+    cross_level_router:
+      enabled: true
+      hidden_channels: 32
+      hard_all_null: false
+      policy: prior_anchored_learned
+      fixed_prior: [0.05, 0.05, 0.90]
+      h3_schedule_path: results/prior_anchored_router_100e/runs/run-20260726T133123.363531Z/prior/h3_prior_preview.json
+      h3_schedule_sha256: dfe9a5627cf12417396387f6ea595ef18dbedd46e9b13467555516d0cbf82611
+      h3_schedule_source: direct_png_preview
+      h3_repository_root: .
+      h3_allow_unverified_preview_lineage: true
+      initial_null_probability: 0.90
+      active_logit_delta_max: 2.0
+      initial_destination_native_probability: 0.95
+      prior_warmup_epochs: 10
+      prior_active_ramp_epochs: 10
+      prior_destination_warmup_epochs: 30
+      prior_destination_ramp_epochs: 10
+      prior_anchor_decay_end_epoch: 300
+      prior_anchor_final_scale: 0.10
+      shallow_projection_init_scale: 0.01
+      phase_observation_epochs: [10, 40, 100, 200, 300]
+
+  gabor:
+    enabled: true
+    scales: 4
+    orientations: 8
+    kernel_size: 15
+    parameter_delta: 0.25
+    inject_adapter: false
+    use_for_noise: false
+    use_for_hotspot: false
+    use_for_loss: false
+
+  organ_prior:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  semantic_prior:
+    enabled: false
+  zero_adapter:
+    enabled: false
+  condition_dropout:
+    enabled: false
+  bbdm_bridge:
+    name: bbdm_bridge
+    num_train_timesteps: 1000
+    m_schedule: linear
+
+losses:
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+  topk_lesion:
+    enabled: true
+    weight: 0.15
+    topk_percent: 0.10
+    active_tau_max: 0.40
+  normalized_lesion_peak:
+    enabled: true
+    weight: 0.10
+    topk_percent: 0.10
+    min_k: 3
+    max_k: 16
+    beta: 0.02
+    active_tau_max: 0.40
+    cold_weight: 1.0
+    cold_tolerance: 0.02
+  outside_peak_ranking:
+    enabled: false
+    weight: 0.1
+    margin: 0.05
+    inside_radius: 3
+    outside_radius: 8
+    topk_percent: 0.01
+    active_tau_max: 0.65
+  boundary_frequency:
+    enabled: false
+    weight: 0.05
+    lesion_weight: 1.0
+    anatomy_weight: 0.5
+    organ_weight: 0.5
+    wavelet_weight: 0.25
+    boundary_radius: 2
+    active_tau_max: 0.7
+  frequency_gate_tv:
+    enabled: false
+    weight: 0.001
+  spectral_router_regularization:
+    enabled: true
+    weight: 1.0
+    temporal_weight: 0.0
+    dct_weight: 1.0e-4
+    gabor_weight: 1.0e-4
+    active_mass_weight: 0.0
+    active_mass_floor: 0.0
+    prior_anchor_weight: 1.0e-2
+    monotonic_weight: 2.0e-3
+    curvature_weight: 2.0e-4
+    budget_weight: 2.0e-3
+    shallow_cost_weight: 0.0
+    # INERT DEAD KEY — factory never reads it; runner forces ==0. See 100e config.
+    artifact_safety_weight: 0.0
+  residual_wavelet:
+    enabled: false
+    weight: 0.05
+    lesion_weight: 4.0
+    band_weights: [0.5, 1.0, 1.5]
+    active_tau_max: 0.7
+  gabor_consistency:
+    enabled: false
+    weight: 0.02
+    lesion_weight: 3.0
+    orientation_weight: 0.1
+    active_tau_max: 0.7
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false
+  roi_suv:
+    enabled: false
+  organ_consistency:
+    enabled: false
+  false_hotspot:
+    enabled: false
+  hotspot_prior:
+    enabled: false
+  heteroscedastic_nll:
+    enabled: false
+  segmenter_consistency:
+    enabled: false
+  # ---- THE ONLY FUNCTIONAL ADDITION vs prior_anchored_router_300e ----
+  perceptual_x0:
+    enabled: true
+    weight: 1.0
+    checkpoint: checkpoints/pet_feature_encoder_v1/encoder_best.pt
+    checkpoint_dir: checkpoints
+    encoder_kind: pretrained
+    feature_layers: [full, half, quarter]
+    layer_weights: [1.0, 0.5, 0.25]
+    distance: charbonnier
+    charbonnier_eps: 1.0e-3
+    region_mode: global
+    dilate_radius: 3
+    timestep_weighting: uniform
+    require_checkpoint_lineage: true
+
+metadata:
+  enabled: false
+segmenter:
+  enabled: false
+
+evaluation:
+  mc_samples: 1
+  physical_suv_available: false
+  small_lesion_quantile: 0.25
+  small_lesion_underestimate_tolerance: 0.05
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

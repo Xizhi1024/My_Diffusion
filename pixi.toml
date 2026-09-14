@@ -1,0 +1,173 @@
+[workspace]
+name = "pet-ct-diffusion"
+channels = [
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
+    "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/bioconda",
+]
+platforms = ["win-64", "linux-64"]
+
+[tasks]
+# ===========================================================================
+# 数据预处理管线（按顺序执行）
+# ===========================================================================
+
+# 1. 从 Data/ 扫描 CT/PET 图像与 LabelSet，生成 cache/manifest.csv
+data-manifest = "python -m src.data.data_manifest --raw-root Data --dicom-root Data --output cache/manifest.csv --jsonl cache/manifest.jsonl --splits-dir cache/manifest_splits --report-dir cache/manifest_report --val-ratio 0.15 --seed 42"
+
+# 2. 从 manifest 读取 DICOM/label，生成训练用 .npz 张量缓存
+data-cache = "python -m src.data.dataset --manifest cache/manifest.csv --out-dir cache/tensors --image-size 192"
+
+# 2b. Build the locked PNG cache without overwriting the authoritative manifest.
+data-cache-png-main = "python -m src.data.png_cache --png-root main_data --split-csv main_data/split_manifest.csv --out-dir cache/tensors_main --split-manifest cache/tensors_main_manifest.csv --image-size 192 --pet-subdirs pet --normalization auto --mask-threshold 0.5 --pet-invert"
+
+# Strict mechanism gates. The all-scope task fails closed while any H2-H6
+# validator is still marked unimplemented in the locked pipeline spec.
+mechanism-validate-local = "python scripts/run_all_mechanism_validations.py --scope local"
+mechanism-validate-all = "python scripts/run_all_mechanism_validations.py --scope all"
+mechanism-validate-plan = "python scripts/run_all_mechanism_validations.py --scope all --dry-run"
+mechanism-v2-freeze = "python scripts/freeze_h4_v2_internal_cv_plan.py"
+mechanism-v2-internal = "python scripts/run_h4_v2_internal_exploratory_pipeline.py"
+mechanism-v2-plan = "python scripts/run_h4_v2_internal_exploratory_pipeline.py --plan"
+v2-cloud-stage03 = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_cloud_v2_stage03.ps1"
+v2-inference-audit = "python scripts/audit_v2_inference_admissibility.py"
+
+# 3. 从 .npz 缓存生成 train/val/test 患者级划分清单
+data-split = "python -m src.data.split_manifest --cache-dir cache/tensors --output cache/split_manifest.csv --val-ratio 0.15 --seed 42"
+
+# 4. 器官先验预处理（器官mask + 符号距离图），需要 GPU
+data-organ = "python -m src.data.organ_preprocess --cache-dir cache/tensors --gpu"
+
+# 检查 TotalSegmentator 是否可用（dry-run，不修改数据）
+data-organ-check = "python -m src.data.organ_preprocess --cache-dir cache/tensors --dry-run"
+
+# 5. 语义token预计算（默认禁用，仅 semantic_prior 需要）
+data-semantic = "python -m src.data.semantic_builder --cache-dir cache/tensors --backend radimagenet --gpu"
+
+# 一键运行完整数据预处理（manifest → cache → split → organ）
+data-setup = "python -m src.data.data_manifest --raw-root Data --dicom-root Data --output cache/manifest.csv --jsonl cache/manifest.jsonl --splits-dir cache/manifest_splits --report-dir cache/manifest_report --val-ratio 0.15 --seed 42 && python -m src.data.dataset --manifest cache/manifest.csv --out-dir cache/tensors --image-size 192 && python -m src.data.split_manifest --cache-dir cache/tensors --output cache/split_manifest.csv --val-ratio 0.15 --seed 42 && python -m src.data.organ_preprocess --cache-dir cache/tensors --gpu"
+
+# ===========================================================================
+# 训练
+# ===========================================================================
+
+# 标准训练：全部模块启用
+train = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml"
+
+# 快速冒烟训练：假数据，验证管线是否跑通
+train-smoke = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override data.use_fake_data=true --override training.num_epochs=5 --override runtime.eval_interval=2 --override runtime.save_interval=5 --override runtime.sample_interval=2"
+
+# 消融训练：去掉 Gabor 先验
+train-no-gabor = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --ablation no_gabor"
+
+# 消融训练：去掉 Hotspot 先验
+train-no-hotspot = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override modules.hotspot_prior.enabled=false --override losses.hotspot_prior.enabled=false"
+
+# 消融训练：去掉 Organ 先验
+train-no-organ = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override modules.organ_prior.enabled=false"
+
+# 消融训练：仅基础损失（无所有辅助损失项）
+train-base-only = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override losses.topk_lesion.enabled=false --override losses.focal_frequency.enabled=false --override losses.patch_nce.enabled=false --override losses.roi_suv.enabled=false --override losses.false_hotspot.enabled=false --override losses.organ_consistency.enabled=false --override losses.hotspot_prior.enabled=false --override losses.heteroscedastic_nll.enabled=false"
+
+# 带 WandB 日志的训练
+train-wandb = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override training.logger=wandb"
+
+# PNG-only baseline 训练（无 DICOM/SUV/organ 依赖，Gabor 四条路由全关）
+# 这是当前推荐的稳定无条纹 baseline 入口。启动时会运行 validate_png_baseline_config。
+train-png-baseline = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml"
+
+# PNG residual-frequency R0/R2/F1-F4 screen + artifact gates + clean top-K retraining
+train-frequency-ablations = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan.yaml --stage all"
+
+# V2: pretrain one shared PET mean, freeze it, then screen and promote variants
+train-frequency-ablations-v2 = "python scripts/run_frequency_ablations.py --plan configs/experiments/frequency_ablation_plan_v2.yaml --stage all"
+
+# V5: two-stage spectral-evidence/router screen and exact 300-epoch promotion.
+train-spectral-router-v5 = "python scripts/run_spectral_router_v5.py --plan configs/experiments/spectral_router_ablation_plan_v5.yaml --stage all"
+dry-run-spectral-router-v5 = "python scripts/run_spectral_router_v5.py --plan configs/experiments/spectral_router_ablation_plan_v5.yaml --stage all --dry-run"
+train-spectral-router-v5-t0-c1 = "python scripts/run_v5_t0_c1_300.py"
+dry-run-spectral-router-v5-t0-c1 = "python scripts/run_v5_t0_c1_300.py --dry-run"
+
+# PNG baseline 5-epoch 过拟合冒烟测试（假数据，验证管线）
+train-png-smoke = "python scripts/train_v2.py --config configs/experiments/slmf_png_baseline.yaml --override data.use_fake_data=true --override training.num_epochs=5 --override runtime.eval_interval=2 --override runtime.save_interval=5 --override runtime.sample_interval=2"
+
+# PNG baseline 评估
+eval-png-baseline = "python scripts/evaluate.py --config configs/experiments/slmf_png_baseline.yaml --split test"
+
+# 条纹诊断（A/B/C/D/E 五种 Gabor 路由配置对比）
+diagnose-stripes = "python scripts/diagnose_stripes.py --config configs/experiments/slmf_png_baseline.yaml --checkpoint $CKPT --split val --output-dir results/diag_stripes"
+
+# PNG 数据对齐检查（CT/PET/mask 配准、翻转/平移检测）
+validate-png-alignment = "python scripts/validate_png_alignment.py --config configs/experiments/slmf_png_baseline.yaml --output-dir results/alignment"
+
+# 从 checkpoint 恢复训练（设置 CKPT 环境变量指定路径）
+train-resume = "python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --override training.resume_from=$CKPT"
+
+# ===========================================================================
+# 评估 & 推理
+# ===========================================================================
+
+# 测试集完整评估
+eval-full = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --split test"
+
+# 验证集评估
+eval-val = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --split val"
+
+# 单样本推理（设置 SAMPLE_ID 环境变量）
+sample-one = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --sample-id $SAMPLE_ID --output-dir outputs/samples"
+
+# ===========================================================================
+# 测试
+# ===========================================================================
+
+# 冒烟测试
+test-smoke = "python -m pytest -q tests/test_smoke.py"
+
+# 冒烟测试：仅采样
+test-sample = "python -m pytest -q tests/test_smoke.py -k sample"
+
+# 完整测试套件
+test = "python -m pytest -q tests"
+
+# ===========================================================================
+# 工具
+# ===========================================================================
+
+# 查看模型参数量 & 模块状态（dry-run）
+inspect = "python scripts/inspect_model.py"
+
+# 查看 GPU 信息
+gpu-info = "python scripts/gpu_info.py"
+
+[dependencies]
+# 核心依赖，特别是需要从特定渠道（如pytorch, nvidia）获取的
+python = ">=3.11,<3.14"  # PyTorch 2.0+ 需要 Python 3.8 或更高版本
+scikit-image = ">=0.25.2,<0.26"
+
+[pypi-options]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[pypi-dependencies]
+# 其他可以通过 PyPI 安装的依赖
+torch = { version = ">=2.8.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+accelerate = "*"
+einops = "*"
+ema-pytorch = ">=0.4.2"
+numpy = "*"
+pillow = "*"
+pytorch-fid = "*"
+scipy = "*"
+tqdm = "*"
+# 新增的医学图像处理和感知损失相关依赖
+nibabel = "*"  # NIfTI格式支持
+TotalSegmentator = ">=2.13.0, <3"  # 器官分割（OrganPrior 必需）
+lpips = "*"    # 感知损失
+timm = "*"     # 预训练模型
+transformers = "*"  # Transformer组件
+diffusers = "*"     # Diffusion模型库
+opencv-python = "*"
+matplotlib = "*"
+tensorboard = "*"
+wandb = "*"
+pytest = "*"
+pydicom = ">=3.0.2, <4"

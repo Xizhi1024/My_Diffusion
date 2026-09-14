@@ -1,0 +1,125 @@
+# RC-BRD minimal smoke configuration (DESIGN §8 schema; PRD FR-5/DoD-1)
+#
+# 目标：rc_brd enabled=true 的最小可跑冒烟配置（FakeDataset 路径，CPU 快速）。
+#   - kappa=0 + 无合同 → bandwise 调度严格退化 scalar D1（FR-3.3），
+#     因此 contract_path 留空是合法冒烟形态；真实训练必须先 freeze 合同。
+#   - 所有 C1/C6/C7 开关取 PRD §3 默认值；specialist 默认开（A2 旁路可关）。
+#   - image_size=64（两级 Haar 要求 H,W 被 4 整除）；T=100 加速。
+
+experiment:
+  name: rc_brd_smoke
+  seed: 42
+
+data:
+  image_size: 64
+  batch_size: 2
+  val_batch_size: 2
+  augment: false
+  use_fake_data: true          # FakeDataset 冒烟路径（无真实数据）
+  required_keys:
+    - ct
+    - pet
+    - mask
+  optional_keys: []
+
+runtime:
+  device: cpu
+  amp: false
+  channels_last: false
+  torch_compile: false
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: null
+  gradient_accumulate_every: 1
+  grad_clip_norm: 1.0
+  eval_interval: 999
+  sample_interval: 999
+  save_interval: 999
+  eval_sampling_steps: 5
+  rc_brd_fold: fold_0           # runtime.rc_brd_fold：合同 fold 交叉校验（κ=0 冒烟不消费）
+
+training:
+  num_epochs: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  lr_min: 1.0e-6
+  ema:
+    decay: 0.999
+    update_every: 1
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  initialization_seed: 1234     # UNet 初始化与 rc_brd 开关解耦（fork_rng）
+  self_conditioning:
+    enabled: false
+    probability: 0.5
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  gabor: {enabled: false}
+  organ_prior: {enabled: false}
+  hotspot_prior: {enabled: false}
+  semantic_prior: {enabled: false}
+  zero_adapter: {enabled: false}
+  condition_dropout: {enabled: false}
+
+  bbdm_bridge:
+    enabled: true
+    name: bbdm_bridge
+    num_train_timesteps: 100    # 小 T 加速；rc_brd.num_timesteps 必须相等
+
+  conditional_mean:
+    enabled: true
+    architecture: low_frequency
+    base_channels: 8
+    levels: 2
+    freeze: false               # 冒烟不加载 checkpoint（真实运行用 comparison 格式 + freeze）
+    detach_bridge: true
+    loss_weight: 0.0
+
+  residual_bridge:
+    enabled: true
+    output_scale: 1.0           # 0.0 可精确回退 D0（μ only）
+    clip_output: false
+
+  residual_frequency:
+    enabled: false              # 旧 router 与 RC-BRD 互斥使用（[计划] §4）
+
+  rc_brd:                       # DESIGN §8（默认值取 PRD §3 主线）
+    enabled: true
+    forward_mode: bridge_time_changed   # C1（[审计] §1.2 bridge 主线）
+    kappa: 0.0                           # κ=0：严格 D1 等价冒烟；≠0 必须给 contract_path
+    num_timesteps: 100                   # 必须等于 bbdm_bridge.num_train_timesteps
+    sigma_bridge: 1.0                    # [审计] §3.2 σ_b²=2σ² 对齐
+    lambda_min: -10.0
+    lambda_max: 10.0
+    endpoint_mode: zeros                 # C7：e_r=0 主线
+    band_groups: 3                       # 与合同 band_groups 冗余时校验一致
+    contract_path: ""                    # κ=0 冒烟可空；freeze 后填 artifacts/<fold>/...
+    sampling_mode: endpoint_ddim         # v1.0g：endpoint_ddim|ancestral_mc（逐步 posterior 采样）
+    allow_unverified_tokens: false       # v1.0g provenance 逃生口（生产必须 false）
+    # ---- v1.0f 消融 5 键（_build_rc_brd 消费；此处为主线默认值）----
+    contract_transform: none              # none|flat_c|group_rotation|grid_reversal（需合同）
+    a3_variant: ""                        # 空|budget_matched|density_matched（C8）
+    density_match: ""                     # "logsnr"=A3b 密度匹配采样（需 a3_variant=density_matched）
+    loss_weighting: uniform               # uniform|per_band_min_snr（A8 逐带 min{SNR_b,γ}）
+    min_snr_gamma: 5.0                    # A8 的 γ
+    specialist:
+      enabled: true                      # A2 旁路开关（false → 不构造 head）
+      a_max: 0.25
+      d_max: 0.10                        # v1.0g tanh 幅度界（绝对 bound=a_max·d_max）
+      gate_init: 0.1
+      channels: 64                       # ct_feat 通道（[B,64,H/2,W/2]）
+    readout:
+      mode: mc_mean                      # C6：mc_mean | deterministic_head
+      mc_samples: 8                      # K=8（[计划] §7.3 冻结聚合）
+
+losses: {}

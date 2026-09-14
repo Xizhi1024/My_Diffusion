@@ -1,0 +1,159 @@
+# V6 keeps the V5 evidence front-end but repairs the sampler and learned-route
+# optimization.  Run with scripts/run_spectral_router_v5.py --plan <this file>.
+# V5 configs/results remain unchanged for provenance.
+base_config: configs/experiments/slmf_png_spectral_router_v5.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/spectral_router_repairs_v6
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+  # Avoid 90%-null gradient starvation and release learned routing only after
+  # native projections have acquired a usable signal path.
+  modules.residual_frequency.cross_level_router.initial_null_probability: 0.50
+  modules.residual_frequency.cross_level_router.native_warmup_epochs: 10
+  modules.residual_frequency.cross_level_router.routing_ramp_epochs: 10
+  # Prevent timestep jitter and discourage a learned all-null local optimum.
+  losses.spectral_router_regularization.temporal_weight: 0.0001
+  losses.spectral_router_regularization.active_mass_weight: 0.001
+  losses.spectral_router_regularization.active_mass_floor: 0.25
+  # Faster EMA is required for a branch that is deliberately zero-initialized.
+  training.ema.decay: 0.995
+  training.ema.update_every: 1
+  training.optimizer_groups.enabled: true
+  training.optimizer_groups.projection_lr: 0.0005
+  training.optimizer_groups.router_lr: 0.0005
+  training.optimizer_groups.descriptor_lr: 0.0002
+  training.optimizer_groups.no_decay_bias_and_offsets: true
+  runtime.gradient_diagnostics: true
+
+# Record the repaired-sampler S3 baseline and carry its already-established
+# evidence identity into Stage B.  This is intentionally not a second evidence
+# screen: a poor S3 baseline is information for the route comparison, not a
+# reason to prevent that comparison from running.
+stage_a:
+  reference_id: S3
+  top_k: 1
+  dry_run_selected_evidence: S3
+  experiment_prefix: sr_v6_stage_a
+  epochs: 30
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - {id: S3, preset: sr_v5_s3}
+  # S3 was selected by the completed V5 evidence screen.  An empty gate set
+  # makes this stage a provenance latch while preserving all measured metrics.
+  hard_gates: {}
+
+# Minimal causal screen: no injection, native-only, repaired learned 3-way,
+# and repaired learned 2-way.  Legacy and fixed-90%-null routes stay retired.
+stage_b:
+  reference_id: T_native
+  top_k: 2
+  experiment_prefix: sr_v6_stage_b
+  epochs: 50
+  eval_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  variants:
+    - id: N0
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: true
+    - id: T_native
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+        modules.residual_frequency.cross_level_router.policy: native_only
+    - id: C1
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+        modules.residual_frequency.cross_level_router.policy: learned
+    - id: C_no_null
+      overrides:
+        modules.residual_frequency.mode: spectral_evidence_router
+        modules.residual_frequency.cross_level_router.enabled: true
+        modules.residual_frequency.cross_level_router.hard_all_null: false
+        modules.residual_frequency.cross_level_router.policy: learned_no_null
+        modules.residual_frequency.cross_level_router.fixed_prior: [0.5, 0.5]
+  # The 50-epoch mechanism screen asks whether cross-level routing improves on
+  # the matched native-only route.  Publication/deployment absolute thresholds
+  # belong to the matched-budget promotion endpoint below.
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      {direction: lower, max_ratio: 0.95}
+    lesion_peak_error_norm_mean: {direction: lower, max_ratio: 0.95}
+    lesion_centroid_distance_mean: {direction: lower, max_delta: 0.25}
+    directional_spectrum_error_norm_mean: {direction: lower, max_delta: 0.0005}
+    failure_any_mean: {direction: lower, max_value: 0.25, max_delta: 0.0}
+    false_hotspot_density_mean:
+      {direction: lower, max_ratio: 1.25, epsilon: 0.000001}
+    stripe_excess_mean: {direction: lower, max_value: 0.20, max_delta: 0.03}
+    mae_mean: {direction: lower, max_delta: 0.002}
+    ssim_mean: {direction: higher, max_delta: 0.01}
+
+# Do not spend 300 epochs before the repaired mechanism clears its screen.
+promote:
+  experiment_prefix: sr_v6_confirm
+  epochs: 100
+  eval_interval: 20
+  save_interval: 20
+  sample_interval: 20
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+  trajectory_checkpoints: [20, 40, 60, 80, 100]
+  # Strict endpoint gates. These are intentionally not used to suppress a
+  # promising mechanism before it receives the full matched training budget.
+  hard_gates:
+    lesion_topq_peak_error_norm_mean:
+      {direction: lower, max_value: 0.12, max_ratio: 0.90}
+    lesion_peak_error_norm_mean: {direction: lower, max_value: 0.20}
+    lesion_centroid_distance_mean: {direction: lower, max_delta: 0.25}
+    directional_spectrum_error_norm_mean: {direction: lower, max_delta: 0.0005}
+    failure_any_mean: {direction: lower, max_value: 0.25, max_delta: 0.0}
+    false_hotspot_density_mean:
+      {direction: lower, max_ratio: 1.25, epsilon: 0.000001}
+    stripe_excess_mean: {direction: lower, max_value: 0.20, max_delta: 0.03}
+    mae_mean: {direction: lower, max_delta: 0.002}
+    ssim_mean: {direction: higher, max_delta: 0.01}
+
+paired_comparison:
+  seed: 42
+  resamples: 10000
+  metrics:
+    small_lesion_topq_peak_error_norm_mean: lower
+    small_lesion_cold_bias_norm_mean: lower
+    small_lesion_underestimate_mean: lower
+    lesion_topq_peak_error_norm_mean: lower
+    lesion_peak_error_norm_mean: lower
+    lesion_mean_error_norm_mean: lower
+    lesion_centroid_distance_mean: lower
+    lesion_boundary_gradient_mae_norm_mean: lower
+    anatomy_edge_gradient_mae_norm_mean: lower
+    directional_spectrum_error_norm_mean: lower
+    failure_any_mean: lower
+    false_hotspot_density_mean: lower
+    stripe_excess_mean: lower
+    mae_mean: lower
+    ssim_mean: higher

@@ -1,0 +1,176 @@
+# SLMF-BBDM: PNG-only baseline configuration
+#
+# 目标：建立可靠、无条纹的 PNG-only baseline。
+#   - 数据来自 PNG cache（cache/tensors_main），无 DICOM/SUV/organ 真值
+#   - 所有 DICOM/SUV/organ/metadata 路径完全关闭（不止 YAML 标记）
+#   - Gabor 模块保留（enabled=true）用于诊断，但四条路由全部关闭，
+#     切断 Gabor→条纹 的传播路径
+#   - 普通 BBDM bridge + raw CT concat + 基础重建损失
+#   - 第一阶段关闭 heteroscedastic / self_conditioning / condition_dropout
+#
+# 启动时会运行 validate_png_baseline_config 校验：若 data.mode=png 但
+# roi_suv / organ_prior / organ_consistency / metadata 任一开启，直接报错。
+
+experiment:
+  name: slmf_png_baseline
+  seed: 42
+
+data:
+  mode: png                         # PNG-only：触发启动校验，关闭 DICOM/SUV/organ 路径
+  cache_dir: cache/tensors_main
+  split_manifest: main_data/split_manifest.csv
+  image_size: 192
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys:
+    - ct
+    - pet
+    - mask
+  optional_keys: []                 # PNG cache 不含 organ/suv，不接受可选键
+
+runtime:
+  device: auto
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 50
+  eval_num_samples: 16
+  eval_seed: 42                     # fixed sampling noise for cross-epoch comparison
+  eval_sampling_steps: 20
+  sample_interval: 50
+  save_interval: 50
+  # 训练监控与模型选择（由 Trainer 读取）
+  tracked_sample_ids: []            # 空 → 自动按病灶面积选小/中/大各 2 例固定追踪
+  best_checkpoint:
+    enabled: true
+    combined_alpha: 0.5             # combined = α·lesion_score + (1-α)·image_score
+    stripe_penalty: 0.3             # combined 中 stripe 项的惩罚权重
+  early_stopping:
+    enabled: true
+    patience: 40                    # 连续 patience 个 epoch 无提升则停止
+    min_epochs: 50
+
+training:
+  num_epochs: 300                   # 默认上限 300（不再 1000）
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  lr_min: 1e-6
+  ema:
+    decay: 0.999
+    update_every: 10
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false     # 第一阶段关闭
+  self_conditioning:
+    enabled: false                  # 第一阶段关闭
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  # ---- Gabor：模块保留，四条路由全关 ----
+  # filters 是可学习参数；路由关闭后计算结果不进入 adapter/noise/hotspot/loss，
+  # 仅用于 diagnose_stripes.py 诊断。这是切断条纹传播的关键。
+  gabor:
+    enabled: true
+    filters: 32
+    inject_adapter: false
+    use_for_noise: false
+    use_for_hotspot: false
+    use_for_loss: false
+
+  organ_prior:
+    enabled: false                  # → NoOpPrior，不创建可训练参数
+
+  hotspot_prior:
+    enabled: false                  # 第一阶段关闭；启用时务必 target_mode=mask_only
+    base_channels: 16
+    params_max: 500000
+    use_gabor_energy: false         # use_for_hotspot=false 时强制 CT-only
+
+  semantic_prior:
+    enabled: false
+
+  zero_adapter:
+    enabled: false                  # raw CT concat（最简单、最稳定的 baseline）
+
+  condition_dropout:
+    enabled: false                  # 第一阶段关闭
+
+  # 普通 BBDM bridge（显式声明，不用 scale-adaptive）
+  bbdm_bridge:
+    name: bbdm_bridge
+    num_train_timesteps: 1000
+    m_schedule: linear
+
+losses:
+  # ---- lesion-aware（只用 ct/pet/mask，PNG 安全）----
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+
+  topk_lesion:
+    enabled: true
+    weight: 0.4
+    topk_percent: 0.01
+    active_tau_max: 0.5
+
+  outside_peak_ranking:
+    enabled: true
+    weight: 0.1
+    margin: 0.05
+    inside_radius: 3
+    outside_radius: 8
+    topk_percent: 0.01
+    active_tau_max: 0.65
+
+  # ---- 第一阶段关闭（疑似条纹/纹理复制源）----
+  focal_frequency:
+    enabled: false
+  patch_nce:
+    enabled: false                  # raw-image CT-PET 对比会鼓励 CT 纹理复制
+
+  # ---- PNG 无对应真值，必须关闭 ----
+  roi_suv:
+    enabled: false                  # PNG 无 SUV 标定
+  organ_consistency:
+    enabled: false                  # PNG 无 organ mask
+  false_hotspot:
+    enabled: false                  # 依赖 organ_mask（PNG 全零）
+  hotspot_prior:
+    enabled: false                  # 第一阶段关闭
+    target_mode: mask_only          # 启用时严格来自 lesion mask（禁止全图 top5%）
+  heteroscedastic_nll:
+    enabled: false                  # enable_heteroscedastic=false
+  segmenter_consistency:
+    enabled: false
+
+metadata:
+  enabled: false                    # 依赖 DICOM metadata（PNG 无）
+
+segmenter:
+  enabled: false                    # 需要预训练 segmenter
+
+evaluation:
+  mc_samples: 1
+  physical_suv_available: false     # 报告中明确标记：无物理 SUV
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

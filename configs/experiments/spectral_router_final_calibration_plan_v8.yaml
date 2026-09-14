@@ -1,0 +1,176 @@
+# V8 is a final low-learning-rate calibration, not a router redesign. Every
+# candidate starts from the EMA weights of the safest V7 endpoint.
+base_config: configs/experiments/slmf_png_spectral_router_v5.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/spectral_router_final_calibration_v8
+reference_id: CAL_CTRL
+top_k: 1
+include_reference_in_promotion: true
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  training.init_from: checkpoints/sr_v7_confirm_cold_rank/ckpt_epoch0050.pt
+  training.init_weights: ema
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+  modules.residual_frequency.mode: spectral_evidence_router
+  modules.residual_frequency.cross_level_router.enabled: true
+  modules.residual_frequency.cross_level_router.hard_all_null: false
+  modules.residual_frequency.cross_level_router.policy: learned
+  modules.residual_frequency.cross_level_router.native_warmup_epochs: 0
+  modules.residual_frequency.cross_level_router.routing_ramp_epochs: 0
+  losses.spectral_router_regularization.temporal_weight: 0.0001
+  losses.spectral_router_regularization.active_mass_weight: 0.001
+  losses.spectral_router_regularization.active_mass_floor: 0.25
+
+  # Preserve the V7 COLD_RANK mechanism in every candidate.
+  losses.normalized_lesion_peak.weight: 0.20
+  losses.normalized_lesion_peak.cold_weight: 2.0
+  losses.normalized_lesion_peak.active_tau_max: 0.55
+  losses.outside_peak_ranking.enabled: true
+  losses.outside_peak_ranking.weight: 0.05
+  losses.outside_peak_ranking.active_tau_max: 0.55
+
+  # Small calibration steps limit hotspot and localization regressions.
+  training.learning_rate: 0.00002
+  training.ema.decay: 0.99
+  training.ema.update_every: 1
+  training.optimizer_groups.enabled: true
+  training.optimizer_groups.projection_lr: 0.00005
+  training.optimizer_groups.router_lr: 0.00005
+  training.optimizer_groups.descriptor_lr: 0.00002
+  training.optimizer_groups.no_decay_bias_and_offsets: true
+  runtime.gradient_diagnostics: true
+  evaluation.small_lesion_quantile: 0.25
+  evaluation.small_lesion_underestimate_tolerance: 0.05
+
+variants:
+  # Estimates whether low-LR continuation alone closes the final 0.0086 gap.
+  - id: CAL_CTRL
+    preset: sr_v5_s3
+
+  # Modestly strengthens the already successful asymmetric peak correction.
+  - id: PEAK25
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.25
+      losses.normalized_lesion_peak.cold_weight: 2.5
+
+  # Applies PEAK25 over a wider noise range.
+  - id: PEAK_WIDE
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.25
+      losses.normalized_lesion_peak.cold_weight: 2.5
+      losses.normalized_lesion_peak.active_tau_max: 0.65
+
+  # Increases the safety ranking alongside PEAK25 to prevent outside hotspots.
+  - id: BALANCED
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.25
+      losses.normalized_lesion_peak.cold_weight: 2.5
+      losses.outside_peak_ranking.weight: 0.075
+
+  # Adds only a weak target-position increase; the harmful V7 value was 0.25.
+  - id: TOPK18
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.25
+      losses.normalized_lesion_peak.cold_weight: 2.5
+      losses.topk_lesion.weight: 0.18
+
+screen:
+  experiment_prefix: sr_v8_screen
+  epochs: 12
+  eval_interval: 4
+  save_interval: 4
+  sample_interval: 4
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+  evaluate_final_checkpoint: true
+
+# The short screen tests reproducible relative calibration gain. The absolute
+# 0.12 publication target is reserved for the independent-seed endpoint below.
+hard_gates:
+  lesion_topq_peak_error_norm_mean: {direction: lower, max_ratio: 0.98}
+  lesion_peak_error_norm_mean: {direction: lower, max_ratio: 0.98}
+  small_lesion_topq_peak_error_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_cold_bias_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_underestimate_mean: {direction: lower, max_delta: 0.0}
+  lesion_centroid_distance_mean: {direction: lower, max_delta: 0.10}
+  lesion_boundary_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  anatomy_edge_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  directional_spectrum_error_norm_mean: {direction: lower, max_delta: 0.0005}
+  failure_any_mean: {direction: lower, max_value: 0.15, max_delta: 0.0}
+  false_hotspot_density_mean:
+    {direction: lower, max_ratio: 1.10, epsilon: 0.000001}
+  stripe_excess_mean: {direction: lower, max_delta: 0.02}
+  mae_mean: {direction: lower, max_delta: 0.001}
+  ssim_mean: {direction: higher, max_delta: 0.005}
+
+# A passing candidate is repeated from the same V7 EMA source with a new data
+# order. It does not continue from its screen optimizer state.
+promote:
+  experiment_prefix: sr_v8_final
+  epochs: 12
+  eval_interval: 4
+  save_interval: 4
+  sample_interval: 4
+  split: val
+  max_samples: 64
+  seed: 43
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+  evaluate_final_checkpoint: true
+
+promotion_hard_gates:
+  lesion_topq_peak_error_norm_mean: {direction: lower, max_value: 0.12}
+  lesion_peak_error_norm_mean: {direction: lower, max_value: 0.12}
+  small_lesion_topq_peak_error_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_cold_bias_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_underestimate_mean: {direction: lower, max_delta: 0.0}
+  lesion_centroid_distance_mean: {direction: lower, max_delta: 0.10}
+  lesion_boundary_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  anatomy_edge_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  directional_spectrum_error_norm_mean: {direction: lower, max_delta: 0.0005}
+  failure_any_mean: {direction: lower, max_value: 0.15, max_delta: 0.0}
+  false_hotspot_density_mean:
+    {direction: lower, max_ratio: 1.10, epsilon: 0.000001}
+  stripe_excess_mean: {direction: lower, max_delta: 0.02}
+  mae_mean: {direction: lower, max_delta: 0.001}
+  ssim_mean: {direction: higher, max_delta: 0.005}
+
+paired_comparison:
+  seed: 42
+  resamples: 10000
+  metrics:
+    small_lesion_topq_peak_error_norm_mean: lower
+    small_lesion_cold_bias_norm_mean: lower
+    small_lesion_underestimate_mean: lower
+    lesion_topq_peak_error_norm_mean: lower
+    lesion_topq_cold_bias_norm_mean: lower
+    lesion_peak_error_norm_mean: lower
+    lesion_mean_error_norm_mean: lower
+    lesion_centroid_distance_mean: lower
+    lesion_boundary_gradient_mae_norm_mean: lower
+    failure_any_mean: lower
+    false_hotspot_density_mean: lower
+    stripe_excess_mean: lower
+    mae_mean: lower
+    ssim_mean: higher

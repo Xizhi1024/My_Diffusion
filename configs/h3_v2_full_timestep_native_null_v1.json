@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "stage": "05C_h3_v2_full_timestep_native_null",
+  "pipeline_id": "H3_V2_FULL_TIMESTEP_NATIVE_NULL_CALIBRATION_V1",
+  "status": "PREREGISTERED_BEFORE_H3_V2_CALIBRATION_OR_MODEL_EVALUATION",
+  "scope": "stage_A1_timestep_band_availability_screen_not_a_ternary_destination_router",
+  "mechanism_role": {
+    "stage": "A1_availability_screen",
+    "tested_component": "full_timestep_band_conditioned_native_null_availability",
+    "availability_parameter": "a_l_b_t",
+    "destination_component_status": "NOT_EVALUATED",
+    "artifact_safety_component_status": "OUTPUT_SAFETY_GATES_ONLY_NOT_A_VALIDATED_SAFETY_MECHANISM",
+    "h3_driven_curriculum_status": "NOT_EVALUATED",
+    "full_ternary_router_claim_allowed": false,
+    "recoverability_specificity_claim_requires_future_controls": [
+      "timestep_shuffle",
+      "wrong_band_schedule"
+    ]
+  },
+  "historical_results_preserved": {
+    "original_h3_logsnr_recoverability": "PASS",
+    "05B_h3_fixed_schedule_inference_admissibility": "FAIL",
+    "h4_v1": "FAIL",
+    "h4_v2_production_inference_admissibility": "FAIL",
+    "must_not_overwrite_or_relabel": true
+  },
+  "dataset_contract": {
+    "patients": 155,
+    "samples": 1191,
+    "mechanism_train_patients": 99,
+    "calibration_patients": 25,
+    "validation_patients": 31,
+    "test_set_exists": false,
+    "validation_previously_exposed": true,
+    "manifest_path": "main_data/split_manifest.csv",
+    "manifest_file_sha256": "6b2130712b14c6846645491bf924be9f3b41ef25c4159ed12fe306838283c9ce",
+    "manifest_semantic_sha256": "2d0638808211e67483a60b43467533456a95c22688765b67af6cf22cf427711c",
+    "dataset_contract_path": "configs/dataset_contract_stage0a_v1.json",
+    "dataset_contract_sha256": "f43229d1d03f9bc68ad6218d009b9915155e00fcb4b95a0f9666d1c323cc88c1",
+    "cache_dir": "cache/tensors_main",
+    "cache_lineage_path": "cache/tensors_main/cache_lineage.json",
+    "cache_payload_sha256": "3b127294021f25f85f0a432ad6a2c31131beff51a84370f5d2f4db487345226a",
+    "cache_metadata_sha256": "1e2e9438610d67f4c9195d37217ab41f8a90b727053ace2ddefca48414f40c5d",
+    "mechanism_partition_sha256": "8c7ff390f666d21a6599169fdfc7fc3f431eb17f32cd4245eccc43b856fab295",
+    "partition_unit": "patient",
+    "authoritative_fields": [
+      "sample_id",
+      "patient_id",
+      "split"
+    ]
+  },
+  "mean_checkpoint": {
+    "decision_path": "results/mechanism_validation_v2/03_excluded_mean_production/decision.json",
+    "decision_file_sha256": "dea018977a600e1abad7c78fcb1375a139585ebb1249f823063b8840cfa47f9e",
+    "decision_pipeline_id": "V2_EXCLUDED_MEAN_PRODUCTION_V1",
+    "decision_required": "PASS",
+    "path": "checkpoints/freq_mean_excluded_v1/mean_best.pt",
+    "file_sha256": "f04c1d79214247c11cd1cff296fffc3020a835af0785aa5d084cae601768c5e8",
+    "sidecar_path": "checkpoints/freq_mean_excluded_v1/mean_best.pt.fingerprint.json",
+    "sidecar_fingerprint_sha256": "8ffe445e0a5ba863b320b977a668ccc4d1f8f90e6f66f65aff52ac67c5c8b67f",
+    "pathology_exclusion_enabled": true,
+    "guard_radius_px": 8,
+    "production_cutover_claimed": false
+  },
+  "calibration": {
+    "partitions_read": [
+      "mechanism_train",
+      "calibration"
+    ],
+    "validation_images_read": false,
+    "validation_metrics_drive_schedule_or_gate": false,
+    "num_train_timesteps": 1000,
+    "m_schedule": "linear",
+    "sigma_scale": 1.0,
+    "band_order": [
+      "l2_lh",
+      "l2_hl",
+      "l2_hh",
+      "l1_lh",
+      "l1_hl",
+      "l1_hh"
+    ],
+    "route_order": [
+      "native",
+      "shallow",
+      "null"
+    ],
+    "analysis_seed": 20260730,
+    "batch_size": 8,
+    "timestep_chunk_size": 16,
+    "num_workers": 2,
+    "noise_identity": "one_sha256(analysis_seed|partition_role|sample_id)_derived_fixed_epsilon_reused_across_all_timesteps",
+    "common_random_numbers_across_timesteps": true,
+    "recoverability_metric": "lesion_masked_cosine_alignment_scaled_to_[0,1]",
+    "patient_weighting": "equal_patient_weight_within_each_band_and_timestep",
+    "active_mass_transform": "clip((recoverability-0.5)/0.5,0,1)",
+    "shape_constraint": "per_band_isotonic_non_increasing_over_all_directly_measured_timesteps",
+    "direct_measurement_grid": {
+      "minimum": 0,
+      "maximum": 999,
+      "step": 1,
+      "count": 1000,
+      "interpolation": "forbidden",
+      "nearest_neighbor": "forbidden",
+      "global_mean_fallback": "forbidden"
+    },
+    "mapping": {
+      "formula": "[native, shallow, null] = [active_mass, 0, 1-active_mass]",
+      "shallow_route_policy": "structurally_zero",
+      "justification": "H3 recoverability supplies one identifiable active-mass degree of freedom; no evidence identifies a separate shallow allocation.",
+      "target_pet_at_runtime": false,
+      "lesion_mask_at_runtime": false,
+      "recoverability_label_at_runtime": false,
+      "single_slice_residual_band_evidence_at_runtime": false
+    }
+  },
+  "calibration_gates": {
+    "required_mechanism_train_patients": 99,
+    "required_calibration_patients": 25,
+    "required_band_count": 6,
+    "required_timestep_count": 1000,
+    "all_values_finite_and_in_range": true,
+    "all_frozen_curves_non_increasing": true,
+    "minimum_active_mass_at_t0": 0.98,
+    "maximum_active_mass_at_t999": 0.1,
+    "calibration_schedule_vs_band_constant": {
+      "metric": "patient_mean_squared_error_on_recoverability",
+      "contrast": "h3_v2_schedule_mse_minus_mechanism_train_band_constant_mse",
+      "required_bootstrap_ci95_high_below": 0.0,
+      "minimum_improved_patient_fraction": 0.8,
+      "bootstrap_replicates": 10000,
+      "bootstrap_seed": 20260731
+    },
+    "decision": "PASS_only_if_every_integrity_and_scientific_gate_passes",
+    "on_fail": "stop_before_model_training_and_write_FAIL_decision"
+  },
+  "runtime_contract": {
+    "route_policy": "h3_native_null",
+    "schedule_lookup": "exact_integer_timestep_only",
+    "schedule_tensor_shape": [
+      2,
+      3,
+      1000
+    ],
+    "schedule_tensor_order": [
+      "level_[L2,L1]",
+      "band_[LH,HL,HH]",
+      "timestep_[0..999]"
+    ],
+    "h3_evidence_amplitude_head": "structurally_bypassed",
+    "l3_injection": "zero_tensor",
+    "default_production_v5_behavior_changed": false,
+    "activation_requires_explicit_experimental_config": true,
+    "forbidden_runtime_inputs": [
+      "target_pet",
+      "lesion_mask",
+      "recoverability_label",
+      "single_slice_residual_band_evidence",
+      "random_batch_adjacency"
+    ]
+  },
+  "exploratory_model_experiment": {
+    "runs_only_after_calibration_pass": true,
+    "stage_A1_design": "candidate_vs_no_route_after_offline_band_constant_calibration_gate",
+    "comparators": [
+      "no_route",
+      "h3_v2_native_null"
+    ],
+    "specificity_controls_completed_in_model_training": [],
+    "specificity_controls_deferred_until_candidate_support": [
+      "band_constant",
+      "timestep_shuffle",
+      "wrong_band_schedule"
+    ],
+    "training_partition": "mechanism_train_99_patients_only",
+    "checkpoint_selection_partition": "calibration_25_patients_only",
+    "same_initialization_seed": 4242,
+    "same_epoch_budget": true,
+    "default_epochs": 50,
+    "training_monitor_samples": 4,
+    "exact_final_epoch_checkpoint": true,
+    "evaluation_partition": "validation_31_patients_previously_exposed",
+    "evaluation_label": "post_hoc_internal_exploratory_only",
+    "evaluation_sampling_steps": 20,
+    "evaluation_seed": 20260732,
+    "patients_044_and_153_must_be_reported": true,
+    "patients_002_022_080_must_not_be_hidden": true,
+    "primary_gate": {
+      "metric": "small_lesion_topq_peak_error_norm_mean",
+      "contrast": "h3_v2_minus_no_route",
+      "direction": "lower",
+      "required_bootstrap_ci95_high_below": 0.0,
+      "minimum_patients": 10
+    },
+    "safety_gates": {
+      "mae_mean_maximum_delta": 0.002,
+      "stripe_abs_excess_mean_maximum_delta": 0.05,
+      "failure_any_mean_maximum_delta": 0.0625,
+      "false_hotspot_density_mean_maximum_ratio": 1.25,
+      "false_hotspot_ratio_epsilon": 1e-06
+    },
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 20260733,
+    "allowed_positive_wording": "The Stage-A1 full-timestep band-conditioned native/null availability candidate obtained internal exploratory support versus no-route on the existing exposed dataset; destination, safety-mechanism, curriculum, and schedule-specificity claims remain untested.",
+    "allowed_negative_wording": "The Stage-A1 full-timestep band-conditioned native/null availability candidate did not obtain internal support versus no-route on the existing exposed dataset."
+  },
+  "stop_and_claim_rules": {
+    "production_training": false,
+    "production_activation": false,
+    "h5_started": false,
+    "h6_started": false,
+    "h4_v1_or_v2_restored": false,
+    "full_ternary_router_claim": false,
+    "destination_mechanism_claim": false,
+    "artifact_safety_mechanism_claim": false,
+    "h3_driven_curriculum_claim": false,
+    "recoverability_schedule_specificity_claim": false,
+    "independent_validation_claim": false,
+    "external_generalization_claim": false,
+    "confirmatory_evidence_claim": false,
+    "next_production_stage_allowed": false
+  },
+  "runtime_sources": {
+    "calibration_script": {
+      "path": "scripts/calibrate_h3_v2_full_timestep_native_null.py",
+      "file_sha256": "ad65795304b0930251f33b1c29061e576d524c3fedcd131fafc5159942dab98f"
+    },
+    "h2_predictor_helpers": {
+      "path": "scripts/validate_h2_pathology_excluded_residual.py",
+      "file_sha256": "f46b8dad621f2e5480d5e1496efae62c3d75a112ae3410874f1ae8e7ca91a02c"
+    },
+    "h4_band_helpers": {
+      "path": "scripts/validate_h4_noise_band_calibration.py",
+      "file_sha256": "9316569dd4cbafc1241c0e3c89248f1ebf72aa9435cb122d8c08fd439f4a1136"
+    },
+    "mechanism_common": {
+      "path": "src/mechanism_validation/common.py",
+      "file_sha256": "b8077386c983a10ae8fa4d37fbd6e9ad37ebbd8781de1e0c0fff8c3a25176f8f"
+    },
+    "cached_dataset": {
+      "path": "src/data/dataset.py",
+      "file_sha256": "ded42c301478c5d2293562321ba0365972906ffb2b74405f092b675c37923878"
+    },
+    "data_lineage": {
+      "path": "src/data/lineage.py",
+      "file_sha256": "bf96c2ad820fd973c4fd3a18db35d160391081fd8e0be5b989168f4359dd2c94"
+    },
+    "bridge_schedule": {
+      "path": "src/model/noise/base.py",
+      "file_sha256": "a5b34d025b995c2a8912fd6306af9a6f7840894281b9c2e947efe67002d1ec35"
+    },
+    "schedule_loader": {
+      "path": "src/model/frequency/h3_native_null_schedule.py",
+      "file_sha256": "f890e81d79479af6a54d6e43cdff61c9256522ca2a8253a4d436ff3e9b55587e"
+    },
+    "haar_transform": {
+      "path": "src/model/frequency/haar.py",
+      "file_sha256": "872ffd9057a8cffa3d8e8252fff41d276cceb982285e9730673a5539a2c5ff9d"
+    },
+    "boundary_reliable_router_base": {
+      "path": "src/model/frequency/boundary_reliable.py",
+      "file_sha256": "5ab23dbe8f51d2fec2021f6e648d5b7cbd6f01766bf48fb88fcfca93625ab912"
+    },
+    "spectral_router": {
+      "path": "src/model/frequency/spectral_router.py",
+      "file_sha256": "d95d09246b6a3b60a0c72e1374095c89e6dade6719a85d719a56e5f5e918b634"
+    },
+    "slmf_bbdm": {
+      "path": "src/model/slmf_bbdm.py",
+      "file_sha256": "464e8f4e8af169b7976094096cc465487554d14bcd1dba9017acae2bf682bb1e"
+    },
+    "experiment_builder": {
+      "path": "scripts/build_h3_v2_experiment_configs.py",
+      "file_sha256": "5a23946294ca37b28756ed9b7cb0ab3bbb8a3b8f7274147ce8e9bc55643eebc7"
+    },
+    "experiment_analyzer": {
+      "path": "scripts/analyze_h3_v2_experiment.py",
+      "file_sha256": "57f32faefe56570b575cab7ef9890e30747acc4a4302bfca372489d1a9ef8c81"
+    },
+    "training_entry": {
+      "path": "scripts/train_v2.py",
+      "file_sha256": "86125f12f0d0645a364c6c6308fb3acc2eaf889a9ebac66ed4bb34a43b92df4a"
+    },
+    "trainer": {
+      "path": "src/model/trainer.py",
+      "file_sha256": "e8feecf5ea6cca6ef125738143fce5d967c027e00e994629479d600658d6cae6"
+    },
+    "config_resolution": {
+      "path": "src/model/config_utils.py",
+      "file_sha256": "6314570e05a92c16183eb7e918a4ad5aee042e51bc326eefccf5c105756fbdda"
+    },
+    "evaluation_entry": {
+      "path": "scripts/evaluate.py",
+      "file_sha256": "e929405c0ce3670da1286875bec30d77f4a100d4dc0e43b403646af290ec98e6"
+    },
+    "base_experiment_config": {
+      "path": "configs/experiments/slmf_png_spectral_router_v5.yaml",
+      "file_sha256": "42f77c7c9460ecba596ac3ca16bc3d234af8d437611fa68febf5d99d1e74f59d"
+    },
+    "freeze_integrity_audit": {
+      "path": "scripts/audit_v2_freeze_integrity.py",
+      "file_sha256": "1ccd15a822bf47169a86011e75ba73d0dc87934e76a6c04d0ac819c03695a0b2"
+    },
+    "overnight_runner": {
+      "path": "scripts/run_h3_v2_overnight.py",
+      "file_sha256": "e6e05e52d46d777ab674a7c74bd8e70d30fc5664d53ecc78fa2105201601202e"
+    },
+    "overnight_launcher": {
+      "path": "scripts/run_h3_v2_overnight.ps1",
+      "file_sha256": "f5338c29d0bbf9389e1ba707227ea68adddc758013b88adf5792a5473d904fd7"
+    }
+  },
+  "config_sha256": "82e418129be15cbcb2914cd99ebf5ba2783c74e3084f2396a5d90f464c5cbb39"
+}

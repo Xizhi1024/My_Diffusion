@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+norecursedirs = [
+    ".pixi",
+    ".git",
+    "cache",
+    "checkpoints",
+    "Data",
+    "notebook",
+    "outputs",
+    "results",
+    "samples",
+    "vis_epoch1000",
+    "wuzhe",
+    "wuzhe_data",
+]
+addopts = [
+    "--strict-markers",
+    "-p no:cacheprovider",
+]

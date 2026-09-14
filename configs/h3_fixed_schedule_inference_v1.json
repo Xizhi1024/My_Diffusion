@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "stage": "05B_h3_fixed_schedule_inference",
+  "pipeline_id": "H3_FIXED_SCHEDULE_INFERENCE_V1",
+  "status": "FROZEN_BEFORE_MODEL_EVALUATION",
+  "scope": "audit_only_evidence_free_h3_schedule_and_recoverability_to_route_identifiability",
+  "source_artifacts": {
+    "production_calibration_bundle": {
+      "path": "results/mechanism_validation_v2/04_main_integration_freeze/production_calibration_bundle.json",
+      "file_sha256": "b25e98994d057769087351f238bcdf4d551220022d5cd0f9c5be579c180990ef",
+      "self_hash_field": "bundle_sha256",
+      "self_sha256": "02042c9c959038610de21bea9bc732caa15ba84f37b3f48198cf9ed3660c5525"
+    },
+    "resolved_integration_contract": {
+      "path": "results/mechanism_validation_v2/04_main_integration_freeze/resolved_integration_contract.json",
+      "file_sha256": "0016c0380ead1d4ed8ad2fcc1c7665cfcb79cbcbb241424ea44db4ab6e837dd1",
+      "self_hash_field": "contract_sha256",
+      "self_sha256": "15fed00ba875a4cb78ad9a3c9217e871f9037970dd372582d15252f3b2f76a35"
+    }
+  },
+  "runtime_sources": {
+    "slmf_bbdm": {
+      "path": "src/model/slmf_bbdm.py",
+      "file_sha256": "8216d9e100bd5682a473fbf3dff8b888d666d963edec45db1cc3495423c2ce6c"
+    },
+    "spectral_router": {
+      "path": "src/model/frequency/spectral_router.py",
+      "file_sha256": "8337db1cfc0ac1d47260f449588cd8f6de3ee5137ea04e53162a6353f0615718"
+    },
+    "production_v5_config": {
+      "path": "configs/experiments/slmf_png_spectral_router_v5.yaml",
+      "file_sha256": "42f77c7c9460ecba596ac3ca16bc3d234af8d437611fa68febf5d99d1e74f59d"
+    }
+  },
+  "frozen_partitions": {
+    "h3_schedule_source": {
+      "fingerprint_sha256": "744327eb274d9ff230e57e9a737f30bbb63fdea05ea2abec12413a0469b5c865",
+      "bundle_field": "source.original_partition_fingerprint_sha256"
+    },
+    "h4_v2_nested_lineage": {
+      "fingerprint_sha256": "0146d21dc3b242e65977fda52f32cf3c6efe79b8fd11011b392068b69a0ba9ad",
+      "bundle_field": "source.h4_v2_nested_partition_fingerprint_sha256",
+      "contract_field": "h4_v2_reference.partition_fingerprint_sha256"
+    }
+  },
+  "h3_schedule_contract": {
+    "bundle_model_key": "h3_fixed_schedule",
+    "type": "frozen_band_timestep_schedule",
+    "bands": [
+      "l2_lh",
+      "l2_hl",
+      "l2_hh",
+      "l1_lh",
+      "l1_hl",
+      "l1_hh"
+    ],
+    "timesteps": [
+      0,
+      50,
+      100,
+      200,
+      350,
+      500,
+      650,
+      800,
+      900,
+      950
+    ],
+    "entry_count": 60,
+    "availability_scope": "frozen_grid_exact_lookup_only",
+    "scalar_minimum": 0.0,
+    "scalar_maximum": 1.0,
+    "runtime_lookup_inputs": [
+      "band",
+      "timestep",
+      "frozen_schedule_constants"
+    ],
+    "forbidden_runtime_inputs": [
+      "target_pet",
+      "lesion_mask",
+      "recoverability_label",
+      "single_slice_residual_band_evidence",
+      "random_batch_adjacency"
+    ],
+    "off_grid_lookup_authorized": false
+  },
+  "production_timestep_contract": {
+    "num_train_timesteps": 1000,
+    "training_timestep_minimum": 0,
+    "training_timestep_maximum": 999,
+    "training_timestep_sampler": "torch.randint(0,T)",
+    "eval_sampling_steps": 20,
+    "eval_timestep_builder": "torch.linspace(T-1,0,steps,dtype=torch.long)",
+    "expected_eval_timesteps": [
+      999,
+      946,
+      893,
+      841,
+      788,
+      736,
+      683,
+      630,
+      578,
+      525,
+      473,
+      420,
+      368,
+      315,
+      262,
+      210,
+      157,
+      105,
+      52,
+      0
+    ],
+    "expected_frozen_grid_overlap": [
+      0
+    ],
+    "expected_off_grid_count": 19,
+    "off_grid_resolver_status": "UNDEFINED_FAIL_CLOSED",
+    "authorized_off_grid_resolver": null,
+    "forbidden_unfrozen_substitutes": [
+      "nearest",
+      "interpolation",
+      "global_mean_fallback"
+    ]
+  },
+  "production_code_state_contract": {
+    "h3_fixed_schedule_activation": "ABSENT_NOT_ACTIVATED",
+    "uncertainty_aware_router_default_enabled": false,
+    "l3_injection": "zero_tensor",
+    "route_order": [
+      "native",
+      "shallow",
+      "null"
+    ],
+    "forbidden_direct_router_inputs": [
+      "target_pet",
+      "lesion_mask"
+    ],
+    "compatibility_inputs_must_be_discarded": [
+      "lesion_score",
+      "topq_mask"
+    ]
+  },
+  "mapping_contract": {
+    "input": "one_scalar_recoverability_per_band_timestep",
+    "required_route_order": [
+      "native",
+      "shallow",
+      "null"
+    ],
+    "required_output": "three_component_probability_distribution",
+    "frozen_mapping_status": "UNDEFINED_FAIL_CLOSED",
+    "bundle_undefined_marker": "does NOT define the mapping",
+    "contract_scalar_marker": "h3_fixed_schedule scalar recoverability",
+    "authorized_mapping": null,
+    "identifiability_rule": "A scalar does not uniquely identify a three-route probability distribution unless a recoverability-to-route function and its constraints are frozen before evaluation.",
+    "conservative_substitute_allowed": false
+  },
+  "decision_policy": {
+    "expected_decision": "FAIL",
+    "next_stage_allowed": false,
+    "model_evaluation_allowed": false,
+    "production_activation_allowed": false,
+    "stop_before_model_change": true
+  },
+  "config_sha256": "103878ed0fb4ea67e5d9f6dd9d13fd53d49d8d0661f0d86150ccd21969681036"
+}

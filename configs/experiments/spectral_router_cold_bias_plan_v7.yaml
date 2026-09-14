@@ -1,0 +1,169 @@
+# V7 starts every candidate from the same repaired C1-100 model weights and
+# uses fresh optimizer/scheduler/EMA state. It isolates the remaining cold
+# lesion bias before any spatial-router redesign is attempted.
+base_config: configs/experiments/slmf_png_spectral_router_v5.yaml
+ablation_config: configs/experiments/ablations.yaml
+output_dir: results/spectral_router_cold_bias_v7
+reference_id: CTRL
+top_k: 2
+include_reference_in_promotion: true
+
+mean_pretrain:
+  enabled: false
+  checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+
+common_train_overrides:
+  training.init_from: checkpoints/sr_v6_confirm_evidence-s3_c1/ckpt_epoch0100.pt
+  model.initialization_seed: 4242
+  modules.conditional_mean.checkpoint: checkpoints/freq_mean_pretrain_v2/mean_best.pt
+  modules.conditional_mean.freeze: true
+  modules.conditional_mean.loss_weight: 0.0
+
+  modules.residual_frequency.mode: spectral_evidence_router
+  modules.residual_frequency.cross_level_router.enabled: true
+  modules.residual_frequency.cross_level_router.hard_all_null: false
+  modules.residual_frequency.cross_level_router.policy: learned
+  # The checkpoint already contains a trained router. Replaying warm-up after
+  # init_from would incorrectly disable it for the first 10 fine-tuning epochs.
+  modules.residual_frequency.cross_level_router.native_warmup_epochs: 0
+  modules.residual_frequency.cross_level_router.routing_ramp_epochs: 0
+  losses.spectral_router_regularization.temporal_weight: 0.0001
+  losses.spectral_router_regularization.active_mass_weight: 0.001
+  losses.spectral_router_regularization.active_mass_floor: 0.25
+
+  # Conservative fine-tuning rates, shared by every causal candidate.
+  training.learning_rate: 0.0001
+  training.ema.decay: 0.995
+  training.ema.update_every: 1
+  training.optimizer_groups.enabled: true
+  training.optimizer_groups.projection_lr: 0.0002
+  training.optimizer_groups.router_lr: 0.0002
+  training.optimizer_groups.descriptor_lr: 0.0001
+  training.optimizer_groups.no_decay_bias_and_offsets: true
+  runtime.gradient_diagnostics: true
+  evaluation.small_lesion_quantile: 0.25
+
+variants:
+  # Same losses and reliability as V6: estimates the benefit of 30 more epochs.
+  - id: CTRL
+    preset: sr_v5_s3
+
+  # Tests whether weak asymmetric peak supervision is the cold-bias bottleneck.
+  - id: COLD
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.20
+      losses.normalized_lesion_peak.cold_weight: 2.0
+      losses.normalized_lesion_peak.active_tau_max: 0.55
+
+  # Tests whether CT/PET frequency disagreement is suppressing CT-occult lesions.
+  - id: CT_RELAX
+    preset: sr_v5_s3
+    overrides:
+      modules.residual_frequency.ct_reliability_floor_l2: 0.10
+      modules.residual_frequency.ct_reliability_floor_l1: 0.25
+
+  # Adds target-position supervision on top of COLD to test localization drift.
+  - id: COLD_ALIGN
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.20
+      losses.normalized_lesion_peak.cold_weight: 2.0
+      losses.normalized_lesion_peak.active_tau_max: 0.55
+      losses.topk_lesion.weight: 0.25
+
+  # Adds inside-vs-outside ranking on top of COLD to test false-hotspot control.
+  - id: COLD_RANK
+    preset: sr_v5_s3
+    overrides:
+      losses.normalized_lesion_peak.weight: 0.20
+      losses.normalized_lesion_peak.cold_weight: 2.0
+      losses.normalized_lesion_peak.active_tau_max: 0.55
+      losses.outside_peak_ranking.enabled: true
+      losses.outside_peak_ranking.weight: 0.05
+      losses.outside_peak_ranking.active_tau_max: 0.55
+
+# Short causal screen. Exact epoch-30 endpoints are compared; no per-run best
+# checkpoint selection is allowed.
+screen:
+  experiment_prefix: sr_v7_screen
+  epochs: 30
+  eval_interval: 10
+  save_interval: 10
+  sample_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+  evaluate_final_checkpoint: true
+
+# Candidates must improve the remaining peak error while preserving C1 safety.
+hard_gates:
+  lesion_topq_peak_error_norm_mean: {direction: lower, max_ratio: 0.98}
+  lesion_peak_error_norm_mean: {direction: lower, max_delta: 0.005}
+  lesion_centroid_distance_mean: {direction: lower, max_delta: 0.10}
+  failure_any_mean: {direction: lower, max_delta: 0.0}
+  false_hotspot_density_mean:
+    {direction: lower, max_ratio: 1.10, epsilon: 0.000001}
+  stripe_excess_mean: {direction: lower, max_delta: 0.02}
+  mae_mean: {direction: lower, max_delta: 0.001}
+  ssim_mean: {direction: higher, max_delta: 0.005}
+
+# If a candidate passes, retrain it and CTRL from the same C1-100 weights for
+# an exact 50-epoch endpoint. This is not continuation from the 30-epoch screen.
+promote:
+  experiment_prefix: sr_v7_confirm
+  epochs: 50
+  eval_interval: 10
+  save_interval: 10
+  sample_interval: 10
+  split: val
+  max_samples: 64
+  seed: 42
+  mc_steps: 20
+  early_stopping: false
+  require_final_checkpoint: true
+  evaluate_final_checkpoint: true
+
+# The confirmed candidate must retain its overall peak target and may not buy
+# that gain by sacrificing the bottom-quartile small-lesion stratum.
+promotion_hard_gates:
+  lesion_topq_peak_error_norm_mean:
+    {direction: lower, max_value: 0.12, max_ratio: 0.95}
+  lesion_peak_error_norm_mean: {direction: lower, max_value: 0.12}
+  small_lesion_topq_peak_error_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_cold_bias_norm_mean:
+    {direction: lower, max_ratio: 1.00}
+  small_lesion_underestimate_mean: {direction: lower, max_delta: 0.0}
+  lesion_centroid_distance_mean: {direction: lower, max_delta: 0.10}
+  lesion_boundary_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  anatomy_edge_gradient_mae_norm_mean: {direction: lower, max_delta: 0.002}
+  directional_spectrum_error_norm_mean: {direction: lower, max_delta: 0.0005}
+  failure_any_mean: {direction: lower, max_value: 0.15, max_delta: 0.0}
+  false_hotspot_density_mean:
+    {direction: lower, max_ratio: 1.10, epsilon: 0.000001}
+  stripe_excess_mean: {direction: lower, max_delta: 0.02}
+  mae_mean: {direction: lower, max_delta: 0.001}
+  ssim_mean: {direction: higher, max_delta: 0.005}
+
+paired_comparison:
+  seed: 42
+  resamples: 10000
+  metrics:
+    small_lesion_topq_peak_error_norm_mean: lower
+    small_lesion_cold_bias_norm_mean: lower
+    small_lesion_underestimate_mean: lower
+    lesion_topq_peak_error_norm_mean: lower
+    lesion_peak_error_norm_mean: lower
+    lesion_topq_cold_bias_norm_mean: lower
+    lesion_mean_error_norm_mean: lower
+    lesion_centroid_distance_mean: lower
+    lesion_boundary_gradient_mae_norm_mean: lower
+    failure_any_mean: lower
+    false_hotspot_density_mean: lower
+    stripe_excess_mean: lower
+    mae_mean: lower
+    ssim_mean: higher

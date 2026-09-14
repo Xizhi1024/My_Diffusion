@@ -1,0 +1,217 @@
+# SLMF-BBDM: Full configuration (all modules enabled)
+
+experiment:
+  name: slmf_bbdm_full
+  seed: 42
+
+data:
+  cache_dir: cache/tensors
+  split_manifest: cache/split_manifest.csv
+  image_size: 192
+  batch_size: 8
+  val_batch_size: 4
+  augment: true
+  required_keys:
+    - ct
+    - pet
+    - mask
+  optional_keys:
+    - organ_mask
+    - organ_distance
+    - mu_map
+    - ct_hu
+    - pet_suv
+    - semantic_tokens
+    - meta
+
+runtime:
+  device: auto
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  eval_interval: 50
+  eval_num_samples: 16
+  eval_sampling_steps: 50
+  sample_interval: 50
+  save_interval: 100
+  mc_samples_eval: 20
+
+training:
+  stage: lesion_posttrain
+  lesion_posttrain:
+    enabled: true
+    description: ROI dense reconstruction plus outside-peak ranking for small-lesion PET fidelity
+  num_epochs: 1000
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  lr_min: 1e-6
+  ema:
+    decay: 0.999
+    update_every: 10
+
+model:
+  unet_type: diffusers
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: true
+  heteroscedastic_logvar_min: -6.0
+  heteroscedastic_logvar_max: 2.0
+  self_conditioning:
+    enabled: true
+    probability: 0.5
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  gabor:
+    enabled: true
+    filters: 32
+    inject_adapter: true
+    use_for_noise: true
+    use_for_loss: true
+
+  organ_prior:
+    enabled: true
+    organ_channels: 6
+    mu_map_channels: 1
+    out_channels: [16, 32, 64]
+
+  hotspot_prior:
+    enabled: true
+    base_channels: 16
+    params_max: 500000
+
+  semantic_prior:
+    enabled: false
+    mode: cached_tokens
+    token_dim: 64
+    num_tokens: 4
+
+  zero_adapter:
+    enabled: true
+
+  condition_dropout:
+    enabled: true
+    p_organ: 0.05           # ↓0.1
+    p_hotspot: 0.03          # ↓0.1 keep hotspot (lesion location) prior more often
+    p_semantic: 0.1
+    p_meta: 0.1
+    p_gabor: 0.15            # ↑0.1 drop gabor more (suspected stripe source)
+
+  scale_adaptive_noise:
+    enabled: true
+    name: scale_adaptive
+    num_train_timesteps: 1000
+    low_sigma_mult: 1.0
+    mid_sigma_mult: 0.75
+    high_sigma_mult: 0.45
+    use_gabor_energy: true
+    bridge_mode: true
+
+losses:
+  topk_lesion:
+    enabled: true
+    weight: 0.4              # ↑0.2 strengthen lesion shape (mask-based already covers full lesion)
+    topk_percent: 0.01       # unused when lesion mask present
+    active_tau_max: 0.5      # ↑0.25 activate lesion loss earlier
+
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0              # dense PET supervision inside dilated lesion ROI
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+
+  outside_peak_ranking:
+    enabled: true
+    weight: 0.1              # keep mask-outside peaks below mask-inside peaks
+    margin: 0.05
+    inside_radius: 3
+    outside_radius: 8
+    topk_percent: 0.01
+    active_tau_max: 0.65
+
+  focal_frequency:
+    enabled: true
+    weight: 0.03             # ↓0.1 suspected stripe/streak artifact source
+    alpha: 1.0
+    active_tau_max: 0.35     # ↓0.4
+
+  patch_nce:
+    enabled: true
+    weight: 0.03             # ↓0.1 reduce local-texture matching pressure
+    patch_size: 5            # ↑3 larger patch = less local texture bias
+    num_patches: 256
+    temperature: 0.07
+    active_tau_max: 0.45     # ↓0.6
+
+  roi_suv:
+    enabled: true
+    weight: 0.5              # main lesion intensity driver (TBR term removed in code)
+    active_tau_max: 0.4
+
+  false_hotspot:
+    enabled: true
+    weight: 0.10             # ↑0.05 suppress mask-outer hotspots harder
+    active_tau_max: 0.45     # ↑0.3
+
+  organ_consistency:
+    enabled: true
+    weight: 0.05             # ↓0.1 relax (endometrium lesions sit in pelvic region)
+    active_tau_min: 0.25
+    cold_weight: 0.02
+
+  hotspot_prior:
+    enabled: true
+    weight: 0.15             # ↑0.1
+    active_tau_min: 0.15     # ↓0.25
+    active_tau_max: 0.85     # ↑0.75
+    distance_weight: 0.5     # ↑0.25 strengthen location supervision
+
+  segmenter_consistency:
+    enabled: false  # enable only after segmenter reaches recall ≥ 0.70
+    weight: 0.1
+    active_tau_max: 0.3
+
+  heteroscedastic_nll:
+    enabled: true
+    weight: 0.1              # avoid NLL dominating / variance-cheating
+
+evaluation:
+  mc_samples: 8
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0
+
+# ---- Metadata FiLM injection (patient/scan metadata → UNet ResBlocks) ----
+# When enabled, extracts per-sample DICOM metadata (uptake time, weight, age,
+# slice thickness, z position) and injects via FiLM into every ResBlock.
+# Requires re-preprocessing with the updated CacheBuilder to populate metadata
+# fields in scale_meta.  Old cache files work with zero-filled metadata.
+metadata:
+  enabled: false  # set to true to activate
+
+# ---- Tiny PET Segmenter (frozen, for L_seg) ----
+# Three-stage training protocol:
+#   Stage 1: PET → Gaussian heatmap (σ=6px), L1
+#   Stage 2: PET → distance-transform (relaxed), L1
+#   Stage 3: PET → hard mask, Dice+Focal
+# After training (lesion recall ≥ 0.70 on val), freeze and use as L_seg.
+# Stage 2 is used for L_seg (continuous, stable gradients).
+segmenter:
+  enabled: false           # enable ONLY after pre-training segmenter
+  base_channels: 16        # ~0.25M params
+  stage: 2                 # 2 = distance-transform (for L_seg)
+  gaussian_sigma: 6.0
+  checkpoint: null         # path to pretrained segmenter weights

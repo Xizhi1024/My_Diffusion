@@ -1,0 +1,115 @@
+# SLMF-BBDM: Ablation presets
+# Usage: python scripts/train_v2.py --config configs/experiments/slmf_full.yaml --ablation no_gabor
+
+ablations:
+  # ---- Full baseline (all off) ----
+  baseline:
+    description: Raw CT concat + standard BBDM + base MSE loss only
+    overrides:
+      modules.gabor.enabled: false
+      modules.organ_prior.enabled: false
+      modules.hotspot_prior.enabled: false
+      modules.semantic_prior.enabled: false
+      modules.zero_adapter.enabled: false
+      modules.condition_dropout.enabled: false
+      modules.scale_adaptive_noise.enabled: false
+      modules.scale_adaptive_noise.name: bbdm_bridge
+      losses.topk_lesion.enabled: false
+      losses.focal_frequency.enabled: false
+      losses.patch_nce.enabled: false
+      losses.roi_suv.enabled: false
+      losses.false_hotspot.enabled: false
+      losses.heteroscedastic_nll.enabled: false
+      losses.hotspot_prior.enabled: false
+      model.enable_heteroscedastic: false
+      model.self_conditioning.enabled: false
+
+  # ---- Single-module ablations ----
+  no_gabor:
+    description: Remove Gabor bank and all Gabor-dependent weighting
+    overrides:
+      modules.gabor.enabled: false
+      modules.scale_adaptive_noise.use_gabor_energy: false
+      losses.focal_frequency.enabled: false
+
+  no_patch_nce:
+    description: Remove CT-PET patch contrastive spatial binding
+    overrides:
+      losses.patch_nce.enabled: false
+
+  no_organ:
+    description: Remove organ prior conditioning
+    overrides:
+      modules.organ_prior.enabled: false
+
+  no_hotspot:
+    description: Remove tiny hotspot prior network
+    overrides:
+      modules.hotspot_prior.enabled: false
+      losses.hotspot_prior.enabled: false
+
+  no_zero_adapter:
+    description: Use raw CT concat instead of ZeroConv Adapter
+    overrides:
+      modules.zero_adapter.enabled: false
+
+  isotropic_noise:
+    description: Replace scale-adaptive noise with standard isotropic noise
+    overrides:
+      modules.scale_adaptive_noise.enabled: false
+      modules.scale_adaptive_noise.name: bbdm_bridge
+
+  ddpm_not_bbdm:
+    description: Standard DDPM instead of Brownian bridge
+    overrides:
+      modules.scale_adaptive_noise.name: ddpm
+
+  no_time_varying_loss:
+    description: Keep all loss terms but make them active across all timesteps
+    overrides:
+      losses.topk_lesion.active_tau_max: 1.0
+      losses.focal_frequency.active_tau_max: 1.0
+      losses.roi_suv.active_tau_max: 1.0
+      losses.false_hotspot.active_tau_max: 1.0
+
+  no_heteroscedastic:
+    description: Remove heteroscedastic uncertainty head
+    overrides:
+      model.enable_heteroscedastic: false
+      losses.heteroscedastic_nll.enabled: false
+
+  no_self_conditioning:
+    description: Remove previous-x0 self-conditioning input
+    overrides:
+      model.self_conditioning.enabled: false
+
+  no_condition_dropout:
+    description: Remove condition dropout during training
+    overrides:
+      modules.condition_dropout.enabled: false
+
+  # ---- Multi-module combinations ----
+  loss_only_baseline:
+    description: Only loss terms enabled, all prior/conditioning modules off
+    overrides:
+      modules.gabor.enabled: false
+      modules.organ_prior.enabled: false
+      modules.hotspot_prior.enabled: false
+      modules.semantic_prior.enabled: false
+      modules.zero_adapter.enabled: false
+      modules.condition_dropout.enabled: false
+      modules.scale_adaptive_noise.enabled: false
+      modules.scale_adaptive_noise.name: bbdm_bridge
+
+  prior_only_baseline:
+    description: Only prior modules enabled, all losses off (except base MSE)
+    overrides:
+      losses.topk_lesion.enabled: false
+      losses.focal_frequency.enabled: false
+      losses.patch_nce.enabled: false
+      losses.roi_suv.enabled: false
+      losses.false_hotspot.enabled: false
+      losses.heteroscedastic_nll.enabled: false
+      losses.hotspot_prior.enabled: false
+      model.enable_heteroscedastic: false
+      modules.condition_dropout.enabled: false

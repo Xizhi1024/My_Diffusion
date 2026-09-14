@@ -1,0 +1,169 @@
+# Perceptual x0 ablation plan v1 — PFM-inspired frozen-feature supervision.
+#
+# Experiment contract for Stage A: five arms on the slmf_png_baseline.yaml base.
+# Only the supervision terms differ across arms; the base (data split, init seed,
+# optimizer, batch order, epochs, sample noise) is shared and fixed.  Weight
+# selection happens ONLY on the calibration partition; validation is untouched
+# until the single frozen winner proceeds to Stage B.
+#
+# All arms are defined here with explicit placeholders; the runner
+# (scripts/run_perceptual_x0_ablation.py) audits fairness and fails closed when
+# a required real encoder checkpoint is missing (dry-run reports BLOCKED).
+#
+# Claim boundary: PFM-inspired supervision-space ablation, NOT a reproduction
+# of Perceptual Flow Matching; no BBDM equation is changed.
+
+experiment:
+  name: perceptual_x0_ablation_v1
+  seed: 42
+
+# The immutable git base this experiment is layered on.  Recorded in every
+# resolved config and execution metadata so the base SHA is never ambiguous,
+# even after the working tree is committed later.
+base_commit_sha256: 6a90921e21a8a5a01189fc642c8f4b07743c5c4b
+
+base_config: configs/experiments/slmf_png_baseline.yaml
+
+arms:
+  P0_PIXEL:
+    description: >-
+      Reference arm. Current base reconstruction plus existing lesion losses
+      from slmf_png_baseline.yaml; no segmenter_consistency, no perceptual_x0.
+    supervision: pixel
+    losses:
+      segmenter_consistency:
+        enabled: false
+      perceptual_x0:
+        enabled: false
+
+  P1_SEG_OUT:
+    description: >-
+      Baseline + existing segmenter_consistency output consistency.  Isolates
+      'final-task-output supervision' from 'intermediate-feature supervision'.
+      Requires a real frozen TinySegmenter checkpoint (enabled via the segmenter
+      block below); without one the segmenter_consistency loss is zero.
+    supervision: segmenter_output
+    segmenter:
+      enabled: true
+      in_channels: 1
+      base_channels: 16
+      stage: 2
+      gaussian_sigma: 6.0
+      checkpoint: checkpoints/tiny_segmenter_v1/segmenter.pt   # PLACEHOLDER
+      require_checkpoint_lineage: true
+    losses:
+      segmenter_consistency:
+        enabled: true
+        weight: 0.1
+        active_tau_max: 0.3
+      perceptual_x0:
+        enabled: false
+
+  P2_FEAT_GLOBAL:
+    description: >-
+      Baseline + frozen pretrained PET multiscale feature loss, global mean.
+      Basic perceptual x0 supervision test (no lesion balancing).
+    supervision: perceptual_global
+    losses:
+      segmenter_consistency:
+        enabled: false
+      perceptual_x0:
+        enabled: true
+        weight: 1.0
+        checkpoint: checkpoints/pet_feature_encoder_v1/encoder_best.pt
+        checkpoint_dir: checkpoints
+        encoder_kind: pretrained
+        feature_layers: [full, half, quarter]
+        layer_weights: [1.0, 0.5, 0.25]
+        distance: charbonnier
+        charbonnier_eps: 1.0e-3
+        region_mode: global
+        dilate_radius: 3
+        timestep_weighting: uniform
+        require_checkpoint_lineage: true
+
+  P3_FEAT_LESION_BALANCED:
+    description: >-
+      Main candidate. Baseline + lesion/background separately normalised
+      multiscale feature loss so small lesions are not drowned out by the
+      whole-image mean.
+    supervision: perceptual_lesion_balanced
+    losses:
+      segmenter_consistency:
+        enabled: false
+      perceptual_x0:
+        enabled: true
+        weight: 1.0
+        checkpoint: checkpoints/pet_feature_encoder_v1/encoder_best.pt
+        checkpoint_dir: checkpoints
+        encoder_kind: pretrained
+        feature_layers: [full, half, quarter]
+        layer_weights: [1.0, 0.5, 0.25]
+        distance: charbonnier
+        charbonnier_eps: 1.0e-3
+        region_mode: lesion_balanced
+        lesion_weight: 4.0
+        background_weight: 1.0
+        dilate_radius: 3
+        timestep_weighting: uniform
+        require_checkpoint_lineage: true
+
+  P4_FEAT_RANDOM:
+    description: >-
+      Negative control. Same structure/param count as P3 but a randomly
+      initialised then frozen encoder.  Detects whether any benefit comes from
+      the learned representation rather than from the nonlinear regularisation.
+    supervision: perceptual_random
+    losses:
+      segmenter_consistency:
+        enabled: false
+      perceptual_x0:
+        enabled: true
+        weight: 1.0
+        checkpoint: null
+        checkpoint_dir: checkpoints
+        encoder_kind: random       # explicit negative control — no checkpoint
+        feature_layers: [full, half, quarter]
+        layer_weights: [1.0, 0.5, 0.25]
+        distance: charbonnier
+        charbonnier_eps: 1.0e-3
+        region_mode: lesion_balanced
+        lesion_weight: 4.0
+        background_weight: 1.0
+        dilate_radius: 3
+        timestep_weighting: uniform
+        require_checkpoint_lineage: false
+
+# Fairness contract checked by the runner's dry-run audit:
+#   - All arms share the base config's data split, initialization_seed, batch
+#     order, optimizer, epoch count, and evaluation seed.
+#   - Arms differ ONLY in the supervision terms listed above.
+#   - The validation partition never participates in weight selection; weights
+#     are frozen on calibration only.
+fairness:
+  split_manifest: main_data/split_manifest.csv
+  cache_dir: cache/tensors
+  shared_initialization_seed: 42
+  shared_epochs: 300
+  shared_eval_seed: 42
+  weight_selection_partition: calibration
+  validation_touched_for_selection: false
+
+# Evaluation grid for validate_perceptual_x0_few_step.py.  The primary
+# comparison uses full arm names; the validator maps short labels (P3, P0, P4)
+# to them automatically.
+evaluation:
+  nfe_grid: [20, 8, 4, 2]
+  primary_endpoint: small_lesion_topq_peak_error_norm
+  primary_comparison: P3_FEAT_LESION_BALANCED@8 vs P0_PIXEL@8
+  non_inferiority_vs_P0_20:
+    - small_lesion_underestimate
+    - mae
+    - ssim
+    - target_relative_false_hotspot_density
+    - stripe_abs_excess
+    - lesion_boundary_gradient_mae_norm
+    - failure_any
+  learned_representation_control: P3@8 vs P4@8
+  minimum_paired_patients: 5
+  alpha: 0.05
