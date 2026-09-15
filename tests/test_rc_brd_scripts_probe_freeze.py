@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -87,6 +88,42 @@ class _Scratch:
 @pytest.fixture()
 def scratch(t_dir: Path) -> _Scratch:
     return _Scratch(t_dir)
+
+
+def _ragged_npz(base: Path, *, zero_patient: bool = False,
+                group_varying: bool = False) -> Path:
+    """Cached probe matrix with ragged per-patient stratum membership.
+
+    Half the patients hold 20 small-lesion coefficients, the other half 12,
+    so every cell is ragged and must subsample to quota=12.  zero_patient
+    empties patient 0's confirmatory coefficients entirely (hard error).
+    group_varying makes odd groups use a 16/10 split instead, so adjacent
+    groups' natural quotas differ (12 vs 10) and the wrong-band null must
+    align the pair to the smaller quota (review finding 4).
+    """
+    P, C, D = 15, 32, 3
+    rng = np.random.default_rng(7)
+    z = rng.standard_normal((3, 3, P, C))
+    u = rng.standard_normal((3, 3, P, C))
+    x = rng.standard_normal((3, 3, P, C, D))
+    sid = np.zeros((3, 3, P, C), dtype=np.int64)
+    for gi in range(3):
+        for p in range(P):
+            if group_varying and gi % 2 == 1:
+                keep = 16 if p < P // 2 else 10
+            else:
+                keep = 20 if p < P // 2 else 12
+            sid[gi, :, p, keep:] = 1
+    if zero_patient:
+        sid[:, :, 0, :] = 1
+    path = base / "ragged.npz"
+    np.savez(path,
+             patient_ids=np.array([f"p{i:03d}" for i in range(P)]),
+             groups=np.array(["low", "mid", "high"]),
+             lambdas=np.array([-2.0, 0.0, 2.0]),
+             strata=np.array(["small_lesion"]),
+             z=z, u=u, x=x, stratum_ids=sid)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +285,9 @@ def test_freeze_roundtrip_loadable_and_c_matches_probe(scratch):
     # psd floors come from the probe data (synthetic noise-variance proxy)
     assert set(contract.psd_floors) == set(probe["psd_floors"])
     assert contract.log_snr_grid == tuple(probe["grid"]["log_snr_centers"])
+    # AUDIT evidence-chain gate: b_active holds only groups with >=1 passing
+    # confirmatory cell (probe recoverable=("low","mid") by default).
+    assert set(contract.b_active) == {"low", "mid"}
 
 
 def test_freeze_mean_checkpoint_sha_matches_direct(scratch, t_dir):
@@ -283,3 +323,126 @@ def test_freeze_fold_mismatch_exits_1(scratch):
     assert rc == 0
     rc, _ = _freeze(scratch, probe_out, fold="fold_9")
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# AUDIT evidence-chain gates: PASS-only freeze + b_active passing groups
+# ---------------------------------------------------------------------------
+
+def test_freeze_refuses_probe_that_failed_pass_rule(scratch):
+    rc, probe_out, result = scratch.run_probe(probe_config(recoverable=()))
+    assert rc == 0
+    assert result["pass_rule"]["passed"] is False
+    rc, _ = _freeze(scratch, probe_out)
+    assert rc == 1  # FAILED probes must never freeze
+
+
+def test_freeze_refuses_probe_json_without_pass_rule(scratch, t_dir):
+    rc, probe_out, probe = scratch.run_probe(probe_config())
+    assert rc == 0
+    stripped = dict(probe)
+    stripped.pop("pass_rule")
+    p2 = t_dir / "no_pass_rule.json"
+    p2.write_text(json.dumps(stripped), encoding="utf-8")
+    rc, _ = _freeze(scratch, p2)
+    assert rc == 1  # a missing pass_rule is not a PASS
+
+
+def test_freeze_malformed_per_cell_exits_1(scratch, t_dir):
+    # Review finding 3: a truthy non-mapping per_cell must fail cleanly.
+    rc, probe_out, probe = scratch.run_probe(probe_config())
+    assert rc == 0
+    edited = json.loads(json.dumps(probe))
+    edited["pass_rule"]["per_cell"] = 5  # malformed
+    p2 = t_dir / "bad_per_cell.json"
+    p2.write_text(json.dumps(edited), encoding="utf-8")
+    rc, _ = _freeze(scratch, p2)
+    assert rc == 1
+
+
+def test_freeze_b_active_only_groups_with_passing_cells(scratch, t_dir):
+    rc, probe_out, probe = scratch.run_probe(probe_config(recoverable=("low",)))
+    assert rc == 0
+    assert probe["pass_rule"]["passed"] is True
+    # Keep the overall PASS verdict but leave only "low" with passing cells.
+    edited = json.loads(json.dumps(probe))
+    for cell, judgement in edited["pass_rule"]["per_cell"].items():
+        if not cell.startswith("low|"):
+            judgement["pass"] = False
+    p2 = t_dir / "only_low.json"
+    p2.write_text(json.dumps(edited), encoding="utf-8")
+    rc, out = _freeze(scratch, p2)
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    assert tuple(contract.b_active) == ("low",)  # canonical order, passing only
+
+
+# ---------------------------------------------------------------------------
+# AUDIT evidence-chain fix: patient-level variable-length cells
+# ---------------------------------------------------------------------------
+
+def test_probe_ragged_cells_subsampled_deterministically(scratch, t_dir):
+    npz = _ragged_npz(t_dir)
+    config = {"probe": {"source": "npz", "path": str(npz)},
+              "cross_fit": {"n_folds": 3, "ridge_lambda": 0.01}, "seed": 5}
+    rc1, _out1, r1 = scratch.run_probe(config, n_perm=50)
+    rc2, _out2, r2 = scratch.run_probe(config, n_perm=50)
+    assert rc1 == 0 and rc2 == 0
+    cell = r1["delta"]["small_lesion"]["mid"]["1"]
+    assert cell["n_coef"] == 12      # per-cell quota = min per-patient count
+    assert cell["ragged_cell"] is True
+    assert r1 == r2                  # seeded subsample -> bit-identical reruns
+
+
+def test_probe_zero_coefficient_patient_exits_1(scratch, t_dir):
+    npz = _ragged_npz(t_dir, zero_patient=True)
+    config = {"probe": {"source": "npz", "path": str(npz)}, "seed": 5}
+    rc, _out, _result = scratch.run_probe(config)
+    assert rc == 1  # a patient with zero coefficients in a cell is a hard error
+
+
+def test_probe_group_varying_quotas_wrong_band_null_runs(scratch, t_dir):
+    # Review finding 4: adjacent groups with different natural quotas (12 vs
+    # 10) must not shape-error the wrong-band null — the pair aligns to the
+    # smaller quota and the probe completes.
+    npz = _ragged_npz(t_dir, group_varying=True)
+    config = {"probe": {"source": "npz", "path": str(npz)},
+              "cross_fit": {"n_folds": 3, "ridge_lambda": 0.01}, "seed": 5}
+    rc, _out, result = scratch.run_probe(config, n_perm=50)
+    assert rc == 0
+    even = result["delta"]["small_lesion"]["low"]["0"]["n_coef"]
+    odd = result["delta"]["small_lesion"]["mid"]["0"]["n_coef"]
+    assert even == 12 and odd == 10  # per-group natural minima preserved
+
+
+# ---------------------------------------------------------------------------
+# schema v2: freeze writes band_powers (never silent; DESIGN_RC_BRD_clock_v2)
+# ---------------------------------------------------------------------------
+
+def test_freeze_writes_explicit_default_band_powers(scratch):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    rc, out = _freeze(scratch, probe_out)
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    # absent CLI/probe powers -> explicit all-1.0 (power-blind control A)
+    assert contract.band_powers == {"low": 1.0, "mid": 1.0, "high": 1.0}
+    assert contract.band_powers_split == "outer_train_fold_0"
+
+
+def test_freeze_cli_band_powers_propagated(scratch):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    scratch.counter += 1
+    out = scratch.base / ("contract" + str(scratch.counter) + ".json")
+    rc = FREEZE.main([
+        "--probe-result", str(probe_out), "--fold", "fold_0",
+        "--out", str(out), "--s-ref", "0.05",
+        "--kappa-grid", "0.0,0.5", "--mean-sha", MEAN_SHA,
+        "--band-powers", "low=0.2", "--band-powers", "mid=1.0",
+        "--band-powers", "high=5.0",
+        "--band-power-split", "outer_train_fold_2"])
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    assert contract.band_powers == {"low": 0.2, "mid": 1.0, "high": 5.0}
+    assert contract.band_powers_split == "outer_train_fold_2"

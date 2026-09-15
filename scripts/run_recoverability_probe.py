@@ -21,6 +21,13 @@ band groups x 3 log-SNR regions x small-lesion as the only confirmatory
 stratum; full = 7 bands x K lambda x 3 strata. Patients below the grid
 threshold exit 2.
 
+Patient-level variable-length cells (audit evidence-chain fix): a cell whose
+per-patient stratum coefficient counts are ragged is subsampled per patient,
+without replacement, to the per-cell minimum count with a seed derived from
+(probe seed, group, lambda region, stratum) - reproducible and recorded per
+cell as delta[stratum][group][k]["n_coef"] / ["ragged_cell"]. A patient with
+zero coefficients in a cell remains a hard error (exit 1).
+
 CLI: --config --fold --grid {compressed,full} --n-perm 1000 --out. The data
 source is injectable: config probe.source = "synthetic" (seeded generator)
 or "npz" (cached probe matrix; array contract in load_npz_probe_data).
@@ -256,16 +263,60 @@ def cell_probe(z: np.ndarray, u: np.ndarray, x: np.ndarray, folds: list[np.ndarr
             "t_obs": float(d_obs.mean() / se), "t_null": t_null}
 
 
-def _cell_arrays(data: ProbeData, gi: int, k: int, si: int) -> tuple[np.ndarray, ...]:
-    """Rows of one (group, lambda, stratum) cell as [P,C] / [P,C,D] arrays."""
+def _cell_arrays(data: ProbeData, gi: int, k: int, si: int,
+                  quota_seed: int = 0,
+                  quota: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, bool]:
+    """Rows of one (group, lambda, stratum) cell as [P,C] / [P,C,D] arrays.
+
+    AUDIT evidence-chain fix (patient-level variable-length handling): the
+    boolean-mask + reshape(P, -1) construction silently assumed every patient
+    contributes the SAME number of coefficients to the cell.  With real npz
+    data, per-patient stratum membership is ragged: a ragged mask either
+    crashed reshape with an opaque message or - when the selected total
+    happened to be divisible by P - mis-aligned coefficients ACROSS patients
+    (silent data corruption).  Now every patient contributes exactly
+    quota = min_p(count_p) coefficients: equal-count cells pass through
+    unchanged; ragged cells draw a seeded per-patient subsample (no
+    replacement, sorted positions) so the rectangular [P,C] algebra -
+    including the cross-patient position pairing UX[p,q,d] of the
+    permutation null - stays exact, reproducible (quota_seed) and
+    patient-level.  Returns (z, u, x, quota, ragged); quota < 1 still raises.
+    """
     mask = data.stratum_ids[gi, k] == si
-    if int(mask.sum(axis=1).min()) < 1:
+    counts = mask.sum(axis=1)
+    if int(counts.min()) < 1:
         raise ValueError("every patient needs >=1 coefficient per cell")
     P = data.z.shape[2]
+    quota_min = int(counts.min())
+    if quota is not None:
+        # explicit quota (cross-group pairing alignment, review finding 4)
+        quota = int(quota)
+        if quota < 1 or quota > quota_min:
+            raise ValueError(f"requested quota {quota} outside [1, {quota_min}] "
+                             "for the cell")
+    else:
+        quota = quota_min
+    ragged = bool(int(counts.max()) != quota)
+    if ragged:
+        # Deterministic per-cell RNG: same probe seed -> same subsample ->
+        # bit-reproducible probe JSON (freeze consumes the JSON verbatim).
+        cell_seed = (int(quota_seed) * 1_000_003 + gi * 8_191 + k * 131 + si) % (2**63 - 1)
+        rng = np.random.default_rng(cell_seed)
+        picks = []
+        for p in range(P):
+            idx = np.flatnonzero(mask[p])
+            if idx.size != quota:
+                idx = np.sort(rng.choice(idx, size=quota, replace=False))
+            picks.append(idx)
+        idx_p = np.stack(picks)                                   # [P, quota]
+        z = np.take_along_axis(data.z[gi, k], idx_p, axis=1)
+        u = np.take_along_axis(data.u[gi, k], idx_p, axis=1)
+        x = np.take_along_axis(data.x[gi, k], idx_p[:, :, None], axis=1)
+        return z, u, x, quota, ragged
     z = data.z[gi, k][mask].reshape(P, -1)
     u = data.u[gi, k][mask].reshape(P, -1)
     x = data.x[gi, k][mask].reshape(P, z.shape[1], data.x.shape[-1])
-    return z, u, x
+    return z, u, x, quota, ragged
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +324,7 @@ def _cell_arrays(data: ProbeData, gi: int, k: int, si: int) -> tuple[np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _evaluate_grid(data: ProbeData, folds: list[np.ndarray], ridge: float,
-                   perms: np.ndarray) -> tuple[dict[tuple, dict], np.ndarray]:
+                   perms: np.ndarray, quota_seed: int = 0) -> tuple[dict[tuple, dict], np.ndarray]:
     """Cross-fit every cell; returns cell stats + [n_perm, n_cells] null T's."""
     n_cells = len(data.groups) * len(data.lambdas) * len(data.strata)
     cells: dict[tuple, dict] = {}
@@ -282,10 +333,15 @@ def _evaluate_grid(data: ProbeData, folds: list[np.ndarray], ridge: float,
     for gi, g in enumerate(data.groups):
         for k in range(len(data.lambdas)):
             for si, s in enumerate(data.strata):
-                z, u, x = _cell_arrays(data, gi, k, si)
+                z, u, x, quota, ragged = _cell_arrays(data, gi, k, si,
+                                                       quota_seed=quota_seed)
                 cell = cell_probe(z, u, x, folds, ridge, perms)
                 t_null[:, idx] = cell.pop("t_null")
                 idx += 1
+                # Variable-length evidence chain: record the per-cell quota so
+                # the freeze step and audits can see subsampled cells.
+                cell["n_coef"] = quota
+                cell["ragged_cell"] = ragged
                 cells[(g, k, s)] = cell
     return cells, t_null
 
@@ -311,7 +367,7 @@ def _apply_lcb(nested: dict[str, Any], groups: tuple[str, ...], n_lambda: int,
 
 
 def _null_probes(data: ProbeData, folds: list[np.ndarray], ridge: float,
-                 q95: float) -> tuple[dict, dict]:
+                 q95: float, quota_seed: int = 0) -> tuple[dict, dict]:
     """Wrong-band CT and label-free spatial-shift nulls on the confirmatory
     stratum ([计划] §3.4 three nulls; descriptive, reported with LCB)."""
     wrong: dict[str, Any] = {}
@@ -319,8 +375,22 @@ def _null_probes(data: ProbeData, folds: list[np.ndarray], ridge: float,
     si = data.strata.index(CONFIRMATORY_STRATUM)
     for gi, g in enumerate(data.groups):
         for k in range(len(data.lambdas)):
-            z, u, x = _cell_arrays(data, gi, k, si)
-            _, _, x_w = _cell_arrays(data, (gi + 1) % len(data.groups), k, si)
+            z, u, x, q_a, _ragged = _cell_arrays(data, gi, k, si,
+                                                  quota_seed=quota_seed)
+            other = _cell_arrays(data, (gi + 1) % len(data.groups), k, si,
+                                 quota_seed=quota_seed)
+            x_w = other[2]
+            if other[3] != q_a:
+                # Review finding 4: the wrong-band pairing UX[p,q,d] needs
+                # position-aligned [P,C] rows; when the two cells' natural
+                # quotas differ, align BOTH to the smaller quota instead of
+                # shape-erroring inside cell_statistics' einsum.
+                q_pair = min(q_a, other[3])
+                z, u, x, _, _ = _cell_arrays(data, gi, k, si,
+                                              quota_seed=quota_seed,
+                                              quota=q_pair)
+                x_w = _cell_arrays(data, (gi + 1) % len(data.groups), k, si,
+                                   quota_seed=quota_seed, quota=q_pair)[2]
             for name, cell, feats in (("wrong_band_ct", wrong, x_w),
                                       ("spatial_shift", shift, np.roll(x, 1, axis=1))):
                 result = cell_probe(z, u, feats, folds, ridge,
@@ -407,13 +477,13 @@ def run_probe(config: dict[str, Any], fold: str, grid_mode: str, n_perm: int,
     folds = patient_folds(n_patients, n_folds, seed)
     rng = np.random.default_rng(seed + 1)
     perms = np.stack([rng.permutation(n_patients) for _ in range(max(1, int(n_perm)))])
-    cells, t_null = _evaluate_grid(data, folds, ridge, perms)
+    cells, t_null = _evaluate_grid(data, folds, ridge, perms, quota_seed=seed)
     max_t = t_null.max(axis=1)
     q50, q95, q99 = (float(np.quantile(max_t, q)) for q in (0.5, 0.95, 0.99))
     n_lambda = int(len(lambdas))
     nested = _nested_delta(cells, groups, n_lambda, strata)
     _apply_lcb(nested, groups, n_lambda, strata, q95)
-    wrong, shift = _null_probes(data, folds, ridge, q95)
+    wrong, shift = _null_probes(data, folds, ridge, q95, quota_seed=seed)
     pass_rule = evaluate_pass_rule(nested, groups, n_lambda, q95)
     _write_json(out_path, {
         "schema_version": SCHEMA_VERSION, "fold": fold, "seed": seed,

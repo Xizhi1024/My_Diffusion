@@ -93,7 +93,7 @@ def test_valid_contract_passes_validation():
     contract.validate()
     assert contract.fold_id == "fold_0"
     assert contract.contract_sha256 == compute_contract_sha256(contract.to_payload())
-    assert CONTRACT_SCHEMA_VERSION == 1
+    assert CONTRACT_SCHEMA_VERSION == 2  # v2: optional band_powers (clock v2)
     assert SUPPORT_MODES == ("stratified_mixture", "floor_gated")
 
 
@@ -524,3 +524,55 @@ def test_compute_contract_sha256_is_canonical():
             k: v for k, v in payload.items() if k != "log_snr_grid"}})  # tuple == list
     changed = make_payload(s_ref=2.0)
     assert compute_contract_sha256(payload) != compute_contract_sha256(changed)
+
+
+# ---------------------------------------------------------------------------
+# schema v2: band_powers / band_powers_split (DESIGN_RC_BRD_clock_v2 §2.3)
+# ---------------------------------------------------------------------------
+
+def test_schema_version_bumped_to_2():
+    assert CONTRACT_SCHEMA_VERSION == 2
+
+
+def test_band_powers_valid_and_roundtrip():
+    payload = make_payload(band_powers={"low": 1.0, "mid": 2.0, "high": 0.5},
+                           band_powers_split="outer_train_fold_0")
+    contract = RecoverabilityContract.from_payload(payload)
+    contract.validate()
+    assert contract.band_powers == {"low": 1.0, "mid": 2.0, "high": 0.5}
+    assert contract.band_powers_split == "outer_train_fold_0"
+    out = contract.to_payload()
+    assert out["band_powers"] == {"low": 1.0, "mid": 2.0, "high": 0.5}
+    assert out["band_powers_split"] == "outer_train_fold_0"
+    again = RecoverabilityContract.from_payload(out)
+    assert again.contract_sha256 == contract.contract_sha256
+
+
+def test_band_powers_domain_violations():
+    bad_powers = (
+        {"low": 1.0, "mid": 2.0},                       # missing group key
+        {"low": 1.0, "mid": 0.0, "high": 1.0},          # nonpositive
+        {"low": 1.0, "mid": float("nan"), "high": 1.0},  # NaN
+        {"low": 1.0, "mid": 2.0, "high": float("inf")},  # inf
+    )
+    for bad in bad_powers:
+        with pytest.raises(ContractViolationError):
+            RecoverabilityContract.from_payload(
+                make_payload(band_powers=bad)).validate()
+
+
+def test_v1_payload_stays_loadable_and_hash_stable():
+    payload = make_payload()  # no band_powers key -> v1 artifact
+    contract = RecoverabilityContract.from_payload(payload)
+    contract.validate()
+    assert contract.band_powers is None and contract.band_powers_split is None
+    out = contract.to_payload()
+    assert "band_powers" not in out and "band_powers_split" not in out
+    again = RecoverabilityContract.from_payload(out)
+    assert again.contract_sha256 == contract.contract_sha256
+
+
+def test_band_powers_split_requires_powers():
+    with pytest.raises(ContractViolationError):
+        RecoverabilityContract.from_payload(
+            make_payload(band_powers_split="outer_train_fold_0")).validate()

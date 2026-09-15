@@ -1,0 +1,187 @@
+# RC-BRD production arm: rc_brd_prod_d1 (D1 scalar residual bridge twin, kappa=0)
+#
+# AUDIT evidence-chain fix (audit round: "建立真实数据生产配置并加载、冻结合格
+# MeanNet"). 真实 PNG 数据 + 冻结的条件均值 MeanNet + 合同化 RC-BRD 调度。
+#
+# 前置依赖链（fail-closed，缺一不可正式训练）:
+#   1. MeanNet 预训练: src/model/mean_pretraining.py 产出
+#      checkpoints/rc_brd_mean_pretrain/mean_best.pt（format_version 1|2,
+#      含 "model" state dict）; freeze=true 在模型构建时强制加载并校验。
+#   2. R0 probe: scripts/run_recoverability_probe.py（患者级，PASS 才可冻结）。
+#   3. freeze: scripts/freeze_recoverability_contract.py（PASS 门 + b_active
+#      仅含通过检验的组）→ artifacts/rc_brd/fold_0/contract.json。
+#
+# 匹配设计: 本配置与 rc_brd_prod_d1/rc_brd_prod_rc 除 kappa/contract_path 外
+# 逐键一致（参数/SNR 匹配对照, 审计"最小矩阵"要求）。
+#   clock_mode 说明：两臂均未显式设置 clock_mode（隐式 base_snr，v1 对照 B 时钟）。
+#   若需启用 v2 频带时钟：clock_mode: band_snr + 以 --band-powers 冻结的 v2 合同。
+#   本臂: kappa=0.0 → bandwise 调度严格退化为标量 D1 残差桥（无需合同,
+#   m≡t/T, 与 BBDMBridgeSchedule(sigma_scale=1.0) 逐元素等价, 由
+#   tests/test_rc_brd_posterior.py 锁定）。可立即运行（依赖 MeanNet 预训练）。
+
+experiment:
+  name: rc_brd_prod_d1
+  seed: 42
+
+data:
+  mode: png
+  cache_dir: cache/tensors_main
+  split_manifest: main_data/split_manifest.csv
+  image_size: 192                    # 两级 Haar 要求被 4 整除（192 ✓）
+  batch_size: 4
+  val_batch_size: 4
+  augment: true
+  required_keys:
+    - ct
+    - pet
+    - mask
+  optional_keys: []
+
+runtime:
+  device: auto
+  amp: true
+  channels_last: true
+  torch_compile: false
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  gradient_accumulate_every: 2
+  grad_clip_norm: 1.0
+  log_interval: 10
+  eval_interval: 50
+  eval_num_samples: 16
+  eval_seed: 42
+  eval_sampling_steps: 20
+  sample_interval: 50
+  save_interval: 50
+  rc_brd_fold: fold_0               # 合同 fold 交叉校验（κ=0 不消费）
+  tracked_sample_ids: []
+  best_checkpoint:
+    enabled: true
+    combined_alpha: 0.5
+    stripe_penalty: 0.3
+  early_stopping:
+    enabled: true
+    patience: 40
+    min_epochs: 50
+
+training:
+  num_epochs: 300
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  lr_min: 1e-6
+  ema:
+    decay: 0.999
+    update_every: 10
+
+model:
+  objective: pred_x0
+  sample_scheduler: ddim
+  enable_heteroscedastic: false
+  initialization_seed: 1234
+  self_conditioning:
+    enabled: false
+  base_loss:
+    mse_weight: 1.0
+    l1_weight: 1.0
+    gradient_weight: 0.1
+    min_snr_enabled: true
+    min_snr_gamma: 5.0
+
+modules:
+  gabor: {enabled: false}
+  organ_prior: {enabled: false}
+  hotspot_prior: {enabled: false}
+  semantic_prior: {enabled: false}
+  zero_adapter: {enabled: false}
+  condition_dropout: {enabled: false}
+
+  bbdm_bridge:
+    enabled: true
+    name: bbdm_bridge
+    num_train_timesteps: 1000       # rc_brd.num_timesteps 必须相等
+
+  conditional_mean:                 # AUDIT: 加载并冻结合格 MeanNet
+    enabled: true
+    architecture: low_frequency
+    checkpoint: checkpoints/rc_brd_mean_pretrain/mean_best.pt
+    checkpoint_format: mean         # {"model": state, "format_version": 1|2}
+    freeze: true                    # 构建时 fail-closed 加载并冻结
+    detach_bridge: true
+    loss_weight: 0.0                # 冻结均值 → 均值损失关闭
+
+  residual_bridge:
+    enabled: true
+    output_scale: 1.0
+    clip_output: false
+
+  residual_frequency:
+    enabled: false                  # 旧 router 与 RC-BRD 互斥（[计划] §4）
+
+  rc_brd:
+    enabled: true
+    forward_mode: bridge_time_changed
+    kappa: 0.0                      # D1 严格回退臂：无需合同
+    num_timesteps: 1000
+    sigma_bridge: 1.0
+    lambda_min: -10.0
+    lambda_max: 10.0
+    endpoint_mode: zeros
+    band_groups: 3
+    contract_path: ""               # κ=0 合法留空
+    sampling_mode: endpoint_ddim    # v1.0g 默认；ancestral_mc 为 MC 逐步后验备选
+    allow_unverified_tokens: false
+    specialist:
+      enabled: true                 # 与 RC 臂匹配（κ=0 下 specialist 仍受界约束）
+      a_max: 0.25
+      d_max: 0.10
+      gate_init: 0.1
+      channels: 64
+    readout:
+      mode: mc_mean
+      mc_samples: 8
+
+losses:
+  lesion_roi_l1:
+    enabled: true
+    weight: 1.0
+    dilate_radius: 3
+    beta: 0.05
+    active_tau_max: 0.7
+  topk_lesion:
+    enabled: true
+    weight: 0.4
+    topk_percent: 0.01
+    active_tau_max: 0.5
+  outside_peak_ranking:
+    enabled: true
+    weight: 0.1
+    margin: 0.05
+    inside_radius: 3
+    outside_radius: 8
+    topk_percent: 0.01
+    active_tau_max: 0.65
+  focal_frequency: {enabled: false}
+  patch_nce: {enabled: false}
+  roi_suv: {enabled: false}
+  organ_consistency: {enabled: false}
+  false_hotspot: {enabled: false}
+  hotspot_prior: {enabled: false, target_mode: mask_only}
+  heteroscedastic_nll: {enabled: false}
+  segmenter_consistency: {enabled: false}
+
+metadata:
+  enabled: false
+
+segmenter:
+  enabled: false
+
+evaluation:
+  # AUDIT: 故意不写 mc_samples —— evaluate.py 的统一 MC/readout 入口会在
+  # rc_brd readout=mc_mean 时自动把 K 钉到 modules.rc_brd.readout.mc_samples（8）。
+  physical_suv_available: false
+  failure_detection:
+    outside_margin: 0.05
+    lesion_min_ratio: 0.6
+    uncertainty_ratio_threshold: 2.0

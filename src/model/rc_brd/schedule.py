@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,13 @@ if TYPE_CHECKING:  # pragma: no cover - static-only import (batch 1B file)
 
 # C1 ([审计] §1.2): bridge marginal is the mainline; v1.4 VP stays as an arm.
 FORWARD_MODES = ("bridge_time_changed", "vp_bandwise")
+# v2 clock modes (DESIGN_RC_BRD_clock_v2; audit band-clock fix):
+#   base_snr — v1 clock: c~ queried on the shared scalar lambda_0(u)
+#              (power-blind; retained as the matched-schedule control B).
+#   band_snr — v2 clock: c~ queried on the band's own bridge SNR
+#              lambda_g(m_g) with frozen per-group power P_g, solved as a
+#              self-consistent fixed point (controls A/C: P_g==1 / kappa=0).
+CLOCK_MODES = ("base_snr", "band_snr")
 # C7 ([计划] §3.6): residual endpoint coordinate convention.
 ENDPOINT_MODES = ("zeros", "ct_minus_mean")
 # DESIGN §4: the warped clock is trapezoid-integrated on a fine u-grid with
@@ -54,8 +62,22 @@ _SIGMA_DIV_EPS = 1e-6
 # [DESIGN §4 v1.0g / AUDIT 5 §3.3] tolerance of the degenerate-step branch:
 # m_t within this distance of {0, 1} makes ε̂=(z_t−μ_t)/σ_t non-invertible.
 _M_ENDPOINT_TOL = 1e-12
+# band_snr fixed-point numerics (clock math review corrections #1/#5):
+# measured iterations-to-1e-12 are 13-14 (κ=0.5), 18-21 (κ=1), 33-41 (κ=2)
+# with η=0.8 — K_max=64 leaves headroom; tol 1e-12 sits above the ~2e-14
+# float noise of the normalized clock.  The stagnation trip fires only after
+# 16 NON-SHRINKING iterations: an aliased step table exhibited a 10-iteration
+# one-grid-step transient that still converged (iter 14), so a tighter trip
+# would false-alarm on it.
+_CLOCK_FP_MAX_ITERS = 64
+_CLOCK_FP_TOL = 1e-12
+_CLOCK_FP_STAGNATION_ITERS = 16
+_CLOCK_ALIASING_MIN_NODES = 2
 # Duck-typed runtime surface required from a recoverability contract.
-_CONTRACT_ATTRIBUTES = ("effective_c", "eta_max", "band_groups", "log_snr_grid", "b_active")
+# v2: band_powers must be DECLARED (None allowed = v1 artifact semantics);
+# clock_mode='band_snr' additionally requires it to be a complete mapping.
+_CONTRACT_ATTRIBUTES = ("effective_c", "eta_max", "band_groups", "log_snr_grid",
+                        "b_active", "band_powers")
 
 
 def _expand(values: torch.Tensor, ndim: int) -> torch.Tensor:
@@ -87,6 +109,7 @@ class BandwiseScheduleConfig:
     lambda_min: float = -10.0          # vp mode λ endpoint (max noise)
     lambda_max: float = 10.0           # vp mode λ endpoint (clean signal)
     endpoint_mode: str = "zeros"
+    clock_mode: str = "base_snr"       # v2: base_snr (v1 control) | band_snr
 
     def __post_init__(self) -> None:
         if isinstance(self.num_timesteps, bool) or not isinstance(self.num_timesteps, int):
@@ -97,6 +120,8 @@ class BandwiseScheduleConfig:
             raise ValueError(f"forward_mode must be one of {FORWARD_MODES}, got {self.forward_mode!r}")
         if self.endpoint_mode not in ENDPOINT_MODES:
             raise ValueError(f"endpoint_mode must be one of {ENDPOINT_MODES}, got {self.endpoint_mode!r}")
+        if self.clock_mode not in CLOCK_MODES:
+            raise ValueError(f"clock_mode must be one of {CLOCK_MODES}, got {self.clock_mode!r}")
         # [DESIGN §4 v1.0g / AUDIT 5 §3.3] finite-domain validation: NaN/±inf
         # would silently poison the clock integral and posterior variances.
         for name in ("kappa", "sigma_bridge", "lambda_min", "lambda_max"):
@@ -135,6 +160,34 @@ class BandwiseBridgeSchedule(nn.Module):
             raise TypeError(f"config must be BandwiseScheduleConfig, got {type(config)!r}")
         if contract is not None:
             _validate_contract_duck_type(contract)
+            if config.clock_mode == "band_snr":
+                # v2 fail-closed (clock math review correction #3): the
+                # band-SNR axis needs frozen per-group powers; None = v1
+                # artifact -> refuse with an actionable message.
+                powers = getattr(contract, "band_powers", None)
+                if powers is None:
+                    raise ValueError(
+                        "clock_mode='band_snr' requires a v2 contract with "
+                        "band_powers (re-freeze with --band-powers); "
+                        "clock_mode='base_snr' keeps the v1 power-blind clock")
+                missing = [g for g in contract.band_groups if g not in powers]
+                if missing:
+                    raise ValueError(
+                        f"contract.band_powers is missing groups {missing}")
+                bad = [g for g in contract.band_groups
+                       if not (math.isfinite(float(powers[g])) and float(powers[g]) > 0.0)]
+                if bad:
+                    raise ValueError(
+                        f"contract.band_powers entries must be finite and > 0 "
+                        f"for {bad} (mean per-coefficient Haar residual power)")
+            if (config.clock_mode == "band_snr"
+                    and config.endpoint_mode == "ct_minus_mean"):
+                warnings.warn(
+                    "clock_mode='band_snr' lambda_g is exact for "
+                    "endpoint_mode='zeros'; with 'ct_minus_mean' the true "
+                    "signal second moment includes cross/endpoint powers "
+                    "(DESIGN_RC_BRD_clock_v2 §5) — the query axis is an "
+                    "approximation", RuntimeWarning, stacklevel=2)
         if config.kappa != 0.0 and contract is None:
             raise ValueError("kappa != 0 requires a contract; contract=None only valid for kappa=0")
         self.config = config
@@ -145,10 +198,164 @@ class BandwiseBridgeSchedule(nn.Module):
             self._band_to_group = {
                 band: group for group, band_list in contract.band_groups.items() for band in band_list
             }
-        # Instance-level memo of computed clocks (never a module-level global).
+        # Instance-level memos (never module-level globals): the coarse clock
+        # and, for band_snr, the converged fine-grid query axis lambda_g(m_g).
         self._m_cache: dict[str, torch.Tensor] = {}
+        self._lam_query_cache: dict[str, torch.Tensor] = {}
 
     # ---- clock / m sequence ------------------------------------------------
+
+    def _band_snr_query_axis(self, group: str, u: torch.Tensor) -> torch.Tensor:
+        """v2 self-consistent band-SNR query axis (DESIGN_RC_BRD_clock_v2 §2.2).
+
+        λ_g(m) = clip(log(P_g·(1−m)/(ν²·m)), λmin, λmax) is the band's own
+        bridge SNR under the marginal (e=0); the clock speed is
+        ρ_g(s)=exp{κ(2c̃_g(λ_g(m_g(s)))−1)}, solved as a fixed point starting
+        from m⁰≡u.  Returns the CONVERGED λ grid (the axis on which c̃ is
+        queried), so the clock, the head gating and the A3b density weights
+        cannot drift apart.  Fail-closed: ValueError on stagnation or
+        non-convergence (clock math review corrections #1/#2 — certified
+        contraction only inside 4|κ|·η·TV(c)<1; outside it convergence is
+        empirical and guarded, never assumed).
+        """
+        contract = self._contract
+        p_g = float(contract.band_powers[group])
+        nu_squared = 2.0 * self.config.sigma_bridge ** 2
+        lam_min, lam_max = self.config.lambda_min, self.config.lambda_max
+
+        def _lam_of(m: torch.Tensor) -> torch.Tensor:
+            return torch.log(
+                p_g * (1.0 - m).clamp_min(0.0) / (nu_squared * m.clamp_min(1e-300))
+            ).clamp(lam_min, lam_max)
+
+        def _clock_of(lam: torch.Tensor) -> torch.Tensor:
+            rho = torch.exp(
+                self.config.kappa
+                * (2.0 * contract.effective_c(group, lam).to(dtype=torch.float64) - 1.0)
+            )
+            increments = 0.5 * (rho[:-1] + rho[1:]) / (u.numel() - 1)  # trapezoid
+            cumulative = torch.cat(
+                [torch.zeros(1, dtype=torch.float64), torch.cumsum(increments, dim=0)])
+            total = cumulative[-1]
+            if not torch.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    f"clock integral for group {group!r} is not positive/finite; "
+                    "kappa is numerically out of range")
+            return cumulative / total  # pins m[0]=0, m[end]=1 exactly
+
+        m = u.clone()
+        deltas: list[float] = []
+        stagnant = 0
+        for _ in range(_CLOCK_FP_MAX_ITERS):
+            m_new = _clock_of(_lam_of(m))
+            delta = float((m_new - m).abs().max())
+            m = m_new
+            deltas.append(delta)
+            if delta <= _CLOCK_FP_TOL:
+                break
+            if len(deltas) > 1 and delta >= deltas[-2]:
+                stagnant += 1
+            else:
+                stagnant = 0
+            if stagnant >= _CLOCK_FP_STAGNATION_ITERS:
+                q_hat = deltas[-1] / max(deltas[-2], 1e-300)
+                raise ValueError(
+                    f"band_snr clock fixed point stagnated for group {group!r} "
+                    f"(delta not shrinking for {stagnant} iterations; last "
+                    f"delta {delta:.3e}, empirical Q≈{q_hat:.3f}) — aliased "
+                    "contract table or |kappa| outside the empirical range "
+                    "(DESIGN_RC_BRD_clock_v2 §4)")
+        else:
+            q_hat = (deltas[-1] / max(deltas[-2], 1e-300)
+                     if len(deltas) > 1 else float("nan"))
+            raise ValueError(
+                f"band_snr clock fixed point did not converge for group "
+                f"{group!r} within {_CLOCK_FP_MAX_ITERS} iterations (last "
+                f"delta {deltas[-1]:.3e}, empirical Q≈{q_hat:.3f}); decrease "
+                "|kappa| or check the contract table")
+        lam_query = _lam_of(m)
+        self._aliasing_guard(group, lam_query)
+        return lam_query
+
+    def _aliasing_guard(self, group: str, lam_query: torch.Tensor) -> None:
+        """Grid-aliasing warning (clock math review correction #5).
+
+        A table segment of width Δλ occupies an m-window ≈ m(1−m)·Δλ; near
+        the clip desaturation edges this can fall below the fine-grid step,
+        making the clock numerically power-blind over that segment.  Warn (do
+        not fail) listing the offending segments.
+        """
+        grid = torch.tensor([float(v) for v in self._contract.log_snr_grid],
+                            dtype=torch.float64)
+        # Review finding 2: c_values is NOT part of the declared duck-typed
+        # surface (_CONTRACT_ATTRIBUTES); a contract implementing exactly the
+        # documented interface must not crash here.  Finding 5: groups outside
+        # b_active run the identity clock by design — the warning would be
+        # spurious for them.  Skip the guard in both cases.
+        if group not in tuple(getattr(self._contract, "b_active", ())):
+            return
+        c_values = getattr(self._contract, "c_values", None)
+        if not isinstance(c_values, Mapping) or group not in c_values:
+            return
+        c_row = [float(v) for v in c_values[group]]
+        if grid.numel() < 2:
+            return
+        aliased = []
+        for i in range(grid.numel() - 1):
+            if abs(c_row[i + 1] - c_row[i]) <= 1e-9:
+                continue  # flat segment carries no clock information anyway
+            count = int(((lam_query >= grid[i]) & (lam_query < grid[i + 1])).sum())
+            if count < _CLOCK_ALIASING_MIN_NODES:
+                aliased.append(f"λ∈[{grid[i]:.3g},{grid[i + 1]:.3g})×{count}")
+        if aliased:
+            warnings.warn(
+                f"band_snr clock: contract table segments {aliased} for group "
+                f"{group!r} resolve to fewer than {_CLOCK_ALIASING_MIN_NODES} "
+                "fine-grid nodes (m-window ≈ m(1−m)·Δλ below the grid step): "
+                "the clock is numerically power-blind there — refine the "
+                "log_snr_grid or accept the aliased segment "
+                "(DESIGN_RC_BRD_clock_v2 §4)", RuntimeWarning, stacklevel=2)
+
+    def _base_snr_query_axis(self, u: torch.Tensor) -> torch.Tensor:
+        """v1 axis λ₀(u) (DESIGN §4 v1.0f), shared by every group."""
+        nu_squared = 2.0 * self.config.sigma_bridge ** 2
+        return torch.log((1.0 - u) / (nu_squared * u)).clamp(
+            self.config.lambda_min, self.config.lambda_max
+        )
+
+    def clock_query_log_snr(self, group: str, t: torch.Tensor) -> torch.Tensor:
+        """The λ axis on which this clock reads c̃ for 'group' at timesteps t.
+
+        base_snr: λ₀(t/T) for every group (v1 semantics, unchanged).
+        band_snr: λ_g(m_g(t)) — the converged self-consistent axis when κ≠0
+        (gathered from the cached fine grid), or λ_g(t/T) directly at κ=0
+        (identity clock, band-aware axis for head gating).  This is the
+        single source both the schedule and the integration-side c lookup
+        consume, so the two cannot drift (audit defect (b) fix).
+        Returns a float64 tensor on t.device shaped like t.
+        """
+        t = self._validate_timesteps(t, "t")
+        if self.config.clock_mode == "band_snr":
+            if self._contract is None:
+                raise ValueError("clock_query_log_snr requires a contract")
+            if group not in self._contract.band_groups:
+                raise KeyError(group)
+            p_g = float(self._contract.band_powers[group])
+            nu_squared = 2.0 * self.config.sigma_bridge ** 2
+            if self.config.kappa != 0.0:
+                fine = self._lam_query_cache.get(group)
+                if fine is None:
+                    self.m_sequence(group)  # populates the cache
+                    fine = self._lam_query_cache[group]
+                idx = t * _CLOCK_GRID_SUBDIVISIONS
+                return fine.to(device=t.device)[idx].clone()
+            u = t.to(dtype=torch.float64) / self.config.num_timesteps
+            return torch.log(
+                p_g * (1.0 - u).clamp_min(0.0)
+                / (nu_squared * u.clamp_min(1e-300))
+            ).clamp(self.config.lambda_min, self.config.lambda_max)
+        u = t.to(dtype=torch.float64) / self.config.num_timesteps
+        return self._base_snr_query_axis(u).to(device=t.device)
 
     def _compute_m_sequence(self, group: str) -> torch.Tensor:
         """Integrate the warped clock on the fine u-grid (float64, CPU)."""
@@ -156,16 +363,19 @@ class BandwiseBridgeSchedule(nn.Module):
         if self._contract is None or self.config.kappa == 0.0:
             # κ=0 → exact identity u = t/T ([审计] §3.2), contract irrelevant.
             return torch.arange(num_t + 1, dtype=torch.float64) / num_t
-        # [审计] §3.1: ρ=exp{κ(2c̃(u)−1)}; [审计] §3.3 keeps ρ in e^{±κη_max}.
-        # [计划] v1.5 §3.6 / DESIGN v1.0f lookup: λ₀(u)=log((1−u)/(ν²·u)) with
-        # base clock m₀(u)=u, ν²=2·sigma_bridge²; ±inf endpoints clip to
-        # [λ_min, λ_max].  The v1.4 linear λ warp is deprecated.
+        # [审计] §3.1: ρ=exp{κ(2c̃−1)}; [审计] §3.3 keeps ρ in e^{±κη_max}.
+        # Query axis (audit band-clock fix): base_snr keeps the v1.0f shared
+        # λ₀(u)=log((1−u)/(ν²·u)) lookup (power-blind control B); band_snr
+        # queries the band's own bridge SNR λ_g(m_g) with frozen P_g via the
+        # self-consistent fixed point (DESIGN_RC_BRD_clock_v2 §2).  The v1.4
+        # linear λ warp is deprecated.
         nodes = num_t * _CLOCK_GRID_SUBDIVISIONS
         u = torch.arange(nodes + 1, dtype=torch.float64) / nodes
-        nu_squared = 2.0 * self.config.sigma_bridge ** 2
-        log_snr = torch.log((1.0 - u) / (nu_squared * u)).clamp(
-            self.config.lambda_min, self.config.lambda_max
-        )
+        if self.config.clock_mode == "band_snr":
+            log_snr = self._band_snr_query_axis(group, u)
+            self._lam_query_cache[group] = log_snr
+        else:
+            log_snr = self._base_snr_query_axis(u)
         c_tilde = self._contract.effective_c(group, log_snr).to(dtype=torch.float64)
         if c_tilde.shape != u.shape:
             raise ValueError(
@@ -194,11 +404,13 @@ class BandwiseBridgeSchedule(nn.Module):
     def m_sequence(self, group: str) -> torch.Tensor:
         """Warped clock m_b at u=t/T, t=0..T → [T+1] float64 CPU tensor.
 
-        bridge: m_b(u)=∫₀^uρ/∫₀^1ρ, ρ=exp{κ(2c̃_b(u)−1)} ([审计] §3.1),
+        bridge: m_b(u)=∫₀^uρ/∫₀^1ρ, ρ=exp{κ(2c̃_b−1)} ([审计] §3.1),
         trapezoid-integrated on a fine grid (≥4·T nodes); vp: A_b(u), the
-        same integral ([计划] §3.6).  c̃ lookup per [计划] v1.5 §3.6 /
-        DESIGN v1.0f: λ₀(u)=log((1−u)/(ν²·u)), ν²=2σ², clipped to
-        [λ_min, λ_max].  m[0]=0, m[T]=1 exactly; monotonicity is verified
+        same integral ([计划] §3.6).  c̃ lookup axis: base_snr keeps the
+        v1.0f shared λ₀(u)=log((1−u)/(ν²·u)) ([计划] v1.5 §3.6, control B);
+        band_snr uses the self-consistent band axis λ_g(m_g) with frozen
+        P_g (DESIGN_RC_BRD_clock_v2 §2, controls A/C).  m[0]=0, m[T]=1
+        exactly; monotonicity is verified
         numerically (ValueError on violation).  kappa==0 → exact identity
         clock m≡u in BOTH modes (only the bridge arm then degenerates to the
         scalar D1 path — PRD v1.0.2); contract may be None.  Unknown group

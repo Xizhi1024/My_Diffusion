@@ -22,6 +22,15 @@ Usage:
 
     # CPU-only smoke test
     python scripts/evaluate.py --config configs/experiments/slmf_baseline.yaml --fake-data
+
+    # RC-BRD unified MC/readout entry: with rc_brd enabled and
+    # modules.rc_brd.readout.mode=mc_mean, K is pinned by the model
+    # (readout.mc_samples) unless --mc-samples / evaluation.mc_samples
+    # explicitly overrides it; the report records the readout used.
+    python scripts/evaluate.py \
+        --config configs/experiments/rc_brd_prod_d1.yaml \
+        --checkpoint checkpoints/rc_brd_prod_d1/ckpt_best_combined.pt \
+        --split test --output results/rc_brd_prod_d1_eval.json
 """
 
 
@@ -855,7 +864,7 @@ def evaluate(
     device: str = "cuda",
     amp: bool = True,
     save_samples: Optional[Path] = None,
-    mc_samples: int = 1,
+    mc_samples: Optional[int] = 1,
     mc_steps: Optional[int] = None,
     mc_aggregate: str = "mean",
     failure_thresholds: Optional[Dict[str, float]] = None,
@@ -885,7 +894,12 @@ def evaluate(
             enabled=amp and device_type == "cuda",
             dtype=amp_dtype,
         ):
-            if mc_samples and mc_samples > 1:
+            # AUDIT evidence-chain wiring (unified MC/readout entry):
+            # mc_samples=None means "model-pinned K" - the rc_brd mc_mean
+            # readout pins K=modules.rc_brd.readout.mc_samples inside
+            # sample_mc (C6), so evaluation can never silently downgrade the
+            # frozen readout to a single deterministic draw.
+            if mc_samples is None or mc_samples > 1:
                 sample_out = model.sample_mc(
                     batch_gpu,
                     n_samples=mc_samples,
@@ -1059,6 +1073,25 @@ def evaluate(
         patient_summary[pid] = p_agg
 
     summary["per_patient"] = patient_summary
+    # AUDIT evidence-chain wiring: record the rc_brd readout actually used so
+    # eval reports stay traceable to the frozen contract/schedule semantics.
+    if bool(getattr(model, "rc_brd_enabled", False)):
+        schedule = getattr(model, "rc_brd_schedule", None)
+        contract = getattr(model, "rc_brd_contract", None)
+        summary["rc_brd_readout"] = {
+            "readout_mode": str(getattr(model, "rc_brd_readout_mode", "mc_mean")),
+            "sampling_mode": str(
+                getattr(model, "rc_brd_sampling_mode", "endpoint_ddim")),
+            # Record the K ACTUALLY used (review finding 1): model-pinned K
+            # under the default path, the explicit override otherwise.
+            "mc_samples": (int(mc_samples) if mc_samples is not None
+                           else int(getattr(model, "rc_brd_mc_samples", 8))),
+            "mc_samples_source": ("model_pinned" if mc_samples is None
+                                  else "explicit"),
+            "kappa": float(schedule.config.kappa) if schedule is not None else 0.0,
+            "contract_fold": (
+                str(contract.fold_id) if contract is not None else None),
+        }
     _append_calibration_summary(summary, all_metrics)
 
     return summary
@@ -1077,6 +1110,10 @@ def print_report(summary: Dict[str, Any]) -> None:
     suv_avail = summary.get("physical_suv_available", False)
     print(f"physical_suv_available: {suv_avail}"
           + ("" if suv_avail else "  (PNG baseline: clinical SUV metrics omitted)"))
+    rc = summary.get("rc_brd_readout")
+    if rc:
+        print(f"rc_brd readout: {rc['readout_mode']} K={rc['mc_samples']} "
+              f"sampling={rc['sampling_mode']} kappa={rc['kappa']}")
     print("-" * 60)
 
     sections = [
@@ -1182,6 +1219,7 @@ def main():
     )
     _seed_evaluation(eval_seed)
     print(f"Evaluation seed: {eval_seed}")
+    explicit_mc = args.mc_samples is not None or "mc_samples" in eval_cfg
     mc_samples = args.mc_samples if args.mc_samples is not None else eval_cfg.get("mc_samples", 1)
     mc_aggregate = (
         args.mc_aggregate
@@ -1220,6 +1258,15 @@ def main():
     # Build model
     print("Building model...")
     model = SLMFBBDM.from_config(config)
+    # AUDIT evidence-chain wiring: with rc_brd enabled, readout mc_mean and no
+    # explicit --mc-samples / evaluation.mc_samples choice, defer K to the
+    # model (readout.mc_samples) instead of silently evaluating K=1.
+    if (bool(getattr(model, "rc_brd_enabled", False))
+            and str(getattr(model, "rc_brd_readout_mode", "mc_mean")) == "mc_mean"
+            and not explicit_mc):
+        mc_samples = None
+        print("RC-BRD readout: mc_mean with model-pinned K="
+              f"{int(getattr(model, 'rc_brd_mc_samples', 8))}")
     expected_data_lineage = load_checkpoint_data_lineage(config)
 
     if args.checkpoint:

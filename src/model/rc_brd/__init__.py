@@ -22,6 +22,7 @@ from .contract import (
     mean_weights_sha256,
 )
 from .schedule import (
+    CLOCK_MODES,
     ENDPOINT_MODES,
     FORWARD_MODES,
     BandwiseBridgeSchedule,
@@ -58,6 +59,7 @@ __all__ = [
     "mean_weights_sha256",
     "ENDPOINT_MODES",
     "FORWARD_MODES",
+    "CLOCK_MODES",
     "BandwiseBridgeSchedule",
     "BandwiseScheduleConfig",
     "SpecialistConfig",

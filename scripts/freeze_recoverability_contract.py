@@ -7,10 +7,18 @@ Reads the probe JSON produced by run_recoverability_probe.py and freezes
 
 into a RecoverabilityContract payload (band_groups resolved from the probe
 grid, mean checkpoint SHA computed with the canonical mean_weights_sha256
-from --mean-checkpoint or taken verbatim from --mean-sha, b_active defaulting
-to all groups, psd_floors from the probe data or --sigma-floor). The payload
-is validated fail-closed (from_payload + validate, FR-2.2) and written with
-its self hash; any validation failure exits 1.
+from --mean-checkpoint or taken verbatim from --mean-sha, psd_floors from
+the probe data or --sigma-floor). The payload is validated fail-closed
+(from_payload + validate, FR-2.2) and written with its self hash; any
+validation failure exits 1.
+
+AUDIT evidence-chain gates (fail-closed):
+* only a PASSed probe freezes - pass_rule.passed must be exactly True
+  (anything else, including a missing pass_rule, raises);
+* b_active defaults to the groups with >=1 passing confirmatory cell
+  (probe pass_rule.per_cell), NOT to all groups - groups outside b_active
+  run the ordinary clock (effective_c == 0.5); an empty passing set refuses
+  to freeze (close RC-BRD, fall back to D1).
 
 CLI: --probe-result --fold --out --s-ref --kappa-grid (must contain 0.0;
 s_ref must be > 0).
@@ -20,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -86,13 +95,36 @@ def freeze_contract(probe_result: Path, fold: str, out_path: Path, s_ref: float,
                     mean_sha: str | None = None, sigma_floor: float = DEFAULT_SIGMA_FLOOR,
                     size_thresholds: dict[str, float] | None = None,
                     support_mode: str = "floor_gated", eta_max: float = 0.8,
-                    floor_rho: float = 0.1) -> dict:
+                    floor_rho: float = 0.1,
+                    band_powers: dict[str, float] | None = None,
+                    band_power_split: str | None = None) -> dict:
     """Build, validate and write the frozen contract; returns the artifact."""
     probe = json.loads(Path(probe_result).read_text(encoding="utf-8"))
     if probe.get("status") == "insufficient_patients":
         raise ValueError("probe result has insufficient patients; refusing to freeze")
     if probe.get("fold") != fold:
         raise ValueError(f"fold mismatch: probe {probe.get('fold')!r} != --fold {fold!r}")
+    # AUDIT evidence-chain gate: only a PASSed probe may freeze.  The old code
+    # merely refused status == "insufficient_patients", so a probe whose
+    # confirmatory cells FAILED could still be frozen.
+    pass_rule = probe.get("pass_rule")
+    if not isinstance(pass_rule, Mapping) or pass_rule.get("passed") is not True:
+        raise ValueError(
+            "probe result did not PASS the v1.5 cell rule (pass_rule.passed is "
+            "not true); refusing to freeze - rerun the probe or close RC-BRD "
+            "and fall back to D1")
+    per_cell = pass_rule.get("per_cell") or {}
+    if not isinstance(per_cell, Mapping):
+        # Review finding 3: a malformed truthy per_cell must exit 1 with a
+        # clean message, not an AttributeError traceback.
+        raise ValueError("pass_rule.per_cell must be a mapping of cell "
+                         "judgments when present")
+    passing_groups = {str(cell).split("|", 1)[0] for cell, judgement in per_cell.items()
+                      if isinstance(judgement, Mapping) and judgement.get("pass") is True}
+    if not passing_groups:
+        raise ValueError(
+            "no band group passed any confirmatory cell; refusing to freeze - "
+            "close RC-BRD and fall back to D1")
     groups_map = resolve_band_groups(list(probe["grid"]["groups"]))
     log_snr_grid = [float(v) for v in probe["grid"]["log_snr_centers"]]
     if not all(log_snr_grid[i] < log_snr_grid[i + 1]
@@ -108,13 +140,41 @@ def freeze_contract(probe_result: Path, fold: str, out_path: Path, s_ref: float,
     psd = probe.get("psd_floors") or {g: float(sigma_floor) for g in groups_map}
     thresholds = dict(size_thresholds) if size_thresholds else dict(
         probe.get("size_thresholds") or DEFAULT_SIZE_THRESHOLDS)
+    # schema v2 band powers (clock math review correction #3; audit band-clock
+    # fix): P_g must be the MEAN PER-COEFFICIENT power of the group's Haar
+    # residual coefficients on the freeze split - never the group total
+    # (Parseval 1:3:12/16 would inflate the high group ~12x).  Never default
+    # silently: absent CLI/probe values freeze the explicit all-1.0 form,
+    # which IS matched control A (power-blind), and say so on stderr.
+    powers = band_powers if band_powers is not None else probe.get("band_powers")
+    if powers:
+        powers = {str(g): float(v) for g, v in dict(powers).items()}
+    else:
+        powers = {g: 1.0 for g in groups_map}
+        print("freeze: band powers absent; freezing explicit P_g=1.0 for every "
+              "group (power-blind control A, DESIGN_RC_BRD_clock_v2 §3)")
+    missing_p = [g for g in groups_map if g not in powers]
+    if missing_p:
+        raise ValueError(f"band powers are missing groups {missing_p}")
+    bad_p = [g for g in groups_map
+             if not (math.isfinite(float(powers[g])) and float(powers[g]) > 0.0)]
+    if bad_p:
+        raise ValueError(f"band powers must be finite and > 0 for {bad_p}")
+    split_note = str(band_power_split) if band_power_split else f"outer_train_{fold}"
     payload = {"fold_id": str(fold), "band_groups": groups_map,
                "log_snr_grid": log_snr_grid, "c_values": c_values,
-               "mean_checkpoint_sha256": sha, "b_active": list(groups_map),
+               "mean_checkpoint_sha256": sha,
+               # AUDIT evidence-chain gate: b_active contains ONLY groups with
+               # >=1 passing confirmatory cell (canonical group order kept).
+               # Groups outside b_active run the ordinary clock via
+               # effective_c == 0.5 (contract.py v1.0g semantics).
+               "b_active": [g for g in groups_map if g in passing_groups],
                "psd_floors": {str(g): float(v) for g, v in psd.items()},
                "size_thresholds": thresholds, "kappa_grid": [float(k) for k in kappa_grid],
                "s_ref": float(s_ref), "support_mode": str(support_mode),
-               "eta_max": float(eta_max), "floor_rho": float(floor_rho)}
+               "eta_max": float(eta_max), "floor_rho": float(floor_rho),
+               "band_powers": {str(g): float(powers[g]) for g in groups_map},
+               "band_powers_split": split_note}
     contract = RecoverabilityContract.from_payload(payload)
     contract.validate()  # fail-closed (FR-2.2; [计划] §3.5)
     artifact = dict(payload)
@@ -130,6 +190,16 @@ def _parse_kappa(text: str) -> tuple[float, ...]:
     if not values:
         raise ValueError("--kappa-grid must list at least one value")
     return values
+
+
+def _parse_powers(items: list[str]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--band-powers entries must be key=value, got {item!r}")
+        out[key] = float(value)
+    return out
 
 
 def _parse_thresholds(items: list[str]) -> dict[str, float]:
@@ -160,6 +230,12 @@ def main(argv: list[str] | None = None) -> int:
                         default="floor_gated")
     parser.add_argument("--eta-max", type=float, default=0.8)
     parser.add_argument("--floor-rho", type=float, default=0.1)
+    parser.add_argument("--band-powers", action="append", default=[],
+                        help="group=mean-per-coefficient Haar residual power "
+                             "(repeatable; absent -> explicit all-1.0 control A)")
+    parser.add_argument("--band-power-split", default=None,
+                        help="provenance label of the P_g estimation split "
+                             "(default outer_train_<fold>)")
     args = parser.parse_args(argv)
     try:
         kappa = _parse_kappa(args.kappa_grid)
@@ -180,7 +256,9 @@ def main(argv: list[str] | None = None) -> int:
             mean_sha=args.mean_sha, sigma_floor=args.sigma_floor,
             size_thresholds=_parse_thresholds(args.size_thresholds),
             support_mode=args.support_mode, eta_max=args.eta_max,
-            floor_rho=args.floor_rho)
+            floor_rho=args.floor_rho,
+            band_powers=_parse_powers(args.band_powers),
+            band_power_split=args.band_power_split)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
             ContractViolationError) as exc:
         print(f"freeze failed: {exc}", file=sys.stderr)

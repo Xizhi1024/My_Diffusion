@@ -147,8 +147,13 @@ _CONTRACT_GROUPS = {"low": ["LL2"], "mid": ["LH2", "HL2", "HH2"], "high": ["LH1"
 
 def _write_contract(path, *, fold_id: str = "fold_0", mean_sha=None,
                     support_mode: str = "floor_gated",
-                    floor_rho: float = 0.1) -> None:
-    """Write a self-hashed, valid recoverability contract JSON (DESIGN S3)."""
+                    floor_rho: float = 0.1,
+                    band_powers=None) -> None:
+    """Write a self-hashed, valid recoverability contract JSON (DESIGN S3).
+
+    band_powers=None keeps the v1 artifact form; a dict writes a schema-v2
+    contract for the band_snr clock.
+    """
     payload = {
         "fold_id": fold_id,
         "band_groups": {g: list(b) for g, b in _CONTRACT_GROUPS.items()},
@@ -165,6 +170,9 @@ def _write_contract(path, *, fold_id: str = "fold_0", mean_sha=None,
         "eta_max": 0.8,
         "floor_rho": floor_rho,
     }
+    if band_powers is not None:
+        payload["band_powers"] = {g: float(v) for g, v in band_powers.items()}
+        payload["band_powers_split"] = "integration_test"
     contract = RecoverabilityContract.from_payload(payload)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump({**contract.to_payload(), "contract_sha256": contract.contract_sha256}, handle)
@@ -176,8 +184,10 @@ def _model_with_contract_cfg(artifact_dir, **rc_overrides) -> dict:
     Contract-level kwargs (support_mode/floor_rho/fold_id) are pulled from
     rc_overrides and forwarded to the contract writer.
     """
-    contract_keys = {"support_mode", "floor_rho", "fold_id"}
+    contract_keys = {"support_mode", "floor_rho", "fold_id", "contract_band_powers"}
     contract_kw = {k: rc_overrides.pop(k) for k in list(rc_overrides) if k in contract_keys}
+    if "contract_band_powers" in contract_kw:
+        contract_kw["band_powers"] = contract_kw.pop("contract_band_powers")
     ckpt = artifact_dir / "mean.pt"
     state = _make_mean_checkpoint(ckpt)
     contract = artifact_dir / "contract.json"
@@ -1035,3 +1045,69 @@ class TestCTProvenanceConfig:
         init_out = model.rc_brd_head(haar_forward2(pred), token, None)
         for band, base in haar_forward2(pred).items():
             assert torch.equal(init_out[band], base)  # zero-init identity
+
+
+# ---------------------------------------------------------------------------
+# v2 band clock integration (clock_mode; DESIGN_RC_BRD_clock_v2)
+# ---------------------------------------------------------------------------
+
+class TestBandClockV2:
+    def test_bad_clock_mode_fails_closed(self, artifact_dir):
+        cfg = _model_with_contract_cfg(artifact_dir, kappa=0.25, clock_mode="nope")
+        with pytest.raises(ValueError, match="clock_mode"):
+            _build(cfg)
+
+    def test_band_snr_with_v1_contract_fails_closed(self, artifact_dir):
+        # v1 artifact (no band_powers) + band_snr -> actionable build error.
+        cfg = _model_with_contract_cfg(artifact_dir, kappa=0.25, clock_mode="band_snr")
+        with pytest.raises(ValueError, match="band_powers"):
+            _build(cfg)
+
+    def test_band_snr_with_v2_contract_builds(self, artifact_dir):
+        cfg = _model_with_contract_cfg(
+            artifact_dir, kappa=0.25, clock_mode="band_snr",
+            contract_band_powers={"low": 0.2, "mid": 1.0, "high": 5.0})
+        model = _build(cfg)
+        assert model.rc_brd_schedule.config.clock_mode == "band_snr"
+        seq = model.rc_brd_schedule.m_sequence("mid")
+        assert seq[0].item() == 0.0 and seq[-1].item() == 1.0
+        assert bool((seq[1:] - seq[:-1] > 0).all())
+
+    def test_band_snr_head_gating_uses_clock_query_axis(self, artifact_dir):
+        # Single-source query axis: _rc_brd_c_effective interpolates the
+        # contract at exactly schedule.clock_query_log_snr (audit defect (b)).
+        cfg = _model_with_contract_cfg(
+            artifact_dir, kappa=0.25, clock_mode="band_snr",
+            contract_band_powers={"low": 0.2, "mid": 1.0, "high": 5.0})
+        model = _build(cfg)
+        contract = model.rc_brd_contract
+        t = torch.tensor([1, 10, 50], dtype=torch.int64)
+        c_bands = model._rc_brd_c_effective(t, torch.zeros(len(t), 1, IMAGE, IMAGE))
+        floor = (contract.floor_rho if contract.support_mode == "floor_gated"
+                 else 0.0)
+        # Cover a P_g=1.0 group AND a P_g=5.0 group (review coverage note):
+        # the warped axis differs from the old shared base axis for both, and
+        # additionally the power shift is pinned for "high".
+        for group in ("mid", "high"):
+            lam = model.rc_brd_schedule.clock_query_log_snr(group, t)
+            expected = floor + (1.0 - floor) * contract.effective_c(group, lam)
+            for band in contract.band_groups[group]:
+                torch.testing.assert_close(c_bands[band], expected,
+                                           rtol=1e-6, atol=1e-7)
+        lam_high = model.rc_brd_schedule.clock_query_log_snr("high", t)
+        lam_low_axis = torch.log(
+            1.0 * (1.0 - t.double() / T) / (2.0 * (t.double() / T))
+        ).clamp(-10.0, 10.0)  # shared v1 axis for contrast
+        assert not torch.allclose(lam_high, lam_low_axis)
+
+    def test_base_snr_clock_ignores_contract_band_powers(self, artifact_dir):
+        # Control B: a v2 contract consumed in base_snr mode is bit-identical
+        # to the v1 contract without band_powers.
+        cfg1 = _model_with_contract_cfg(
+            artifact_dir, kappa=0.25, clock_mode="base_snr",
+            contract_band_powers={"low": 0.2, "mid": 1.0, "high": 5.0})
+        cfg2 = _model_with_contract_cfg(artifact_dir, kappa=0.25,
+                                        clock_mode="base_snr")
+        m1 = _build(cfg1).rc_brd_schedule.m_sequence("mid")
+        m2 = _build(cfg2).rc_brd_schedule.m_sequence("mid")
+        torch.testing.assert_close(m1, m2, rtol=0, atol=0)

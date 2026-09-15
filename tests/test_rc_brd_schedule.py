@@ -45,6 +45,8 @@ class _StubContract:
     band_groups: dict = field(default_factory=lambda: band_groups(3))
     log_snr_grid: tuple = (-10.0, 0.0, 10.0)
     b_active: tuple = ("low", "mid", "high")
+    # v2 duck-typed surface: band_powers must be declared (None = v1 artifact).
+    band_powers: dict | None = None
 
     def effective_c(self, group: str, log_snr: torch.Tensor) -> torch.Tensor:
         if group not in self.band_groups:
@@ -73,6 +75,255 @@ def _random_eps(bands, seed: int):
 def test_mode_constants():
     assert FORWARD_MODES == ("bridge_time_changed", "vp_bandwise")
     assert ENDPOINT_MODES == ("zeros", "ct_minus_mean")
+    from src.model.rc_brd.schedule import CLOCK_MODES
+    assert CLOCK_MODES == ("base_snr", "band_snr")
+
+
+# ---------------------------------------------------------------------------
+# v2 band clock (clock_mode="band_snr"; DESIGN_RC_BRD_clock_v2 + math review)
+# ---------------------------------------------------------------------------
+
+def _table_contract(powers=None, grid=(-10.0, 0.0, 10.0), c=(0.9, 0.5, 0.1)):
+    """Real contract with a curved shared table (table-driven clock tests)."""
+    from src.model.rc_brd.contract import RecoverabilityContract
+    groups = band_groups(3)
+    return RecoverabilityContract.from_payload({
+        "fold_id": "fold_t",
+        "band_groups": {g: list(b) for g, b in groups.items()},
+        "log_snr_grid": list(grid),
+        "c_values": {g: list(c) for g in groups},
+        "mean_checkpoint_sha256": "a" * 64,
+        "b_active": list(groups),
+        "psd_floors": {g: 1e-4 for g in groups},
+        "size_thresholds": {"small_lesion_q25": 25.0},
+        "kappa_grid": [0.0, 0.5, 1.0, 2.0],
+        "s_ref": 0.05,
+        "support_mode": "floor_gated",
+        "eta_max": 0.8,
+        "floor_rho": 0.1,
+        "band_powers": powers or {g: 1.0 for g in groups},
+    })
+
+
+def test_clock_mode_enum_and_default():
+    assert BandwiseScheduleConfig().clock_mode == "base_snr"
+    with pytest.raises(ValueError, match="clock_mode"):
+        BandwiseScheduleConfig(clock_mode="nope")
+
+
+def test_band_snr_requires_v2_contract():
+    with pytest.raises(ValueError, match="band_powers"):
+        BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=50, kappa=0.5, clock_mode="band_snr"),
+            contract=_StubContract())  # band_powers=None -> v1 semantics
+
+
+def test_band_snr_missing_group_power_fails_closed():
+    with pytest.raises(ValueError, match="missing groups"):
+        BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=50, kappa=0.5, clock_mode="band_snr"),
+            contract=_table_contract(powers={"low": 1.0, "mid": 1.0}))
+
+
+def test_band_snr_nonpositive_power_fails_closed():
+    with pytest.raises(ValueError, match="finite and > 0"):
+        BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=50, kappa=0.5, clock_mode="band_snr"),
+            contract=_table_contract(powers={"low": 1.0, "mid": 0.0, "high": 1.0}))
+
+
+def test_band_snr_kappa0_identity_with_power():
+    # Math review R4: kappa=0 -> rho==1 regardless of lambda and P_g; the
+    # fast path is the exact arange identity and the query axis stays
+    # band-aware for head gating.
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=0.0, clock_mode="band_snr"),
+        contract=_table_contract(powers={"low": 5.0, "mid": 1.0, "high": 0.2}))
+    for group in ("low", "mid", "high"):
+        assert _identity_residual(sched.m_sequence(group)) == 0.0
+    t = torch.tensor([0, 25, 100], dtype=torch.int64)
+    lam = sched.clock_query_log_snr("low", t)
+    u = t.to(torch.float64) / 100
+    expected = torch.log(5.0 * (1.0 - u) / (2.0 * u.clamp_min(1e-300))
+                         ).clamp(-10.0, 10.0)
+    torch.testing.assert_close(lam, expected, rtol=0, atol=0)
+
+
+def test_band_snr_monotone_endpoints_and_convergence():
+    # Iterations-to-tol regression envelope: |kappa| <= 2 with eta=0.8 must
+    # converge inside K_max=64 (math review measured need: 13-41 iterations).
+    for kappa in (0.5, 1.0, 2.0, -1.0):
+        sched = BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=100, kappa=kappa, clock_mode="band_snr"),
+            contract=_table_contract(powers={"low": 0.2, "mid": 1.0, "high": 5.0}))
+        for group in ("low", "mid", "high"):
+            seq = sched.m_sequence(group)
+            assert seq[0].item() == 0.0 and seq[-1].item() == 1.0
+            assert bool((seq[1:] - seq[:-1] > 0).all())
+
+
+def test_band_snr_power_differentiates_clocks():
+    # Audit R1: same curved table, different frozen band powers -> genuinely
+    # different per-group clocks.  Magnitude note (math review): P-sensitivity
+    # of a 3-knot table is modest (~4e-4 at kappa=1, P 0.2 vs 5); with kappa=2
+    # and a 100x power ratio it reaches ~1e-3 — three orders above the exact
+    # blindness floor (1e-12) of the equal-P / base_snr controls.
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=2.0, clock_mode="band_snr"),
+        contract=_table_contract(powers={"low": 0.1, "mid": 1.0, "high": 10.0}))
+    m_low, m_high = sched.m_sequence("low"), sched.m_sequence("high")
+    assert (m_low - m_high).abs().max().item() > 1e-4
+
+
+def test_base_snr_ignores_band_powers():
+    # Control B is power-BLIND by construction: with/without differential
+    # powers the v1 clock is bit-identical.
+    c1 = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="base_snr"),
+        contract=_table_contract(powers={"low": 0.2, "mid": 1.0, "high": 5.0}))
+    c2 = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="base_snr"),
+        contract=_table_contract(powers={"low": 1.0, "mid": 1.0, "high": 1.0}))
+    for group in ("low", "mid", "high"):
+        torch.testing.assert_close(c1.m_sequence(group), c2.m_sequence(group),
+                                   rtol=0, atol=0)
+
+
+def test_equal_power_constant_offset_blindness_documented():
+    # Math-review theorem (expected behaviour, NOT a defect): under endpoint
+    # pinning, equal P_g plus a pure constant c offset is exactly blind.
+    from src.model.rc_brd.contract import RecoverabilityContract
+    groups = band_groups(3)
+    payload = {
+        "fold_id": "fold_t",
+        "band_groups": {g: list(b) for g, b in groups.items()},
+        "log_snr_grid": [-10.0, 0.0, 10.0],
+        "c_values": {"low": [0.8, 0.5, 0.2], "mid": [0.8, 0.5, 0.2],
+                     "high": [0.9, 0.6, 0.3]},   # high = low + 0.1 everywhere
+        "mean_checkpoint_sha256": "a" * 64,
+        "b_active": list(groups),
+        "psd_floors": {g: 1e-4 for g in groups},
+        "size_thresholds": {"small_lesion_q25": 25.0},
+        "kappa_grid": [0.0, 1.0],
+        "s_ref": 0.05,
+        "support_mode": "floor_gated",
+        "eta_max": 0.8,
+        "floor_rho": 0.1,
+        "band_powers": {g: 1.0 for g in groups},  # EQUAL powers
+    }
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="band_snr"),
+        contract=RecoverabilityContract.from_payload(payload))
+    diff = (sched.m_sequence("high") - sched.m_sequence("low")).abs().max().item()
+    assert diff < 1e-12
+
+
+def test_flat_table_identity_any_power():
+    # Flat c table -> constant rho -> m == u for every P_g and kappa
+    # (math review Q1 corollary).
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="band_snr"),
+        contract=_table_contract(c=(0.6, 0.6, 0.6),
+                                 powers={"low": 0.2, "mid": 1.0, "high": 5.0}))
+    for group in ("low", "mid", "high"):
+        assert _identity_residual(sched.m_sequence(group)) < 1e-12
+
+
+def test_band_snr_stagnation_fails_closed():
+    class _AlternatingContract:
+        eta_max = 0.8
+        band_groups = band_groups(3)
+        log_snr_grid = (-10.0, 0.0, 10.0)
+        b_active = ("low", "mid", "high")
+        band_powers = {"low": 1.0, "mid": 1.0, "high": 1.0}
+        c_values = {"low": (0.9, 0.5, 0.1), "mid": (0.9, 0.5, 0.1),
+                    "high": (0.9, 0.5, 0.1)}
+
+        def __init__(self):
+            self.calls = 0
+
+        def effective_c(self, group, log_snr):
+            self.calls += 1
+            # Two DIFFERENT lambda-shaped tables alternating per call: the
+            # fixed point ping-pongs between two distinct non-identity clocks
+            # (a constant table would make both sides the identity clock and
+            # trivially "converge").
+            lam = log_snr.to(dtype=torch.float64)
+            shaped = 0.4 + 0.1 * torch.tanh(lam / 5.0)
+            if self.calls % 2 == 0:
+                shaped = 0.6 - shaped
+            return shaped
+
+    with pytest.raises(ValueError, match="stagnated|did not converge"):
+        sched = BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=50, kappa=1.0, clock_mode="band_snr"),
+            contract=_AlternatingContract())
+        sched.m_sequence("mid")
+
+
+def test_band_snr_ct_minus_mean_warns():
+    with pytest.warns(RuntimeWarning, match="ct_minus_mean"):
+        BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=50, kappa=0.5, clock_mode="band_snr",
+                                   endpoint_mode="ct_minus_mean"),
+            contract=_table_contract())
+
+
+def test_aliasing_guard_warns_on_subgrid_table_segment():
+    # A c jump confined to a 0.1-wide lambda segment at the clip
+    # desaturation edge occupies an m-window below the grid step (math
+    # review correction #5): the build must warn while staying usable.
+    with pytest.warns(RuntimeWarning, match="power-blind"):
+        sched = BandwiseBridgeSchedule(
+            BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="band_snr"),
+            contract=_table_contract(grid=(-10.0, -9.9, 10.0), c=(0.9, 0.1, 0.1)))
+        seq = sched.m_sequence("mid")
+        assert seq[0].item() == 0.0 and seq[-1].item() == 1.0
+
+
+def test_band_snr_duck_contract_without_c_values_ok():
+    # Review finding 2: c_values is NOT part of the declared duck-typed
+    # surface; a contract implementing exactly the documented interface must
+    # run the band_snr clock without the aliasing guard crashing.
+    class _NoTableContract:
+        eta_max = 0.8
+        band_groups = band_groups(3)
+        log_snr_grid = (-10.0, 0.0, 10.0)
+        b_active = ("low", "mid", "high")
+        band_powers = {"low": 0.2, "mid": 1.0, "high": 5.0}
+
+        def effective_c(self, group, log_snr):
+            lam = log_snr.to(dtype=torch.float64)
+            c = (0.5 + 0.2 * torch.tanh(lam / 10.0)).clamp(0.0, 1.0)
+            return (1.0 - self.eta_max) * 0.5 + self.eta_max * c
+
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="band_snr"),
+        contract=_NoTableContract())
+    for group in ("low", "mid", "high"):
+        seq = sched.m_sequence(group)
+        assert seq[0].item() == 0.0 and seq[-1].item() == 1.0
+
+
+def test_clock_query_axis_matches_converged_fixed_point():
+    sched = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="band_snr"),
+        contract=_table_contract(powers={"low": 0.2, "mid": 1.0, "high": 5.0}))
+    t = torch.arange(0, 101, 10, dtype=torch.int64)
+    lam = sched.clock_query_log_snr("mid", t)
+    fine = sched._lam_query_cache["mid"]
+    torch.testing.assert_close(lam, fine[t * 4], rtol=0, atol=0)
+    assert bool((lam[:-1] >= lam[1:]).all())  # SNR falls as corrosion proceeds
+    # base mode keeps the shared v1 axis for every group
+    base = BandwiseBridgeSchedule(
+        BandwiseScheduleConfig(num_timesteps=100, kappa=1.0, clock_mode="base_snr"),
+        contract=_table_contract(powers={"low": 0.2, "mid": 1.0, "high": 5.0}))
+    u = t.to(torch.float64) / 100
+    expected = torch.log((1.0 - u) / (2.0 * u)).clamp(-10.0, 10.0)
+    torch.testing.assert_close(base.clock_query_log_snr("low", t), expected,
+                               rtol=0, atol=0)
+    torch.testing.assert_close(base.clock_query_log_snr("high", t), expected,
+                               rtol=0, atol=0)
 
 
 def test_kappa0_identity_without_contract():
@@ -154,6 +405,7 @@ class _GridStubContract:
     band_groups: dict = field(default_factory=lambda: band_groups(3))
     log_snr_grid: tuple = (-10.0, 0.0, 10.0)
     b_active: tuple = ("low", "mid", "high")
+    band_powers: dict | None = None   # v2 duck-typed surface declaration
     c_grid: dict = field(default_factory=lambda: {
         "low": (0.1, 0.25, 0.45),
         "mid": (0.2, 0.55, 0.6),
@@ -243,12 +495,18 @@ def test_clock_lookup_departs_from_deprecated_linear_warp():
 
 
 def test_deprecated_linear_warp_absent_from_clock_path():
-    # No dead path: _compute_m_sequence must contain the v1.5 log-SNR lookup
-    # and no residual v1.4 linear warp (which legitimately survives only in
-    # _alpha_hat_values for the vp ᾱ endpoint interpolation).
+    # No dead path: the clock must go through the log-SNR query-axis helpers
+    # (v2 factored torch.log into _base_snr_query_axis / _band_snr_query_axis)
+    # and contain no residual v1.4 linear warp (which legitimately survives
+    # only in _alpha_hat_values for the vp alpha-bar endpoint interpolation).
     src = inspect.getsource(BandwiseBridgeSchedule._compute_m_sequence)
-    assert "torch.log" in src
-    assert "(self.config.lambda_min - self.config.lambda_max)" not in src
+    axis_src = (
+        inspect.getsource(BandwiseBridgeSchedule._base_snr_query_axis)
+        + inspect.getsource(BandwiseBridgeSchedule._band_snr_query_axis))
+    assert "torch.log" in axis_src
+    assert "_base_snr_query_axis(u)" in src or "_band_snr_query_axis(group, u)" in src
+    for code in (src, axis_src):
+        assert "(self.config.lambda_min - self.config.lambda_max)" not in code
 
 
 def test_unknown_group_raises_keyerror():

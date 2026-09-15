@@ -35,7 +35,11 @@ from typing import Mapping
 import torch
 
 SUPPORT_MODES = ("stratified_mixture", "floor_gated")  # C4 ([审计] §5)
-CONTRACT_SCHEMA_VERSION = 1
+# v2 (clock math review): optional band_powers/band_powers_split for the
+# band_snr clock.  v1 artifacts (no band_powers key) remain loadable; v2
+# contracts MUST carry explicit band_powers (freeze writes them; the
+# power-blind control A freezes explicit 1.0 for every group).
+CONTRACT_SCHEMA_VERSION = 2
 
 # GT-derived quantities are forbidden inside the contract (inference must only
 # read CT evidence; [计划] §3.7/§4). Locked by test_rc_brd_no_gt_leakage.py.
@@ -155,7 +159,13 @@ class RecoverabilityContract:
     support_mode: str                        # SUPPORT_MODES 之一
     eta_max: float                           # C5，∈[0,1)
     floor_rho: float                         # C4 floor_gated 时 ∈(0,1)；stratified_mixture 时忽略
-    contract_sha256: str                     # 载荷自哈希（canonical JSON, sha256, 不含本字段自身）
+    # ---- schema v2（时钟数学复核修正 #3；DESIGN_RC_BRD_clock_v2 §2.3）----
+    # P_g 必须是组内 Haar 残差系数的【每系数平均功率】（z0 侧），在冻结
+    # split 上估计 —— 绝不是组总功率（Parseval 1:3:12/16 会把 high 组放
+    # 大 ~12x，破坏 SNR 语义）。None = v1 工件（无该域，向后兼容）。
+    band_powers: dict[str, float] | None = None
+    band_powers_split: str | None = None     # P_g 估计 split 的记录（审计追溯）
+    contract_sha256: str = ""                # 载荷自哈希（canonical JSON, sha256, 不含本字段自身）
 
     def validate(self) -> None:
         """Fail-closed validation (DESIGN §3 / FR-2.2).
@@ -230,6 +240,19 @@ class RecoverabilityContract:
         _require(_is_finite_number(self.eta_max) and 0.0 <= float(self.eta_max) < 1.0,
                  "eta_max must lie in [0,1) ([审计] §3.3)")
         _require(_is_finite_number(self.floor_rho), "floor_rho must be a finite float")
+        # schema v2 (clock math review #3): mirror psd_floors validation.
+        if self.band_powers is not None:
+            _checked_float_mapping(self.band_powers, "band_powers",
+                                   expected_keys=set(self.band_groups))
+            for group, value in self.band_powers.items():
+                _require(float(value) > 0.0,
+                         f"band_powers[{group!r}] must be > 0 (mean per-coefficient "
+                         "Haar residual power, DESIGN_RC_BRD_clock_v2 §2.3)")
+        if self.band_powers_split is not None:
+            _require(isinstance(self.band_powers_split, str) and self.band_powers_split,
+                     "band_powers_split must be a non-empty string when present")
+            _require(self.band_powers is not None,
+                     "band_powers_split requires band_powers (schema v2)")
         if self.support_mode == "floor_gated":
             _require(0.0 < float(self.floor_rho) < 1.0,
                      "floor_rho must lie in (0,1) when support_mode='floor_gated' "
@@ -268,7 +291,7 @@ class RecoverabilityContract:
 
     def to_payload(self) -> dict:
         """Canonical JSON-native payload dict, without contract_sha256 (DESIGN §3)."""
-        return {
+        payload = {
             "fold_id": str(self.fold_id),
             "band_groups": {
                 str(g): [str(b) for b in bands] for g, bands in self.band_groups.items()
@@ -287,6 +310,11 @@ class RecoverabilityContract:
             "eta_max": float(self.eta_max),
             "floor_rho": float(self.floor_rho),
         }
+        if self.band_powers is not None:
+            payload["band_powers"] = {str(g): float(v) for g, v in self.band_powers.items()}
+        if self.band_powers_split is not None:
+            payload["band_powers_split"] = str(self.band_powers_split)
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict) -> "RecoverabilityContract":
@@ -305,10 +333,12 @@ class RecoverabilityContract:
             "mean_checkpoint_sha256", "b_active", "psd_floors", "size_thresholds",
             "kappa_grid", "s_ref", "support_mode", "eta_max", "floor_rho",
         }
+        # schema v2 optional fields (band_snr clock); absent in v1 artifacts.
+        optional = {"band_powers", "band_powers_split"}
         missing = sorted(required - set(payload))
         if missing:
             raise ContractViolationError(f"payload is missing fields: {missing}")
-        unknown = sorted(set(payload) - required - {"contract_sha256"})
+        unknown = sorted(set(payload) - required - optional - {"contract_sha256"})
         if unknown:
             raise ContractViolationError(f"payload has unknown fields: {unknown}")
         try:
@@ -327,6 +357,10 @@ class RecoverabilityContract:
                 support_mode=payload["support_mode"],
                 eta_max=float(payload["eta_max"]),
                 floor_rho=float(payload["floor_rho"]),
+                band_powers=({str(g): float(v) for g, v in payload["band_powers"].items()}
+                             if payload.get("band_powers") is not None else None),
+                band_powers_split=(str(payload["band_powers_split"])
+                                   if payload.get("band_powers_split") is not None else None),
                 contract_sha256="",
             )
         except (AttributeError, TypeError, ValueError) as exc:

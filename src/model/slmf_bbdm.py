@@ -1390,10 +1390,18 @@ class SLMFBBDM(nn.Module):
             # κ=0 may run contract-free (strict D1, DESIGN §4); a time-changed
             # clock requires the frozen contract.
             raise ValueError("modules.rc_brd.kappa != 0 requires contract_path")
-        from .rc_brd import (A3_VARIANTS, CONTRACT_TRANSFORMS, BandwiseBridgeSchedule,
-                             BandwiseScheduleConfig, apply_contract_transform, band_groups)
+        from .rc_brd import (A3_VARIANTS, CLOCK_MODES, CONTRACT_TRANSFORMS,
+                             BandwiseBridgeSchedule, BandwiseScheduleConfig,
+                             apply_contract_transform, band_groups)
         forward_mode = str(rc_cfg.get("forward_mode", "bridge_time_changed"))
         endpoint_mode = str(rc_cfg.get("endpoint_mode", "zeros"))
+        # v2 band clock (DESIGN_RC_BRD_clock_v2): base_snr = v1 power-blind
+        # control B; band_snr = self-consistent band-SNR axis (needs a v2
+        # contract with band_powers - the schedule guard raises otherwise).
+        clock_mode = str(rc_cfg.get("clock_mode", "base_snr"))
+        if clock_mode not in CLOCK_MODES:
+            raise ValueError(f"modules.rc_brd.clock_mode must be one of "
+                             f"{CLOCK_MODES}, got {clock_mode!r}")
         if forward_mode == "vp_bandwise" and endpoint_mode == "ct_minus_mean":
             # v1.0f guard ①: the sampling path cannot carry ct_minus_mean in vp.
             raise ValueError("modules.rc_brd forward_mode=vp_bandwise cannot be combined "
@@ -1443,6 +1451,7 @@ class SLMFBBDM(nn.Module):
                 lambda_min=float(rc_cfg.get("lambda_min", -10.0)),
                 lambda_max=float(rc_cfg.get("lambda_max", 10.0)),
                 endpoint_mode=endpoint_mode,
+                clock_mode=clock_mode,
             ),
             contract,
         )
@@ -1508,12 +1517,22 @@ class SLMFBBDM(nn.Module):
         contract = self.rc_brd_contract
         if contract is None or self.rc_brd_head is None:
             return None
-        cfg = self.rc_brd_schedule.config
-        u = timesteps.to(device=reference.device, dtype=torch.float64) / cfg.num_timesteps
-        log_snr = _rc_brd_base_log_snr(u, cfg.sigma_bridge, cfg.lambda_min, cfg.lambda_max)
-        zero, active = torch.zeros_like(log_snr), set(contract.b_active)
-        c_groups = {group: (contract.effective_c(group, log_snr) if group in active else zero)
-                    for group in contract.band_groups}
+        zero = torch.zeros(timesteps.shape[0], dtype=torch.float64,
+                           device=reference.device)
+        active = set(contract.b_active)
+        c_groups = {}
+        for group in contract.band_groups:
+            if group not in active:
+                c_groups[group] = zero
+                continue
+            # v2 (audit defect (b) fix): query on the clock's own axis.
+            # base_snr keeps the shared lambda0(t/T) for every group (v1
+            # semantics); band_snr uses lambda_g(m_g(t)) with the frozen band
+            # power.  Single source: schedule.clock_query_log_snr - the head
+            # gating cannot drift from the clock.
+            log_snr = self.rc_brd_schedule.clock_query_log_snr(
+                group, timesteps).to(device=reference.device, dtype=torch.float64)
+            c_groups[group] = contract.effective_c(group, log_snr)
         if contract.support_mode == "floor_gated":  # v1.0f guard ④ ([审计] §5)
             floor = float(contract.floor_rho)
             c_groups = {g: (floor + (1.0 - floor) * c if g in active else c)
@@ -1553,11 +1572,15 @@ class SLMFBBDM(nn.Module):
         """
         cfg = self.rc_brd_schedule.config
         contract = self._rc_brd_density_contract
-        u = torch.arange(cfg.num_timesteps, dtype=torch.float64) / cfg.num_timesteps
-        lam = _rc_brd_base_log_snr(u, cfg.sigma_bridge, cfg.lambda_min, cfg.lambda_max)
+        t_grid = torch.arange(cfg.num_timesteps, dtype=torch.int64)
         shares = _rc_brd_group_shares(contract.band_groups)  # n_g/N (v1.0g)
-        rho = torch.zeros_like(lam)
+        rho = torch.zeros(cfg.num_timesteps, dtype=torch.float64)
         for group, share in shares.items():
+            # v2: same single-source query axis as the clock (base_snr keeps
+            # the shared lambda0; band_snr uses lambda_g(m_g(t))).  band_powers
+            # are invariant under the A3/A4/A5 contract transforms.
+            lam = self.rc_brd_schedule.clock_query_log_snr(
+                group, t_grid).to(torch.float64)
             rho = rho + share * torch.exp(
                 cfg.kappa * (2.0 * contract.effective_c(group, lam).to(torch.float64) - 1.0))
         return rho / rho.sum()

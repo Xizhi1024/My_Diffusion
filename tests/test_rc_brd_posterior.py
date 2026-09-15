@@ -46,6 +46,7 @@ class _StubContract:
     band_groups: dict = field(default_factory=lambda: band_groups(3))
     log_snr_grid: tuple = (-10.0, 0.0, 10.0)
     b_active: tuple = ("low", "mid", "high")
+    band_powers: dict | None = None   # v2 duck-typed surface declaration
 
     def effective_c(self, group: str, log_snr: torch.Tensor) -> torch.Tensor:
         if group not in self.band_groups:
