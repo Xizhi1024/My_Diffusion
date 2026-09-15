@@ -1,26 +1,41 @@
-# RC-BRD production arm: rc_brd_prod_rc (RC-clock + Specialist, kappa!=0 under frozen contract)
+# RC-BRD production arm: rc_brd_prod_rc_band_snr (band-SNR clock v2 + Specialist)
 #
-# AUDIT evidence-chain fix (audit round: "建立真实数据生产配置并加载、冻结合格
-# MeanNet"). 真实 PNG 数据 + 冻结的条件均值 MeanNet + 合同化 RC-BRD 调度。
+# DESIGN_RC_BRD_clock_v2: clock_mode=band_snr — the clock queries c~ on
+# the band's own bridge SNR lambda_g(m_g) with the frozen per-group power
+# P_g (self-consistent fixed point), instead of the shared power-blind
+# lambda_0(u) of the v1/base_snr control.  The loss weighting reads the
+# SAME single-source axis (schedule.clock_query_log_snr), so clock, head
+# gating, A3b density and the per-band Min-SNR-gamma loss cannot drift.
 #
 # 前置依赖链（fail-closed，缺一不可正式训练）:
-#   1. MeanNet 预训练: src/model/mean_pretraining.py 产出
-#      checkpoints/rc_brd_mean_pretrain/mean_best.pt（format_version 1|2,
-#      含 "model" state dict）; freeze=true 在模型构建时强制加载并校验。
-#   2. R0 probe: scripts/run_recoverability_probe.py（患者级，PASS 才可冻结）。
-#   3. freeze: scripts/freeze_recoverability_contract.py（PASS 门 + b_active
-#      仅含通过检验的组）→ artifacts/rc_brd/fold_0/contract.json。
+#   1. MeanNet 预训练: checkpoints/rc_brd_mean_pretrain/mean_best.pt
+#      (src/model/mean_pretraining.py; format_version 1|2, 含 "model")。
+#   2. P_g 封存（本臂特有，每折自动）:
+#      pixi run rc-brd-band-powers   # = python scripts/compute_band_powers.py
+#        --config configs/experiments/rc_brd_prod_rc_band_snr.yaml --fold fold_0
+#      产物 artifacts/rc_brd/fold_0/band_powers.json：outer-train 上
+#      z0=PET−frozen_mean 的组内 Haar 系数每系数平均功率（§2.3 防止
+#      Parseval 1:3:12/16 总量陷阱）。
+#   3. R0 probe: scripts/run_recoverability_probe.py（患者级，PASS 才可冻结）。
+#   4. freeze（v2 合同，写入 band_powers）:
+#      python scripts/freeze_recoverability_contract.py --probe-result ... \
+#        --fold fold_0 --out artifacts/rc_brd/fold_0/contract_band_snr.json \
+#        --s-ref ... --kappa-grid 0.0,0.5 \
+#        --mean-checkpoint checkpoints/rc_brd_mean_pretrain/mean_best.pt \
+#        --band-powers-file artifacts/rc_brd/fold_0/band_powers.json
+#      独立 out 路径：base_snr 臂（rc_brd_prod_rc.yaml）继续消费无功率
+#      合同 artifacts/rc_brd/fold_0/contract.json，重冻结互不干扰。
 #
-# 匹配设计: 本配置与 rc_brd_prod_d1/rc_brd_prod_rc 除 kappa/contract_path 外
-# 逐键一致（参数/SNR 匹配对照, 审计"最小矩阵"要求）。
-#   clock_mode 说明：两臂均未显式设置 clock_mode（隐式 base_snr，v1 对照 B 时钟）。
-#   若需启用 v2 频带时钟：clock_mode: band_snr + 以 --band-powers 冻结的 v2 合同。
-#   本臂: kappa=0.5（必须 ∈ 冻结合同 kappa_grid；freeze 时 --kappa-grid 需含
-#   0.0 与 0.5）。contract_path 指向 probe PASS 后冻结的合同工件；合同缺失或
-#   fold 不匹配时模型构建 fail-closed。κ=0 对照由 rc_brd_prod_d1.yaml 承担。
+# 匹配设计: 与 rc_brd_prod_rc 除 clock_mode/contract_path/loss 三处外
+# 逐键一致（参数/SNR 匹配对照）。clock_mode=band_snr + 无 band_powers 的
+# v1 合同会在模型构建期 fail-closed（schedule 守卫）。
+#   本臂: kappa=0.5（必须 ∈ 合同 kappa_grid）；loss_weighting=
+#   per_band_min_snr 使 A8 逐带 Min-SNR 权重读取真实 SNR_g=exp(lambda_g)
+#   （同一单源查询轴）。对照臂：rc_brd_prod_d1（κ=0）、rc_brd_prod_rc
+#   （base_snr 时钟）；四臂机制拆解见 rc_brd.ablations.CLOCK_SPECIALIST_ARMS。
 
 experiment:
-  name: rc_brd_prod_rc
+  name: rc_brd_prod_rc_band_snr
   seed: 42
 
 data:
@@ -63,7 +78,7 @@ runtime:
     stripe_penalty: 0.3
   early_stopping:
     enabled: true
-    # Audit P1-1: patience must be >= eval_interval (50); 40 halted the plan at epoch 100.
+    # Audit P1-1: patience must be >= eval_interval (50).
     patience: 100
     min_epochs: 50
 
@@ -73,9 +88,7 @@ training:
   weight_decay: 0.01
   lr_min: 1e-6
   ema:
-    # Audit P1-3: 0.999 x every-10 = 10k-step time constant; short runs
-    # (100-300 epochs) carried mostly initial weights into EMA-based best
-    # selection. 0.995 x 1 washes out init within ~2k steps (matches v5).
+    # Audit P1-3: 0.995 x 1 washes out init within ~2k steps (matches v5).
     decay: 0.995
     update_every: 1
 
@@ -106,7 +119,7 @@ modules:
     name: bbdm_bridge
     num_train_timesteps: 1000
 
-  conditional_mean:                 # 与 D1 臂逐键一致（匹配对照）
+  conditional_mean:                 # 与 D1/RC 臂逐键一致（匹配对照）
     enabled: true
     architecture: low_frequency
     checkpoint: checkpoints/rc_brd_mean_pretrain/mean_best.pt
@@ -120,7 +133,7 @@ modules:
     output_scale: 1.0
     # Audit B5/P1-11: PET is normalized to [-1,1]; the composed mean+
     # residual output must be clamped so PSNR data_range=2 / SSIM range
-    # assumptions hold (v5 sets the same; RC configs aligned 2026-09).
+    # assumptions hold (v5 sets the same).
     clip_output: true
 
   residual_frequency:
@@ -129,6 +142,7 @@ modules:
   rc_brd:
     enabled: true
     forward_mode: bridge_time_changed
+    clock_mode: band_snr            # v2 频带时钟（本臂主开关）
     kappa: 0.5                      # ∈ 合同 kappa_grid（freeze 时注册）
     num_timesteps: 1000
     sigma_bridge: 1.0
@@ -136,9 +150,13 @@ modules:
     lambda_max: 10.0
     endpoint_mode: zeros
     band_groups: 3                  # 必须与合同 band_groups 一致
-    contract_path: artifacts/rc_brd/fold_0/contract.json   # probe PASS 后冻结
+    contract_path: artifacts/rc_brd/fold_0/contract_band_snr.json   # v2 合同（含 band_powers）
     sampling_mode: endpoint_ddim
     allow_unverified_tokens: false
+    # A8 逐带 Min-SNR：权重 = min{SNR_g(t), gamma}，SNR_g=exp(lambda_g)
+    # 取自 clock_query_log_snr 单源轴（真实频带 SNR，非 alphahat 代理）。
+    loss_weighting: per_band_min_snr
+    min_snr_gamma: 5.0
     specialist:
       enabled: true
       a_max: 0.25
@@ -185,7 +203,8 @@ segmenter:
   enabled: false
 
 evaluation:
-  # 同 D1 臂：mc_samples 由 evaluate.py 统一入口钉到 readout.mc_samples=8。
+  # 同 D1/RC 臂：故意不写 mc_samples —— evaluate.py 统一入口在 rc_brd
+  # readout=mc_mean 时自动把 K 钉到 modules.rc_brd.readout.mc_samples（8）。
   physical_suv_available: false
   failure_detection:
     outside_margin: 0.05

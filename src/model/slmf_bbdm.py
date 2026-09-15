@@ -489,11 +489,18 @@ class SLMFBBDM(nn.Module):
         residual_wavelet_cfg = configured_losses.get("residual_wavelet", {})
         if residual_wavelet_cfg.get("enabled", False) and not self.residual_bridge_enabled:
             raise ValueError("losses.residual_wavelet requires modules.residual_bridge.enabled=true")
-        gabor_loss_cfg = configured_losses.get("gabor_consistency") or {}
-        # Audit P1-8: default must match _build_loss (enabled defaults True),
-        # otherwise omitting the key bypasses this guard while the builder
-        # still enables the loss.
-        if gabor_loss_cfg.get("enabled", True) and not self.gabor_routes.get("use_for_loss", False):
+        gabor_loss_cfg = configured_losses.get("gabor_consistency")
+        # Audit P1-8: default must match _build_loss (enabled defaults True
+        # when the KEY IS PRESENT), otherwise omitting 'enabled' bypasses
+        # this guard while the builder still enables the loss.  An absent
+        # key never builds the loss at all (forward iterates the configured
+        # keys only), so it must NOT fire here — treating absence as
+        # enabled broke every config/test that omits the key (regression
+        # found while re-verifying the suite: the "345/345" claim was not
+        # reproducible).
+        if (gabor_loss_cfg is not None
+                and gabor_loss_cfg.get("enabled", True)
+                and not self.gabor_routes.get("use_for_loss", False)):
             raise ValueError(
                 "losses.gabor_consistency requires modules.gabor.use_for_loss=true"
             )
@@ -1694,8 +1701,15 @@ class SLMFBBDM(nn.Module):
         """A8 per-band Min-SNR-γ base loss (DESIGN §8 v1.0f; [地图] §10.1 A8).
 
         Replaces the scalar min-SNR weight of _base_reconstruction_loss with
-        the bandwise clamp min{SNR_b(t), γ}, SNR_b=ᾱ_b/(1−ᾱ_b) from
-        schedule.alpha_hat (bridge: ᾱ=1−m, the documented diagnostic proxy).
+        the bandwise clamp min{SNR_g(t), γ} where SNR_g(t)=exp(λ) is the
+        REAL band bridge SNR taken from the schedule's single-source query
+        axis clock_query_log_snr (DESIGN_RC_BRD_clock_v2 §2.1/§5.5):
+        base_snr mode reads the shared λ₀(t/T), band_snr mode reads the
+        band's own λ_g(m_g(t)) with the frozen per-group power P_g — the
+        same λ the clock, the head gating and the A3b density weights
+        consume, so the loss weighting cannot drift from the clock.  The
+        retired ᾱ_b/(1−ᾱ_b) proxy (ᾱ=1−m from schedule.alpha_hat, a
+        documented diagnostic) carried no P_g and no ν² scaling.
         The MSE term is computed per Haar band and size-weighted (orthonormal
         Parseval: Σ_b (n_b/N)·mse_b == image MSE; uniform weights therefore
         reproduce the unweighted MSE exactly).  L1/gradient terms and the
@@ -1716,10 +1730,17 @@ class SLMFBBDM(nn.Module):
         mse_sum = torch.zeros(pred.shape[0], dtype=torch.float64, device=pred.device)
         band_logs: Dict[str, torch.Tensor] = {}
         for band in BAND_NAMES:
-            alpha = self.rc_brd_schedule.alpha_hat(
-                band_to_group[band], timesteps).to(dtype=torch.float64)
-            snr = alpha / (1.0 - alpha).clamp_min(1e-8)  # ᾱ/(1−ᾱ)
-            w_b = torch.minimum(snr, gamma)              # min{SNR_b(t), γ}
+            # Real band bridge SNR from the schedule's single-source
+            # query axis (DESIGN_RC_BRD_clock_v2 §2.1/§5.5): SNR_g(t)=
+            # exp(λ) with λ = clock_query_log_snr(group, t) — the SAME
+            # axis the clock, the head gating and the A3b density weights
+            # read, so the loss cannot drift from the clock (base_snr:
+            # shared λ₀(t/T); band_snr: λ_g(m_g(t)) with frozen P_g).
+            log_snr = self.rc_brd_schedule.clock_query_log_snr(
+                band_to_group[band], timesteps).to(
+                device=pred.device, dtype=torch.float64)
+            snr = log_snr.exp()
+            w_b = torch.minimum(snr, gamma)              # min{SNR_g(t), γ}
             mse_b = (pred_bands[band].double() - target_bands[band].double()).square()
             mse_b = mse_b.mean(dim=reduce_dims)
             share = float(pred_bands[band][0].numel()) / n_total  # n_b/N (Parseval)
@@ -2807,9 +2828,15 @@ class SLMFBBDM(nn.Module):
         Returns:
             synthetic_pet       [B, 1, H, W]  configured mean/median point estimate
             epistemic_var       [B, 1, H, W]  variance across MC samples
-            aleatoric_logvar    [B, 1, H, W]  heteroscedastic log-variance (if enabled)
+            total_var           [B, 1, H, W]  epistemic (+ aleatoric when the
+                                               heteroscedastic head is enabled)
             confidence_map      [B, 1, H, W]  combined confidence (0=low, 1=high)
+            aleatoric_logvar    [B, 1, H, W]  heteroscedastic log-variance (if enabled)
             samples             [n, B, 1, H, W]  all individual samples
+
+        total_var/confidence_map are always present (epistemic-only
+        fallback); only the aleatoric_* keys are conditional on
+        enable_heteroscedastic.
         """
         if aggregate not in {"mean", "median"}:
             raise ValueError("aggregate must be 'mean' or 'median'")
@@ -2846,20 +2873,30 @@ class SLMFBBDM(nn.Module):
             "samples": samples,
         }
 
-        # Combine aleatoric + epistemic for total confidence
+        # Combine aleatoric + epistemic for total confidence.  Naming
+        # contract (uncertainty naming fix): 'total_var' and
+        # 'confidence_map' are ALWAYS emitted - with the heteroscedastic
+        # head disabled (every RC-BRD prod config sets
+        # model.enable_heteroscedastic=false) they fall back to the
+        # epistemic-only form, so evaluate.py's Uncertainty metric names
+        # (uncertainty_ratio / confidence_lesion_mean) cannot silently
+        # vanish for those arms.
+        aleatoric_var = None
         if all_logvars:
             aleatoric_logvar = torch.stack(all_logvars, dim=0).mean(dim=0)
             aleatoric_var = aleatoric_logvar.exp()
-            total_var = epistemic_var + aleatoric_var
-
-            # Confidence map: inverse of normalised total uncertainty
-            var_max = total_var.amax(dim=(2, 3), keepdim=True).clamp_min(1e-8)
-            confidence = 1.0 - (total_var / var_max)
-
             output["aleatoric_logvar"] = aleatoric_logvar
             output["aleatoric_var"] = aleatoric_var
-            output["total_var"] = total_var
-            output["confidence_map"] = confidence
+
+        total_var = (epistemic_var if aleatoric_var is None
+                     else epistemic_var + aleatoric_var)
+
+        # Confidence map: inverse of normalised total uncertainty
+        var_max = total_var.amax(dim=(2, 3), keepdim=True).clamp_min(1e-8)
+        confidence = 1.0 - (total_var / var_max)
+
+        output["total_var"] = total_var
+        output["confidence_map"] = confidence
 
         return output
 

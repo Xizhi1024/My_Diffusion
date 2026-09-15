@@ -59,6 +59,24 @@ from .schedule import ENDPOINT_MODES
 ABLATION_ARMS: tuple[str, ...] = (
     "A1", "A2", "A3a", "A3b", "A4", "A5", "A6", "A8", "A9",
 )
+# clock × specialist 2×2 factorial (mechanism-attribution directive: the
+# RC arm stacks TWO independent mechanisms — the contracted band clock
+# (κ≠0 time-change) and the bounded reverse specialist — and A1/A2 each
+# toggle only one, leaving two cells of the matrix unmeasured.  The
+# factorial names all four cells explicitly:
+#   clock_off_specialist_off  — pure scalar D1 residual through rc_brd
+#   clock_off_specialist_on   — specialist only   (≡ A1 semantics)
+#   clock_on_specialist_off   — clock only        (≡ A2 semantics)
+#   clock_on_specialist_on    — full RC mainline  (base κ, head on)
+# 'clock' off means κ=0 (the time-changed clock degenerates to m≡t/T
+# exactly; the band_snr query axis stays available for head gating);
+# 'clock' on keeps the base config κ (must be ≠0, fail-closed).
+CLOCK_SPECIALIST_ARMS: tuple[str, ...] = (
+    "clock_off_specialist_off",
+    "clock_off_specialist_on",
+    "clock_on_specialist_off",
+    "clock_on_specialist_on",
+)
 # C8（PRD §3）：A3 sham 强度的两个变体。
 A3_VARIANTS: tuple[str, ...] = ("budget_matched", "density_matched")
 DEFAULT_A3_VARIANT: str = "density_matched"  # C8 默认（PRD §3）
@@ -248,11 +266,47 @@ def _flip_endpoint_mode(config: Mapping[str, Any]) -> str:
     return flipped
 
 
+def _base_rc_brd_config(base_config: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The modules.rc_brd mapping of the base config (empty if absent)."""
+    modules = base_config.get("modules", {})
+    rc_brd = modules.get("rc_brd", {}) if isinstance(modules, Mapping) else {}
+    return rc_brd if isinstance(rc_brd, Mapping) else {}
+
+
+def _four_arm_overrides(base_config: Mapping[str, Any], arm: str) -> dict[str, Any]:
+    """Dotlist overrides of one clock × specialist factorial cell.
+
+    clock off -> kappa=0 (exact scalar-D1 degeneration of the clock);
+    clock on  -> the base config kappa, which MUST be non-zero (a zero
+    base kappa would make the clock-on cell identical to clock-off and
+    the factorial silently degenerate — fail-closed ValueError).
+    The specialist flag follows the arm suffix verbatim.
+    """
+    rc_brd = _base_rc_brd_config(base_config)
+    base_kappa = float(rc_brd.get("kappa", 0.0) or 0.0)
+    clock_on = arm.startswith("clock_on")
+    specialist_on = arm.endswith("specialist_on")
+    overrides: dict[str, Any] = {"modules.rc_brd.enabled": True}
+    if clock_on:
+        if base_kappa == 0.0:
+            raise ValueError(
+                f"four-arm cell {arm!r} needs a base config with"
+                " modules.rc_brd.kappa != 0 (the RC mainline arm); a"
+                " kappa=0 base makes clock_on indistinguishable from"
+                " clock_off")
+        overrides["modules.rc_brd.kappa"] = base_kappa
+    else:
+        overrides["modules.rc_brd.kappa"] = 0.0
+    overrides["modules.rc_brd.specialist.enabled"] = specialist_on
+    return overrides
+
+
 def _check_arm_and_variant(arm: str, a3_variant: str) -> None:
     """Validate arm identity and the C8 a3_variant pairing (fail-closed)."""
-    if arm not in ABLATION_ARMS:
+    known_arms = ABLATION_ARMS + CLOCK_SPECIALIST_ARMS
+    if arm not in known_arms:
         raise ValueError(
-            f"unknown ablation arm {arm!r}; expected one of {ABLATION_ARMS}")
+            f"unknown ablation arm {arm!r}; expected one of {known_arms}")
     if a3_variant not in A3_VARIANTS:
         raise ValueError(
             f"unknown a3_variant {a3_variant!r}; expected one of {A3_VARIANTS} (C8)")
@@ -336,9 +390,25 @@ def build_ablation_config(base_config: dict, arm: str, *,
     C8 pairing: A3a requires a3_variant="budget_matched" and A3b requires
     a3_variant="density_matched" (the default); any other arm must keep the
     default. Unknown arms or variants raise ValueError.
+
+    Additionally accepts the clock × specialist 2×2 factorial arms
+    CLOCK_SPECIALIST_ARMS (clock_{off,on}_specialist_{off,on}):
+
+    * clock_off_specialist_off: κ=0 + specialist off (pure scalar-D1
+      twin through rc_brd) — the cell A1/A2 never measured
+    * clock_off_specialist_on:  κ=0 + specialist on (≡ A1 semantics)
+    * clock_on_specialist_off:  base κ + specialist off (≡ A2 semantics)
+    * clock_on_specialist_on:   base κ + specialist on (RC mainline cell)
+
+    clock_on cells require a base config with modules.rc_brd.kappa != 0
+    (fail-closed ValueError otherwise).
     """
     _check_arm_and_variant(arm, a3_variant)
-    return apply_dotlist_overrides(dict(base_config), _arm_overrides(base_config, arm))
+    if arm in CLOCK_SPECIALIST_ARMS:
+        overrides = _four_arm_overrides(base_config, arm)
+    else:
+        overrides = _arm_overrides(base_config, arm)
+    return apply_dotlist_overrides(dict(base_config), overrides)
 
 
 def ablation_config_hash(config: dict) -> str:

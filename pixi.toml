@@ -116,6 +116,13 @@ eval-val = "python scripts/evaluate.py --config configs/experiments/slmf_full.ya
 # sample-one removed: evaluate.py has no --sample-id/--output-dir arguments (audit red-team finding); re-add once per-sample CLI is implemented
 
 # ===========================================================================
+# RC-BRD 证据链（band_snr 时钟）
+# ===========================================================================
+
+# 每折 outer-train 自动计算并封存 P_g（组内 Haar 残差系数每系数平均功率）
+rc-brd-band-powers = "python scripts/compute_band_powers.py --config configs/experiments/rc_brd_prod_rc_band_snr.yaml --fold fold_0"
+
+# ===========================================================================
 # 测试
 # ===========================================================================
 

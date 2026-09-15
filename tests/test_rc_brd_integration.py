@@ -716,12 +716,17 @@ class TestPerBandMinSnr:
         timesteps = torch.tensor([10, 55])
         loss, logs = model(batch, timesteps)
         assert torch.isfinite(loss).all()
-        # Manual weights: no contract -> group == band; SNR = ah/(1-ah) with
-        # the bridge proxy ah = 1 - m = 1 - t/T (DESIGN §4 alpha_hat).
+        # Manual weights: no contract -> group == band; SNR_g(t)=exp(lambda)
+        # read on the schedule's single-source query axis
+        # clock_query_log_snr (DESIGN_RC_BRD_clock_v2 §2.1/§5.5).  base_snr
+        # mode without a contract keeps the shared axis
+        # lambda0(u)=clip(log((1-u)/(2*sigma^2*u)), -10, 10), sigma_bridge=1.0
+        # (the retired ah/(1-ah) proxy from schedule.alpha_hat carried no P_g
+        # and no nu^2 scaling).
         for band in BAND_NAMES:
-            alpha = model.rc_brd_schedule.alpha_hat(band, timesteps)
-            manual = torch.minimum(alpha / (1.0 - alpha).clamp_min(1e-8),
-                                   torch.tensor(3.0, dtype=alpha.dtype))
+            log_snr = model.rc_brd_schedule.clock_query_log_snr(band, timesteps)
+            manual = torch.minimum(log_snr.exp(),
+                                   torch.tensor(3.0, dtype=log_snr.dtype))
             logged = logs[f"loss/rc_brd_band_weight_{band}"]
             torch.testing.assert_close(logged, manual.mean().to(logged.dtype),
                                        rtol=1e-5, atol=1e-6)
@@ -1111,3 +1116,41 @@ class TestBandClockV2:
         m1 = _build(cfg1).rc_brd_schedule.m_sequence("mid")
         m2 = _build(cfg2).rc_brd_schedule.m_sequence("mid")
         torch.testing.assert_close(m1, m2, rtol=0, atol=0)
+
+    def test_band_snr_loss_weights_read_clock_query_axis(self, artifact_dir):
+        # A8 per-band Min-SNR-gamma weighting reads the SAME single-source
+        # query axis as the clock: w_b(t)=min{exp(lambda_g(t)), gamma} with
+        # lambda_g=schedule.clock_query_log_snr(group, t) — the real band
+        # bridge SNR with the frozen per-group power P_g baked into the v2
+        # contract (DESIGN_RC_BRD_clock_v2 §2.1/§5.5), not the retired
+        # alpha_hat proxy.
+        cfg = _model_with_contract_cfg(
+            artifact_dir, kappa=0.25, clock_mode="band_snr",
+            contract_band_powers={"low": 0.2, "mid": 1.0, "high": 5.0},
+            loss_weighting="per_band_min_snr", min_snr_gamma=3.0)
+        model = _build(cfg)
+        # Timesteps spanning high-SNR (small u) and low-SNR (large u) regions
+        # so the gamma clamp engages on some but not all of them.
+        timesteps = torch.tensor([1, 10, 50])
+        loss, logs = model(_batch(batch_size=len(timesteps)), timesteps)
+        assert torch.isfinite(loss).all()
+        gamma = torch.tensor(3.0, dtype=torch.float64)
+        for group in ("low", "mid", "high"):
+            lam = model.rc_brd_schedule.clock_query_log_snr(group, timesteps)
+            expected = torch.minimum(lam.exp(), gamma)
+            for band in model.rc_brd_contract.band_groups[group]:
+                logged = logs[f"loss/rc_brd_band_weight_{band}"]
+                torch.testing.assert_close(logged.mean(),
+                                           expected.mean().to(logged.dtype),
+                                           rtol=1e-5, atol=1e-6)
+        # P_g separation: the P_g=5 "high" group and the P_g=0.2 "low" group
+        # carry visibly different weights on at least some t (the frozen
+        # powers warp the band axes in opposite directions before the shared
+        # gamma clamp flattens both ends).
+        w_high = torch.minimum(
+            model.rc_brd_schedule.clock_query_log_snr("high", timesteps).exp(),
+            gamma)
+        w_low = torch.minimum(
+            model.rc_brd_schedule.clock_query_log_snr("low", timesteps).exp(),
+            gamma)
+        assert not torch.allclose(w_high, w_low)

@@ -265,6 +265,7 @@ def _freeze(scratch: _Scratch, probe_out: Path, **kw: Any) -> tuple[int, Path]:
         args += ["--mean-sha", kw.get("mean_sha", MEAN_SHA)]
     if "sigma_floor" in kw:
         args += ["--sigma-floor", str(kw["sigma_floor"])]
+    args += [str(x) for x in kw.get("extra", [])]  # raw CLI passthrough
     rc = FREEZE.main(args)
     return rc, out
 
@@ -446,3 +447,93 @@ def test_freeze_cli_band_powers_propagated(scratch):
     contract = RecoverabilityContract.load(out)
     assert contract.band_powers == {"low": 0.2, "mid": 1.0, "high": 5.0}
     assert contract.band_powers_split == "outer_train_fold_2"
+
+
+# ---------------------------------------------------------------------------
+# schema v2: --band-powers-file (sealed compute_band_powers.py artifact)
+# ---------------------------------------------------------------------------
+
+def _powers_file(base: Path, powers: dict[str, float], *, label: str = "val_fold_0",
+                 label_key: str = "split_label") -> Path:
+    """A sealed band-powers artifact in the compute_band_powers.py schema.
+
+    The label is deliberately NOT the freeze default (outer_train_fold_0)
+    so the artifact is observably the source of band_powers_split.
+    """
+    payload: dict[str, Any] = {
+        "schema_version": 1, "stage": "rc_brd_band_powers", "fold": "fold_0",
+        "split": "val", "n_samples": 48, "n_patients": 12,
+        "band_powers": dict(powers), label_key: label,
+    }
+    path = base / f"band_powers_{label_key}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+@pytest.mark.parametrize("label_key", ["split_label", "band_powers_split"])
+def test_freeze_band_powers_file_seals_values_and_split(scratch, t_dir, label_key):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    powers_file = _powers_file(t_dir, {"low": 0.2, "mid": 1.0, "high": 5.0},
+                               label="val_fold_0", label_key=label_key)
+    rc, out = _freeze(scratch, probe_out,
+                      extra=["--band-powers-file", str(powers_file)])
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    assert contract.band_powers == {"low": 0.2, "mid": 1.0, "high": 5.0}
+    assert contract.band_powers_split == "val_fold_0"
+
+
+def test_freeze_explicit_band_powers_beat_file_but_keep_its_label(scratch, t_dir):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    powers_file = _powers_file(t_dir, {"low": 9.9, "mid": 8.8, "high": 7.7},
+                               label="val_fold_0")
+    rc, out = _freeze(scratch, probe_out, extra=[
+        "--band-powers-file", str(powers_file),
+        "--band-powers", "low=0.2", "--band-powers", "mid=1.0",
+        "--band-powers", "high=5.0"])
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    assert contract.band_powers == {"low": 0.2, "mid": 1.0, "high": 5.0}  # CLI wins
+    assert contract.band_powers_split == "val_fold_0"  # file label as default
+
+
+def test_freeze_explicit_band_power_split_overrides_file_label(scratch, t_dir):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    powers_file = _powers_file(t_dir, {"low": 0.2, "mid": 1.0, "high": 5.0},
+                               label="val_fold_0")
+    rc, out = _freeze(scratch, probe_out, extra=[
+        "--band-powers-file", str(powers_file),
+        "--band-power-split", "outer_train_fold_2"])
+    assert rc == 0
+    contract = RecoverabilityContract.load(out)
+    assert contract.band_powers == {"low": 0.2, "mid": 1.0, "high": 5.0}
+    assert contract.band_powers_split == "outer_train_fold_2"
+
+
+def _bad_powers_file(base: Path, kind: str) -> Path:
+    """A malformed or absent band-powers artifact (fail-closed cases)."""
+    if kind == "missing_path":
+        return base / "no_such_band_powers.json"  # never written
+    contents = {
+        "not_an_object": "[1, 2, 3]",
+        "missing_band_powers": json.dumps({"split_label": "val_fold_0"}),
+        "empty_band_powers": json.dumps({"band_powers": {}}),
+        "non_numeric_value": json.dumps({"band_powers": {"low": "fast"}}),
+        "not_json": "{not json",
+    }
+    path = base / f"bad_powers_{kind}.json"
+    path.write_text(contents[kind], encoding="utf-8")
+    return path
+
+@pytest.mark.parametrize("kind", ["not_an_object", "missing_band_powers", "empty_band_powers",
+                    "non_numeric_value", "not_json", "missing_path"])
+def test_freeze_band_powers_file_malformed_or_absent_exits_1(scratch, t_dir, kind):
+    rc, probe_out, _ = scratch.run_probe(probe_config())
+    assert rc == 0
+    bad = _bad_powers_file(t_dir, kind)
+    rc, out = _freeze(scratch, probe_out,
+                      extra=["--band-powers-file", str(bad)])
+    assert rc == 1
+    assert not out.exists()  # a rejected artifact never writes a contract

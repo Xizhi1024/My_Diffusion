@@ -118,7 +118,10 @@ modules:
   residual_bridge:
     enabled: true
     output_scale: 1.0
-    clip_output: false
+    # Audit B5/P1-11: PET is normalized to [-1,1]; the composed mean+
+    # residual output must be clamped so PSNR data_range=2 / SSIM range
+    # assumptions hold (v5 sets the same; RC configs aligned 2026-09).
+    clip_output: true
 
   residual_frequency:
     enabled: false                  # 旧 router 与 RC-BRD 互斥（[计划] §4）

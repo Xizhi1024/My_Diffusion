@@ -45,7 +45,9 @@ training:
   weight_decay: 0.0
   lr_min: 1.0e-6
   ema:
-    decay: 0.999
+    # Audit P1-3 alignment: 0.995 x 1 like every other config (a 1-epoch
+    # smoke run with 0.999 would carry mostly initial weights in EMA).
+    decay: 0.995
     update_every: 1
 
 model:

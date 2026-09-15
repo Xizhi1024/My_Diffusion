@@ -1329,6 +1329,10 @@ class TestModelIntegration:
 
 class TestTrainer:
     def test_trainer_one_step(self):
+        import shutil
+        import uuid
+        from pathlib import Path
+
         from src.data.dataset import FakeDataset
         from src.model.slmf_bbdm import SLMFBBDM
         from src.model.trainer import Trainer
@@ -1336,12 +1340,23 @@ class TestTrainer:
 
         cfg = _toy_config()
         cfg["training"]["num_epochs"] = 1
-        model = SLMFBBDM.from_config(cfg)
-        ds = FakeDataset(8, image_size=32)
-        dl = DataLoader(ds, batch_size=2, drop_last=True)
-        trainer = Trainer(model, cfg, dl, dl)
-        trainer.run(num_epochs=1)
-        assert trainer.epoch_count == 1
+        # Isolate the metrics JSONL: the default path is repo-anchored
+        # (checkpoints/smoke_test/), so a stale file left by any earlier
+        # run trips the exact-prefix guard and permanently reds this test
+        # (found while re-verifying the suite after the audit fixes).
+        scratch = (Path(__file__).resolve().parent.parent / ".t_dir"
+                   / "smoke_trainer" / uuid.uuid4().hex[:12])
+        scratch.mkdir(parents=True, exist_ok=True)
+        cfg["runtime"]["metrics_jsonl"] = str(scratch / "training_metrics.jsonl")
+        try:
+            model = SLMFBBDM.from_config(cfg)
+            ds = FakeDataset(8, image_size=32)
+            dl = DataLoader(ds, batch_size=2, drop_last=True)
+            trainer = Trainer(model, cfg, dl, dl)
+            trainer.run(num_epochs=1)
+            assert trainer.epoch_count == 1
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def test_trainer_flushes_partial_gradient_accumulation(self):
         from src.data.dataset import FakeDataset
@@ -1788,6 +1803,7 @@ class TestMCSampling:
         result = slmf.sample_mc(batch, n_samples=3, num_steps=3)
         assert "synthetic_pet" in result
         assert "epistemic_var" in result
+        assert "total_var" in result
         assert "samples" in result
         assert result["synthetic_pet"].shape == (1, 1, 32, 32)
         assert result["epistemic_var"].shape == (1, 1, 32, 32)
@@ -1798,7 +1814,17 @@ class TestMCSampling:
         assert (result["confidence_map"] >= 0).all() and (result["confidence_map"] <= 1).all()
 
     def test_sample_mc_no_heteroscedastic(self):
-        """sample_mc without heteroscedastic head."""
+        """sample_mc without heteroscedastic head keeps the uncertainty names.
+
+        Naming contract (uncertainty naming fix): total_var and
+        confidence_map are ALWAYS emitted; with the heteroscedastic head
+        disabled they fall back to the epistemic-only form
+        (total_var == epistemic_var), so evaluate.py's Uncertainty metric
+        names (uncertainty_ratio / confidence_lesion_mean) cannot silently
+        vanish for arms that set model.enable_heteroscedastic=false (every
+        RC-BRD prod config).  Only the aleatoric_* keys stay conditional on
+        the head.
+        """
         slmf = SLMFBBDM(
             image_size=32,
             objective="pred_x0",
@@ -1815,7 +1841,14 @@ class TestMCSampling:
         result = slmf.sample_mc(batch, n_samples=2, num_steps=3)
         assert "synthetic_pet" in result
         assert "epistemic_var" in result
-        assert "confidence_map" not in result  # no aleatoric component
+        # Epistemic-only fallback: no aleatoric component anywhere.
+        assert "aleatoric_var" not in result
+        assert "aleatoric_logvar" not in result
+        assert "total_var" in result
+        torch.testing.assert_close(result["total_var"], result["epistemic_var"])
+        assert "confidence_map" in result
+        assert result["confidence_map"].shape == (1, 1, 32, 32)
+        assert (result["confidence_map"] >= 0).all() and (result["confidence_map"] <= 1).all()
 
     def test_sample_mc_supports_median_point_estimator(self, monkeypatch):
         slmf = SLMFBBDM(image_size=32, enable_heteroscedastic=False)

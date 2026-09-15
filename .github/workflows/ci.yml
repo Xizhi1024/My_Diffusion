@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: pytest (pixi, linux-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@v5
+        with:
+          cache: true
+
+      # Independent verification of the test suite: the "N/N passed"
+      # claims in commit messages are not evidence on their own — the
+      # check status on the commit is.
+      - name: Run full test suite
+        run: pixi run test
+
+      - name: Compile all touched entry points
+        run: pixi exec python -m py_compile scripts/compute_band_powers.py scripts/freeze_recoverability_contract.py src/model/slmf_bbdm.py src/model/rc_brd/ablations.py

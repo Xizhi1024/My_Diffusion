@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.model.rc_brd.ablations import (
     A3_VARIANTS,
     ABLATION_ARMS,
+    CLOCK_SPECIALIST_ARMS,
     ablation_config_hash,
     apply_contract_transform,
     build_ablation_config,
@@ -119,6 +120,33 @@ EXPECTED_ARM_OVERRIDES = {
     "A9": {
         "modules.rc_brd.enabled": True,
         "modules.rc_brd.endpoint_mode": "ct_minus_mean",
+    },
+}
+
+
+# Expected dotlist overrides per clock × specialist factorial cell on
+# make_base_config() (base κ=0.25, specialist.enabled=True).  The clock_on
+# cells re-pin kappa to the BASE value (0.25 here), so kappa never shows up
+# in the observed diff of those two arms — the κ-kept assertion lives in
+# the test body instead.
+EXPECTED_FOUR_ARM_OVERRIDES = {
+    "clock_off_specialist_off": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.kappa": 0.0,
+        "modules.rc_brd.specialist.enabled": False,
+    },
+    "clock_off_specialist_on": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.kappa": 0.0,
+        "modules.rc_brd.specialist.enabled": True,
+    },
+    "clock_on_specialist_off": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.specialist.enabled": False,
+    },
+    "clock_on_specialist_on": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.specialist.enabled": True,
     },
 }
 
@@ -286,6 +314,98 @@ def test_non_a3_arm_rejects_foreign_a3_variant(base_config, arm):
 def test_unknown_arm_raises(base_config, arm):
     with pytest.raises(ValueError):
         build_ablation_config(base_config, arm)
+
+
+# ---------------------------------------------------------------------------
+# clock × specialist 2x2 factorial arms (CLOCK_SPECIALIST_ARMS)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("arm", list(CLOCK_SPECIALIST_ARMS))
+def test_four_arm_generates_and_diff_is_exactly_expected_keys(base_config, arm):
+    """Each factorial cell builds and differs from base by exactly its keys."""
+    expected = EXPECTED_FOUR_ARM_OVERRIDES[arm]
+    cfg = build_ablation_config(base_config, arm)
+    # 1) every expected key carries the expected value (override applied)
+    for dotted, value in expected.items():
+        assert get_dotted(cfg, dotted) == value, dotted
+    # clock_on keeps the base κ verbatim (a zero base κ raises elsewhere)
+    if arm.startswith("clock_on"):
+        assert cfg["modules"]["rc_brd"]["kappa"] == 0.25
+    touched = diff_keys(base_config, cfg)
+    # 2) subset direction: nothing outside the expected key set changed
+    assert touched <= set(expected), (arm, touched - set(expected))
+    # 3) superset direction: every expected key whose value really differs
+    #    from base appears in the observed diff
+    changed = {
+        k for k, v in expected.items() if get_dotted(cfg, k) != get_dotted(base_config, k)
+    }
+    assert changed <= touched, (arm, changed - touched)
+    assert touched == changed
+
+
+@pytest.mark.parametrize("arm", ["clock_on_specialist_off", "clock_on_specialist_on"])
+def test_four_arm_clock_on_requires_nonzero_base_kappa(arm):
+    """A κ=0 base would make clock_on ≡ clock_off; fail-closed ValueError."""
+    base = make_base_config()
+    base["modules"]["rc_brd"]["kappa"] = 0.0
+    with pytest.raises(ValueError, match="kappa"):
+        build_ablation_config(base, arm)
+    # the clock_off cells are exactly the κ=0 semantics, so they stay buildable
+    for off_arm in ("clock_off_specialist_off", "clock_off_specialist_on"):
+        cfg = build_ablation_config(base, off_arm)
+        assert cfg["modules"]["rc_brd"]["kappa"] == 0.0
+
+
+def test_four_arm_hashes_distinct(base_config):
+    hashes = {arm: ablation_config_hash(build_ablation_config(base_config, arm))
+              for arm in CLOCK_SPECIALIST_ARMS}
+    assert len(set(hashes.values())) == len(CLOCK_SPECIALIST_ARMS)
+    # every cell also differs from the untouched base config
+    assert ablation_config_hash(base_config) not in set(hashes.values())
+
+
+def test_four_arm_documented_equivalence_with_a1_a2(base_config):
+    """A1 ≡ clock_off_specialist_on and A2 ≡ clock_on_specialist_off.
+
+    Documented equivalence of the pre-registered arms with their factorial
+    twins: identical override point sets, identical configs, identical
+    hashes — the factorial only ADDS the two unmeasured cells.
+    """
+    a1 = build_ablation_config(base_config, "A1")
+    twin = build_ablation_config(base_config, "clock_off_specialist_on")
+    assert diff_keys(base_config, a1) == diff_keys(base_config, twin)
+    assert a1 == twin
+    assert ablation_config_hash(a1) == ablation_config_hash(twin)
+    a2 = build_ablation_config(base_config, "A2")
+    twin2 = build_ablation_config(base_config, "clock_on_specialist_off")
+    assert diff_keys(base_config, a2) == diff_keys(base_config, twin2)
+    assert a2 == twin2
+    assert ablation_config_hash(a2) == ablation_config_hash(twin2)
+
+
+@pytest.mark.parametrize("arm", list(CLOCK_SPECIALIST_ARMS))
+def test_four_arm_rejects_foreign_a3_variant(base_config, arm):
+    with pytest.raises(ValueError):
+        build_ablation_config(base_config, arm, a3_variant="budget_matched")
+    # the C8 default is a tolerated no-op for non-A3 arms (PRD §3)
+    assert build_ablation_config(base_config, arm) == build_ablation_config(
+        base_config, arm, a3_variant="density_matched")
+
+@pytest.mark.parametrize("arm", ["clock_off_specialist", "clock_on", "clockoff_specialist_on",
+                 "clock_on_specialist_maybe", "specialist_on"])
+def test_four_arm_near_miss_names_raise(base_config, arm):
+    with pytest.raises(ValueError):
+        build_ablation_config(base_config, arm)
+
+
+def test_clock_specialist_arms_exported_from_package_top_level():
+    """CLOCK_SPECIALIST_ARMS is importable from src.model.rc_brd itself."""
+    import src.model.rc_brd as rc_brd_package
+    from src.model.rc_brd.ablations import CLOCK_SPECIALIST_ARMS as from_module
+    assert rc_brd_package.CLOCK_SPECIALIST_ARMS is from_module
+    assert "CLOCK_SPECIALIST_ARMS" in rc_brd_package.__all__
+    assert from_module == ("clock_off_specialist_off", "clock_off_specialist_on",
+                           "clock_on_specialist_off", "clock_on_specialist_on")
 
 
 # ---------------------------------------------------------------------------

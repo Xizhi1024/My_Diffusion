@@ -202,6 +202,34 @@ def _parse_powers(items: list[str]) -> dict[str, float]:
     return out
 
 
+def _load_band_powers_file(path: Path) -> tuple[dict[str, float], str | None]:
+    """Read a sealed band-powers artifact (compute_band_powers.py output).
+
+    Accepts the schema written by scripts/compute_band_powers.py: a JSON
+    object with a non-empty 'band_powers' {group: P_g > 0} mapping and
+    optional provenance labels ('split_label' preferred,
+    'band_powers_split' accepted for hand-written artifacts).  Any other
+    shape raises ValueError — freeze never guesses (fail-closed).
+    Returns (powers, split_label_or_None).
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"band powers file {path} is not a JSON object")
+    powers = payload.get("band_powers")
+    if not isinstance(powers, Mapping) or not powers:
+        raise ValueError(
+            f"band powers file {path} has no non-empty 'band_powers' mapping")
+    out: dict[str, float] = {}
+    for group, value in powers.items():
+        try:
+            out[str(group)] = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"band powers file {path}: group {group!r} "
+                             f"value {value!r} is not numeric") from exc
+    split = payload.get("split_label") or payload.get("band_powers_split")
+    return out, (str(split) if split else None)
+
+
 def _parse_thresholds(items: list[str]) -> dict[str, float]:
     out: dict[str, float] = {}
     for item in items:
@@ -233,9 +261,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--band-powers", action="append", default=[],
                         help="group=mean-per-coefficient Haar residual power "
                              "(repeatable; absent -> explicit all-1.0 control A)")
+    parser.add_argument("--band-powers-file", default=None,
+                        help="sealed band-powers artifact from scripts/"
+                             "compute_band_powers.py (per-fold outer-train "
+                             "P_g); used when no explicit --band-powers "
+                             "pair is given")
     parser.add_argument("--band-power-split", default=None,
                         help="provenance label of the P_g estimation split "
-                             "(default outer_train_<fold>)")
+                             "(default outer_train_<fold>, or the artifact's "
+                             "split_label when --band-powers-file is used)")
     args = parser.parse_args(argv)
     try:
         kappa = _parse_kappa(args.kappa_grid)
@@ -249,6 +283,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"freeze failed: --kappa-grid must contain 0.0, got {list(kappa)}",
               file=sys.stderr)
         return 1
+    # P_g precedence (fail-closed, never silent): explicit --band-powers
+    # pairs > sealed --band-powers-file artifact > probe artifact domain >
+    # explicit all-1.0 power-blind control A.
+    file_powers: dict[str, float] | None = None
+    file_split: str | None = None
+    if args.band_powers_file:
+        try:
+            file_powers, file_split = _load_band_powers_file(
+                Path(args.band_powers_file))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"freeze failed: {exc}", file=sys.stderr)
+            return 1
+    explicit_powers = _parse_powers(args.band_powers)
+    band_powers = explicit_powers if explicit_powers else file_powers
+    band_power_split = args.band_power_split or (file_split if file_powers else None)
     try:
         artifact = freeze_contract(
             Path(args.probe_result), args.fold, Path(args.out), args.s_ref, kappa,
@@ -257,8 +306,8 @@ def main(argv: list[str] | None = None) -> int:
             size_thresholds=_parse_thresholds(args.size_thresholds),
             support_mode=args.support_mode, eta_max=args.eta_max,
             floor_rho=args.floor_rho,
-            band_powers=_parse_powers(args.band_powers),
-            band_power_split=args.band_power_split)
+            band_powers=band_powers,
+            band_power_split=band_power_split)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
             ContractViolationError) as exc:
         print(f"freeze failed: {exc}", file=sys.stderr)

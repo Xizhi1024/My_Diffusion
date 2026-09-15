@@ -37,6 +37,7 @@ from .head import (
 from .ablations import (
     A3_VARIANTS,
     ABLATION_ARMS,
+    CLOCK_SPECIALIST_ARMS,
     CONTRACT_TRANSFORMS,
     ablation_config_hash,
     apply_contract_transform,
@@ -68,6 +69,7 @@ __all__ = [
     "background_delta_energy",
     "A3_VARIANTS",
     "ABLATION_ARMS",
+    "CLOCK_SPECIALIST_ARMS",
     "CONTRACT_TRANSFORMS",
     "ablation_config_hash",
     "apply_contract_transform",
