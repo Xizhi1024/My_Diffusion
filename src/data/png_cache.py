@@ -240,6 +240,18 @@ def build_png_cache(
         out_path = out_dir / f"{sample_id}{_CACHE_EXT}"
         if out_path.exists() and not overwrite:
             skipped["exists"] += 1
+            # Audit P0-5: the split manifest is rewritten in full below and
+            # CachedDataset treats it as authoritative, so skipped-but-existing
+            # samples must still be listed or they silently vanish from
+            # training/eval on an incremental --no-overwrite rerun.
+            manifest_rows.append({
+                "sample_id": sample_id,
+                "patient_id": patient_id,
+                "slice_id": str(slice_id),
+                "split": split,
+                "cache_path": str(out_path),
+            })
+            pet_source_counts[pet_source] += 1
             continue
 
         try:
@@ -318,10 +330,10 @@ def build_png_cache(
     stats = _empty_stats()
     stats.update({
         "total_rows": len(rows),
-        "built": len(manifest_rows),
+        "built": len(manifest_rows) - int(skipped.get("exists", 0)),
+        "manifest_rows": len(manifest_rows),
         "skipped": dict(skipped),
         "pet_source_counts": dict(pet_source_counts),
-        "manifest_rows": len(manifest_rows),
         "cache_dir": str(out_dir),
         "split_manifest": str(split_manifest),
         "errors": errors,

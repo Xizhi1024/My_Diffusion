@@ -597,7 +597,14 @@ class Trainer:
         # eval_num_samples) is fed to model.sample in chunks no larger than
         # eval_sample_batch_size so peak GPU memory stays bounded.  Default
         # caps at the configured validation batch size.
-        val_batch_size = int(config.get("data", {}).get("val_batch_size", 1))
+        # Audit P2-17: keep this default aligned with build_dataloaders
+        # (src/data/dataset.py defaults val_batch_size to 4, then batch_size).
+        val_batch_size = int(
+            config.get("data", {}).get(
+                "val_batch_size",
+                config.get("data", {}).get("batch_size", 4),
+            )
+        )
         default_chunk = max(1, min(val_batch_size, self.eval_num_samples))
         requested_chunk = int(run_cfg.get("eval_sample_batch_size", default_chunk))
         self.eval_sample_batch_size = max(1, min(requested_chunk, self.eval_num_samples))
@@ -774,9 +781,31 @@ class Trainer:
             background_cfg.get("lesion_exclusion_radius", 8)
         )
 
+        # Audit P2-16: any interval of 0 makes the modulo checks below raise
+        # ZeroDivisionError on the first epoch/step. Validate up front.
+        for _iv_name in ("log_interval", "eval_interval", "sample_interval", "save_interval"):
+            _iv = int(getattr(self, _iv_name))
+            if _iv <= 0:
+                raise ValueError(
+                    f"runtime.{_iv_name} must be >= 1, got {_iv}"
+                )
         self.early_stopping_enabled = bool(es_cfg.get("enabled", False))
         self.early_stopping_patience = int(es_cfg.get("patience", 40))
         self.early_stopping_min_epochs = int(es_cfg.get("min_epochs", 0))
+        # Audit P1-1: improvement is only judged on eval epochs, so a patience
+        # smaller than eval_interval degenerates to "stop after the first
+        # non-improving eval" (e.g. eval=50/patience=40 halts a 300-epoch plan
+        # at epoch 100). Refuse that configuration up front.
+        if (
+            self.early_stopping_enabled
+            and self.early_stopping_patience < self.eval_interval
+        ):
+            raise ValueError(
+                f"runtime.early_stopping.patience ({self.early_stopping_patience}) is "
+                f"smaller than runtime.eval_interval ({self.eval_interval}). Improvement "
+                "is only measured on eval epochs, so this stops training after a single "
+                "non-improving eval. Set patience >= eval_interval."
+            )
         self._best_combined_score: float = -1e9
         self._best_lesion_score: float = -1e9
         self._best_image_score: float = -1e9
@@ -1574,6 +1603,22 @@ class Trainer:
         small_under_count = 0
         small_total = 0
         B = synth.shape[0]
+        # SSIM (lazy import to avoid hard dep at module load). Audit P1-2:
+        # import once and surface failures loudly — a swallowed failure makes
+        # val/ssim NaN, fail-closing best_image/best_combined selection and
+        # re-arming early stopping to fire at the next non-improving eval.
+        try:
+            from skimage.metrics import structural_similarity as _ssim
+        except Exception:
+            if not getattr(self, "_ssim_import_warned", False):
+                self._ssim_import_warned = True
+                print(
+                    "  [warn] scikit-image unavailable: val SSIM will be NaN and "
+                    "best_image/best_combined selection stays fail-closed until "
+                    "it recovers"
+                )
+            _ssim = None
+        _ssim_failures = 0
         for i in range(B):
             p = synth[i, 0].float().cpu().numpy()
             t = target[i, 0].float().cpu().numpy()
@@ -1584,12 +1629,11 @@ class Trainer:
             _mse = max(float(np.mean(diff * diff)), 1e-12)
             psnr_vals.append(float(10.0 * np.log10(4.0 / _mse)))
             stripe_vals.append(_stripe_score(p))
-            # SSIM (lazy import to avoid hard dep at module load)
-            try:
-                from skimage.metrics import structural_similarity as _ssim
-                ssim_vals.append(float(_ssim(t, p, data_range=2.0)))
-            except Exception:
-                pass
+            if _ssim is not None:
+                try:
+                    ssim_vals.append(float(_ssim(t, p, data_range=2.0)))
+                except Exception:
+                    _ssim_failures += 1
             mi = (
                 mask[i, 0].float().cpu().numpy()
                 if mask is not None
@@ -1652,6 +1696,12 @@ class Trainer:
                     small_under_count += int(
                         lesion_metrics.get("small_lesion_underestimate", 0.0)
                     )
+
+        if _ssim_failures:
+            print(
+                f"  [warn] SSIM computation failed for {_ssim_failures}/{B} "
+                "validation samples; val/ssim averages only the successful ones"
+            )
 
         def _mean(vals):
             return float(np.mean(vals)) if vals else float("nan")

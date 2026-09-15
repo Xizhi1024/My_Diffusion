@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +29,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+_BadZipFile = zipfile.BadZipFile  # truncated .npz surfaces as this, not OSError/ValueError
+
+# Meta keys that CacheBuilder writes conditionally (only when the DICOM field
+# exists). Filled with NaN at read time so every sample's meta dict has the
+# same key set (see Audit P0-2).
+_CONDITIONAL_SCALE_META_KEYS = (
+    "uptake_min", "weight_kg", "age_years", "thickness_mm", "z_mm",
+)
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 _CACHE_EXT = ".npz"
@@ -466,6 +476,7 @@ class CachedDataset(Dataset):
             manifest = SplitManifest(manifest_path)
             manifest.validate_no_overlap()
 
+        unlabelled: List[str] = []
         for npz_path in sorted(self.cache_dir.glob(f"*{_CACHE_EXT}")):
             sid = _basename(str(npz_path))
             pid, slc = _parse_sample_id(sid)
@@ -487,13 +498,19 @@ class CachedDataset(Dataset):
                     slc = parsed_slice if parsed_slice is not None else 0
             else:
                 meta_path = self.cache_dir / f"{sid}_meta.json"
-                entry_split = split
+                entry_split = None
                 if meta_path.exists():
                     try:
                         meta = json.loads(open(meta_path, encoding="utf-8").read())
                         entry_split = meta.get("split", split)
                     except (json.JSONDecodeError, OSError):
-                        pass
+                        entry_split = None
+                if entry_split is None:
+                    # Audit P0-4: no split_manifest and no readable per-sample
+                    # split note. Defaulting to the requested split would let
+                    # val/test patients leak into training. Skip fail-safe.
+                    unlabelled.append(sid)
+                    continue
 
             if entry_split != self.split:
                 continue
@@ -512,12 +529,22 @@ class CachedDataset(Dataset):
                 split=entry_split, cache_path=npz_path, has_mask=has_mask,
             ))
         if not self.entries:
-            raise ValueError(f"No cached samples for split={split!r} in {cache_dir}")
+            detail = ""
+            if unlabelled:
+                detail = (f" ({len(unlabelled)} sample(s) skipped: no split_manifest and no "
+                          f"readable _meta.json split, e.g. {unlabelled[:3]})")
+            raise ValueError(f"No cached samples for split={split!r} in {cache_dir}{detail}")
+        if unlabelled:
+            print(f"  WARNING: {len(unlabelled)} sample(s) skipped (no split_manifest and no "
+                  f"readable _meta.json split note, e.g. {unlabelled[:3]}); provide "
+                  "data.split_manifest to include them safely.")
         patient_count = len(set(e.patient_id for e in self.entries))
 
         # ---- Key-presence scan (sample every Nth file to avoid I/O storm) ----
         scan_n = max(1, len(self.entries) // 20)
         scan_entries = self.entries[::scan_n]
+        tokens_present = 0
+        corrupt_files: List[str] = []
         for entry in scan_entries:
             try:
                 with np.load(entry.cache_path) as data:
@@ -528,8 +555,21 @@ class CachedDataset(Dataset):
                 for k in self.optional_keys:
                     if k not in keys:
                         self._missing_key_counts[k] += 1
-            except (OSError, ValueError):
-                pass
+                if "semantic_tokens" in keys:
+                    tokens_present += 1
+            except (OSError, ValueError, _BadZipFile) as ex:
+                # Audit P1-14: make unreadable/truncated npz visible instead of
+                # surfacing as a mid-epoch crash in __getitem__.
+                corrupt_files.append(f"{entry.sample_id} ({type(ex).__name__})")
+        if corrupt_files:
+            print(f"  WARNING: {len(corrupt_files)} scanned .npz could not be opened "
+                  f"(e.g. {corrupt_files[:3]}); training will crash on them in __getitem__")
+        # Audit P0-2 (semantic_tokens variant): mixed presence across the cache
+        # makes default_collate either drop the key batch-wide or raise KeyError.
+        if 0 < tokens_present < len(scan_entries):
+            print(f"  WARNING: semantic_tokens present in only {tokens_present}/{len(scan_entries)} "
+                  "scanned .npz — mixed presence breaks DataLoader collation (silently drops the "
+                  "key or raises KeyError). Re-run semantic_builder over the whole cache.")
 
         print(f"[CachedDataset] split={split!r} samples={len(self.entries)} patients={patient_count} "
               f"masked={sum(1 for e in self.entries if e.has_mask)}"
@@ -620,6 +660,13 @@ class CachedDataset(Dataset):
             scale_meta.setdefault("ct_physical_key", "ct_hu" if has_ct_hu else "")
             scale_meta.setdefault("pet_physical_key", "pet_suv" if has_pet_suv else ("pet_activity" if has_pet_activity else ""))
             scale_meta.setdefault("pet_suv_available", bool(has_pet_suv))
+            # Audit P0-2: normalise the conditional DICOM meta keys to a fixed
+            # key set so default_collate never sees heterogeneous dicts (a key
+            # missing from batch[0] silently drops it batch-wide; an extra key
+            # crashes the worker with KeyError). NaN marks "not available" and
+            # is treated as absent by _meta_to_tensor / roi_suv readers.
+            for _meta_key in _CONDITIONAL_SCALE_META_KEYS:
+                scale_meta.setdefault(_meta_key, float("nan"))
 
         if self.augment:
             augment_generator = torch.Generator(device="cpu")

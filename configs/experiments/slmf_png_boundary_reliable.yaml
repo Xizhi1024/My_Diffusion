@@ -50,8 +50,11 @@ training:
   weight_decay: 0.01
   lr_min: 1e-6
   ema:
-    decay: 0.999
-    update_every: 10
+    # Audit P1-3: 0.999 x every-10 = 10k-step time constant; short runs
+    # (100-300 epochs) carried mostly initial weights into EMA-based best
+    # selection. 0.995 x 1 washes out init within ~2k steps (matches v5).
+    decay: 0.995
+    update_every: 1
 
 model:
   objective: pred_x0

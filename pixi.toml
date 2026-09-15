@@ -113,7 +113,7 @@ eval-full = "python scripts/evaluate.py --config configs/experiments/slmf_full.y
 eval-val = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --split val"
 
 # 单样本推理（设置 SAMPLE_ID 环境变量）
-sample-one = "python scripts/evaluate.py --config configs/experiments/slmf_full.yaml --sample-id $SAMPLE_ID --output-dir outputs/samples"
+# sample-one removed: evaluate.py has no --sample-id/--output-dir arguments (audit red-team finding); re-add once per-sample CLI is implemented
 
 # ===========================================================================
 # 测试

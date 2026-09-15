@@ -13,6 +13,7 @@ Disabled modules follow NoOp paths – zero new code branches in training.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,21 +41,42 @@ _META_NORM = {
 def _meta_to_tensor(meta_batch, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Extract metadata from batch and normalise to [-1, 1] tensor [B, D].
 
-    ``meta_batch`` can be: a list of per-sample dicts, a dict of lists (default
-    DataLoader collation), or a single dict (broadcast to all B).
-    Missing keys are filled with 0.0 (centre of normalised range).
+    `meta_batch` can be: a list of per-sample dicts, a dict of lists or a
+    dict of tensors (both default DataLoader collation forms for numeric
+    scalars), or a single dict (broadcast to all B).
+    Missing / non-finite keys are filled with 0.0 (centre of normalised range).
     """
     # Normalise to per-sample list of dicts
     if isinstance(meta_batch, list):
         meta_list = meta_batch[:B]
     elif isinstance(meta_batch, dict):
-        # Heuristic: if first value has len==B, it's collated → transpose
         first_val = next(iter(meta_batch.values()), None)
-        is_collated = isinstance(first_val, (list, tuple)) and len(first_val) == B
-        if is_collated:
-            meta_list = [{k: meta_batch[k][i] for k in meta_batch} for i in range(B)]
+        if torch.is_tensor(first_val):
+            # Audit P0-1: default_collate stacks numeric scalars into tensors,
+            # not lists. Transpose per key without crashing on float(tensor).
+            if first_val.dim() != 1 or first_val.shape[0] != B:
+                raise ValueError(
+                    "Collated meta tensor has shape "
+                    f"{tuple(first_val.shape)}, expected [{B}]"
+                )
+            meta_list = []
+            for i in range(B):
+                row = {}
+                for k, v in meta_batch.items():
+                    if torch.is_tensor(v):
+                        row[k] = v[i].item() if v.dim() == 1 and v.shape[0] == B else v.item()
+                    elif isinstance(v, (list, tuple)):
+                        row[k] = v[i] if len(v) == B else v
+                    else:
+                        row[k] = v
+                meta_list.append(row)
         else:
-            meta_list = [meta_batch] * B
+            # Heuristic: if first value has len==B, it's collated -> transpose
+            is_collated = isinstance(first_val, (list, tuple)) and len(first_val) == B
+            if is_collated:
+                meta_list = [{k: meta_batch[k][i] for k in meta_batch} for i in range(B)]
+            else:
+                meta_list = [meta_batch] * B
     else:
         meta_list = [{}] * B
 
@@ -65,9 +87,17 @@ def _meta_to_tensor(meta_batch, B: int, device: torch.device, dtype: torch.dtype
             val = m.get(key)
             if val is None:
                 continue  # leave as 0.0
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(val):
+                # NaN sentinel written by CachedDataset for absent DICOM
+                # fields (audit P0-2): treat as missing, not as a value.
+                continue
             lo, hi = _META_NORM[key]
-            # Normalise: (val - lo) / (hi - lo) → [0, 1] → 2*x - 1 → [-1, 1]
-            x = (float(val) - lo) / max(hi - lo, 1e-8)
+            # Normalise: (val - lo) / (hi - lo) -> [0, 1] -> 2*x - 1 -> [-1, 1]
+            x = (val - lo) / max(hi - lo, 1e-8)
             vec[i, j] = 2.0 * x - 1.0
     return vec
 
@@ -86,6 +116,17 @@ def resolve_noise_config(modules_cfg: dict) -> dict:
     for key in noise_keys:
         cfg = modules_cfg.get(key)
         if isinstance(cfg, dict) and "name" in cfg:
+            if cfg.get("enabled", True) is False and key != "scale_adaptive_noise":
+                # Audit P1-10: bridge/DDPM schedules ignore "enabled" entirely,
+                # so modules.bbdm_bridge.enabled=false would silently keep the
+                # bridge running. (scale_adaptive_noise.enabled=false is a real,
+                # supported degrade-to-global-DDPM path and stays allowed.)
+                raise ValueError(
+                    f"modules.{key}.enabled=false has no effect for bridge/DDPM "
+                    "schedules; the bridge would keep running. Remove the module "
+                    "block to use the default bridge, or choose a different "
+                    "schedule."
+                )
             return cfg
     return {"name": "bbdm_bridge"}
 
@@ -448,8 +489,11 @@ class SLMFBBDM(nn.Module):
         residual_wavelet_cfg = configured_losses.get("residual_wavelet", {})
         if residual_wavelet_cfg.get("enabled", False) and not self.residual_bridge_enabled:
             raise ValueError("losses.residual_wavelet requires modules.residual_bridge.enabled=true")
-        gabor_loss_cfg = configured_losses.get("gabor_consistency", {})
-        if gabor_loss_cfg.get("enabled", False) and not self.gabor_routes.get("use_for_loss", False):
+        gabor_loss_cfg = configured_losses.get("gabor_consistency") or {}
+        # Audit P1-8: default must match _build_loss (enabled defaults True),
+        # otherwise omitting the key bypasses this guard while the builder
+        # still enables the loss.
+        if gabor_loss_cfg.get("enabled", True) and not self.gabor_routes.get("use_for_loss", False):
             raise ValueError(
                 "losses.gabor_consistency requires modules.gabor.use_for_loss=true"
             )
@@ -871,6 +915,40 @@ class SLMFBBDM(nn.Module):
                 p.requires_grad = False
             self.segmenter.eval()
 
+        # ---- Audit P1-8: fail fast on "enabled but structurally inert" losses ----
+        # These combinations previously contributed exactly zero with only an
+        # enabled=1 log line, silently changing experiment meaning.
+        _seg_loss_cfg = configured_losses.get("segmenter_consistency")
+        if (
+            _seg_loss_cfg is not None
+            and _seg_loss_cfg.get("enabled", True)
+            and not self.segmenter_enabled
+        ):
+            raise ValueError(
+                "losses.segmenter_consistency is enabled but segmenter is not; the "
+                "loss would be identically zero. Enable model.segmenter or disable the loss."
+            )
+        _nll_loss_cfg = configured_losses.get("heteroscedastic_nll")
+        if (
+            _nll_loss_cfg is not None
+            and _nll_loss_cfg.get("enabled", True)
+            and not self.enable_heteroscedastic
+        ):
+            raise ValueError(
+                "losses.heteroscedastic_nll is enabled but model.enable_heteroscedastic=false; "
+                "pred_logvar is None so the loss would be identically zero."
+            )
+        _gabor_loss_cfg2 = configured_losses.get("gabor_consistency")
+        if (
+            _gabor_loss_cfg2 is not None
+            and _gabor_loss_cfg2.get("enabled", True)
+            and not self.gabor_routes.get("enabled", False)
+        ):
+            raise ValueError(
+                "losses.gabor_consistency is enabled but modules.gabor.enabled=false; the "
+                "Gabor descriptor maps are never produced so the loss would be zero."
+            )
+
         # ---- UNet ----
         # Input is [noisy_x, ct] plus optional previous x0 estimate.
         wavelet_cfg = wavelet_unet_config or {}
@@ -1043,6 +1121,12 @@ class SLMFBBDM(nn.Module):
                 enabled=enabled,
             )
         else:
+            # Audit P1-9: an unknown prior name used to become a silent NoOp.
+            print(
+                f"[SLMF-BBDM] WARNING: unknown prior name {name!r}; creating "
+                "a NoOpPrior (no parameters, no effect). Fix the typo or "
+                "register the prior."
+            )
             return NoOpPrior()
 
     def _build_noise(self, cfg: Dict[str, Any]) -> NoiseSchedule:
@@ -1324,6 +1408,11 @@ class SLMFBBDM(nn.Module):
                 ),
             )
         else:
+            # Audit P1-9: an unknown loss name used to become a silent NoOp.
+            print(
+                f"[SLMF-BBDM] WARNING: unknown loss name {name!r}; creating a "
+                "DisabledLossTerm (always zero). Fix the typo or register the loss."
+            )
             from .loss_terms.base import DisabledLossTerm
             return DisabledLossTerm(name=name, weight=weight)
 
@@ -2686,7 +2775,10 @@ class SLMFBBDM(nn.Module):
                 "raw_pred_residual": final_model_prediction,
             }
         else:
-            synthetic_pet = final_model_prediction
+            # Audit P1-11: keep the reported image inside the [-1, 1] training
+            # range so PSNR(data_range=2)/SSIM and visualisations stay
+            # well-defined (mirrors residual clip_output, audit B5).
+            synthetic_pet = final_model_prediction.clamp(-1.0, 1.0)
             result = {"synthetic_pet": synthetic_pet}
         if self.enable_heteroscedastic and final_output is not None:
             # logvar must come from the same terminal model output as pred_x0.
@@ -2798,6 +2890,7 @@ class SLMFBBDM(nn.Module):
             heteroscedastic_logvar_min=model_cfg.get("heteroscedastic_logvar_min", -6.0),
             heteroscedastic_logvar_max=model_cfg.get("heteroscedastic_logvar_max", 2.0),
             prior_configs=prior_cfgs,
+            ct_encoder_config=modules_cfg.get("ct_encoder", None),
             adapter_config=modules_cfg.get("zero_adapter", {}),
             noise_config=resolve_noise_config(modules_cfg),
             loss_configs=loss_cfg,

@@ -31,10 +31,25 @@ class EMA:
         self.step_count += 1
         if self.step_count % self.update_every != 0:
             return
+        untracked_trainable = []
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in self.shadow:
                     self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+                elif param.requires_grad:
+                    # Audit P1-4: a parameter that became trainable AFTER this
+                    # EMA was constructed (e.g. resume with a different freeze
+                    # set) is silently never averaged and never swapped in by
+                    # apply(). Surface it once instead of running a partial EMA.
+                    untracked_trainable.append(name)
+        if untracked_trainable and not getattr(self, "_untracked_warned", False):
+            self._untracked_warned = True
+            print(
+                f"[EMA] WARNING: {len(untracked_trainable)} trainable parameter(s) "
+                f"are not tracked by the EMA shadow (e.g. {untracked_trainable[:3]}). "
+                "They were probably unfrozen after EMA construction (resume with a "
+                "changed freeze set); eval/apply() will mix raw weights for them."
+            )
 
     def apply(self):
         """Save current training weights and copy EMA weights into model."""
@@ -60,7 +75,20 @@ class EMA:
         }
 
     def load_state_dict(self, state: dict):
-        self.shadow = state["shadow"]
+        shadow = state["shadow"]
+        # Audit P1-4: refuse mismatched key sets instead of silently becoming
+        # a no-op (update/apply both skip names missing from the shadow).
+        model_keys = {name for name, _ in self.model.named_parameters()}
+        stale = [k for k in shadow if k not in model_keys]
+        if stale:
+            raise RuntimeError(
+                f"EMA shadow contains {len(stale)} parameter name(s) absent from "
+                f"the model (first: {stale[:3]}). This typically means the "
+                "checkpoint was saved under a different module wrapping (e.g. "
+                "torch.compile '_orig_mod.' prefix) or architecture. Refusing "
+                "to silently disable EMA tracking."
+            )
+        self.shadow = shadow
         self.step_count = state["step_count"]
         # Audit T1 (reviewer F1): decay/update_every are run configuration,
         # not restorable state. Letting a checkpoint's decay overwrite the

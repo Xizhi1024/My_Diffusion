@@ -705,6 +705,15 @@ def _select_checkpoint_state(
     """Select raw weights or overlay an old-style EMA shadow on model state."""
     raw_state = checkpoint.get("model", checkpoint)
     if weights == "raw":
+        if checkpoint.get("checkpoint_weights") == "ema_materialized_as_model":
+            # Audit P2-2: best-* checkpoints store EMA weights materialised as
+            # the model state; "raw" is not recoverable from them.
+            raise ValueError(
+                "This checkpoint stores EMA-materialised weights "
+                "(checkpoint_weights == 'ema_materialized_as_model'); "
+                "--weights raw would silently return the EMA weights. Use "
+                "--weights ema, or an epoch-numbered checkpoint for raw weights."
+            )
         return raw_state, "model"
     if weights != "ema":
         raise ValueError(f"Unknown checkpoint weights: {weights!r}")
@@ -732,6 +741,22 @@ def _select_checkpoint_state(
     raise KeyError(
         "EMA weights requested, but checkpoint has no ema.shadow, ema_model, or model_ema"
     )
+
+
+def _config_difference_keys(current: dict, saved: dict, prefix: str = "") -> list:
+    """Dotted key paths where two config dicts differ (audit P1-18)."""
+    diffs: list = []
+    for key in sorted(set(current) | set(saved)):
+        path = f"{prefix}.{key}" if prefix else str(key)
+        a = current.get(key)
+        b = saved.get(key)
+        if isinstance(a, dict) and isinstance(b, dict):
+            diffs.extend(_config_difference_keys(a, b, path))
+        elif isinstance(a, dict) or isinstance(b, dict):
+            diffs.append(path)
+        elif a != b:
+            diffs.append(path)
+    return diffs
 
 
 def _seed_evaluation(seed: int) -> None:
@@ -863,7 +888,6 @@ def evaluate(
     dataloader: torch.utils.data.DataLoader,
     device: str = "cuda",
     amp: bool = True,
-    save_samples: Optional[Path] = None,
     mc_samples: Optional[int] = 1,
     mc_steps: Optional[int] = None,
     mc_aggregate: str = "mean",
@@ -1017,7 +1041,7 @@ def evaluate(
 
             all_metrics.append(sample_metrics)
             for k, v in sample_metrics.items():
-                if isinstance(v, (int, float)) and not np.isnan(v):
+                if isinstance(v, (int, float)) and np.isfinite(v):
                     results[k].append(v)
             patient_results[str(pid)].append(sample_metrics)
 
@@ -1053,7 +1077,7 @@ def evaluate(
     }
 
     for metric_name, values in results.items():
-        vals = np.array([v for v in values if not np.isnan(v)])
+        vals = np.array([v for v in values if np.isfinite(v)])
         if len(vals) == 0:
             continue
         summary[f"{metric_name}_mean"] = float(vals.mean())
@@ -1066,7 +1090,13 @@ def evaluate(
     patient_summary = {}
     for pid, p_metrics in patient_results.items():
         p_agg = {}
-        for k in p_metrics[0]:
+        # Audit P1-20: iterate the UNION of keys across the patient's rows;
+        # keying on the first row silently dropped lesion_* metrics whenever
+        # the first slice had no lesion mask.
+        keys: set = set()
+        for m in p_metrics:
+            keys.update(m.keys())
+        for k in sorted(keys):
             vals = [m[k] for m in p_metrics if isinstance(m.get(k), (int, float)) and not np.isnan(m.get(k, float("nan")))]
             if vals:
                 p_agg[f"{k}_mean"] = float(np.mean(vals))
@@ -1202,6 +1232,12 @@ def main():
         action="store_true",
         help="If the requested split is absent, evaluate on train instead of failing.",
     )
+    ap.add_argument(
+        "--allow-random-weights",
+        action="store_true",
+        help="Permit evaluation without --checkpoint (audit P0-3: the default is now "
+        "to fail closed instead of producing a report from random weights).",
+    )
     args = ap.parse_args()
 
     # Load config
@@ -1267,6 +1303,12 @@ def main():
         mc_samples = None
         print("RC-BRD readout: mc_mean with model-pinned K="
               f"{int(getattr(model, 'rc_brd_mc_samples', 8))}")
+    if mc_samples is not None and mc_samples <= 1:
+        print(
+            "NOTE: mc_samples<=1 (single deterministic draw): epistemic "
+            "uncertainty metrics and failure_high_uncertainty are disabled "
+            "(audit P1-19)."
+        )
     expected_data_lineage = load_checkpoint_data_lineage(config)
 
     if args.checkpoint:
@@ -1283,8 +1325,26 @@ def main():
         state, state_source = _select_checkpoint_state(ckpt, weights=args.weights)
         model.load_state_dict(state)
         print(f"Checkpoint weights: {state_source}")
+        ckpt_config = ckpt.get("config") if isinstance(ckpt, dict) else None
+        if isinstance(ckpt_config, dict):
+            differing = _config_difference_keys(config, ckpt_config)
+            if differing:
+                shown = ", ".join(differing[:10])
+                more = " ..." if len(differing) > 10 else ""
+                print(
+                    f"WARNING: current YAML differs from the checkpoint's embedded "
+                    f"config in {len(differing)} key(s): {shown}{more}. Behavioural "
+                    "parameters (module switches, scales, sampling steps, ...) are "
+                    "taken from the CURRENT YAML."
+                )
     else:
-        print("WARNING: No checkpoint provided, using randomly initialised weights")
+        if not args.allow_random_weights:
+            raise SystemExit(
+                "ERROR: no --checkpoint provided; refusing to evaluate randomly "
+                "initialised weights (the report would be meaningless). Pass a "
+                "checkpoint, or --allow-random-weights explicitly for debugging."
+            )
+        print("WARNING: evaluating randomly initialised weights (--allow-random-weights)")
 
     # Build dataloader for the requested split
     from src.data.dataset import CachedDataset, FakeDataset, build_dataloaders
@@ -1299,7 +1359,11 @@ def main():
         cache_dir = data_cfg["cache_dir"]
         try:
             ds = CachedDataset(cache_dir, split=args.split, augment=False, split_manifest=split_manifest)
-        except ValueError:
+        except ValueError as ex:
+            # Audit P2-6: only the documented empty-split error means "split
+            # absent"; anything else is a real construction failure.
+            if "No cached samples for split" not in str(ex):
+                raise
             if not args.allow_train_fallback:
                 raise RuntimeError(
                     f"No {args.split!r} samples found in {cache_dir}. "
