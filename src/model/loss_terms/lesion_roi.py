@@ -65,10 +65,21 @@ class LesionROIL1Loss(LossTerm):
         else:
             diff = (pred - target).abs()
         reduce_dims = tuple(range(1, diff.dim()))
-        roi_sum = roi.sum(dim=reduce_dims).clamp_min(1.0)
-        per_sample = (diff * roi).sum(dim=reduce_dims) / roi_sum
+        roi_mass = roi.sum(dim=reduce_dims)
+        per_sample = (diff * roi).sum(dim=reduce_dims) / roi_mass.clamp_min(1.0)
         gate = smooth_tau_gate(ctx.tau, max_tau=self.active_tau_max).to(device=device)
-        loss = (per_sample * gate).mean()
+        # Empty-ROI samples contribute no supervision; drop them from the
+        # gate mass entirely (same exclusion semantics as topk_lesion and
+        # normalized_lesion_peak) so future negative slices (audit D2)
+        # cannot dilute the term.
+        gate = gate * (roi_mass > 0).to(gate.dtype)
+        # Audit L2: normalize by active gate mass instead of batch size.
+        # Dividing by B rescaled the term by the gate's batch share (sparse
+        # batches under-weighted the lesion term and gradient variance
+        # tracked batch composition). Dividing by max(sum(gate), 1) keeps a
+        # fully gated-out batch at ~0 (the temporal gate stays meaningful)
+        # while active samples keep their full nominal weight.
+        loss = (per_sample * gate).sum() / gate.sum().clamp_min(1.0)
 
         return loss * self.weight, {
             f"{self.name}/loss": loss.detach(),

@@ -102,7 +102,7 @@ def test_empty_masks_are_excluded_without_diluting_valid_sample():
     assert loss.item() == pytest.approx(0.95, abs=1e-4)
 
 
-def test_tau_gate_is_applied_per_sample_before_valid_mean():
+def test_tau_gate_normalizes_by_gate_mass_not_batch_size():
     from src.model.loss_terms.normalized_lesion_peak import (
         NormalizedLesionPeakLoss,
     )
@@ -122,8 +122,36 @@ def test_tau_gate_is_applied_per_sample_before_valid_mean():
 
     loss, logs = term(_context(pred, target, mask, tau=tau))
 
-    assert loss.item() == pytest.approx(0.475, abs=5e-4)
+    # Audit L2: the single gated-in sample keeps its full nominal loss
+    # (0.95 * sigmoid(7.5) ~= 0.9495) instead of being diluted by the
+    # gated-out sample (old behaviour: batch-mean 0.475).
+    assert loss.item() == pytest.approx(0.9495, abs=1e-3)
     assert logs["normalized_lesion_peak/gate_mean"].item() == pytest.approx(0.5, abs=5e-4)
+
+
+def test_fully_gated_out_batch_keeps_temporal_gate_semantics():
+    from src.model.loss_terms.normalized_lesion_peak import (
+        NormalizedLesionPeakLoss,
+    )
+
+    pred = torch.ones(2, 1, 1, 1)
+    target = torch.zeros_like(pred)
+    mask = torch.ones_like(pred)
+    tau = torch.tensor([1.0, 1.0])
+    term = NormalizedLesionPeakLoss(
+        topk_percent=1.0,
+        min_k=1,
+        max_k=1,
+        beta=0.1,
+        active_tau_max=0.25,
+        weight=1.0,
+    )
+
+    loss, _ = term(_context(pred, target, mask, tau=tau))
+
+    # Dividing by max(sum(gate), 1) must not resurrect full supervision when
+    # every tau is above the gate threshold: the batch contributes ~0.
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_peak_loss_uses_pred_x0_and_backpropagates():

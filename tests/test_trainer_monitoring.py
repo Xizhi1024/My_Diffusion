@@ -128,6 +128,88 @@ def test_checkpoint_selection_penalizes_worse_topq_peak_error():
     assert good[2] > bad[2]
 
 
+def test_selection_scores_fail_closed_on_missing_or_nan_lesion_metrics():
+    trainer = object.__new__(Trainer)
+    trainer.best_combined_alpha = 0.5
+    trainer.best_stripe_penalty = 0.3
+    image_only = {
+        "val/mae": 0.05,
+        "val/ssim": 0.95,
+        "val/stripe_score": 1.0,
+    }
+
+    # Audit E1: a lesion-free (or numerically broken) evaluation used to
+    # coerce missing NaN metrics to 0.0, which was the *best* achievable
+    # lesion score. Such scores must now fail closed to -inf.
+    lesion, image, combined = trainer._model_selection_scores(image_only)
+    assert lesion == float("-inf")
+    assert image == pytest.approx(0.9)
+    assert combined == float("-inf")
+
+    nan_lesion = {
+        **image_only,
+        "val/lesion_peak_error_norm": float("nan"),
+        "val/lesion_topq_peak_error_norm": float("nan"),
+        "val/lesion_centroid_distance": float("nan"),
+        "val/failure_rate": float("nan"),
+    }
+    lesion, _, combined = trainer._model_selection_scores(nan_lesion)
+    assert lesion == float("-inf")
+    assert combined == float("-inf")
+
+    nan_topq_only = {
+        **image_only,
+        "val/lesion_peak_error_norm": 0.05,
+        "val/lesion_topq_peak_error_norm": float("nan"),
+        "val/lesion_centroid_distance": 1.0,
+        "val/failure_rate": 0.0,
+    }
+    lesion, _, combined = trainer._model_selection_scores(nan_topq_only)
+    assert lesion == float("-inf")
+    assert combined == float("-inf")
+
+
+def test_ema_load_keeps_configured_decay_and_interval(capsys):
+    from src.model.ema import EMA
+
+    model = torch.nn.Linear(2, 2)
+    ema = EMA(model, decay=0.995, update_every=1)
+    stale = {
+        "shadow": {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        },
+        "step_count": 600,
+        "decay": 0.999,
+    }
+
+    ema.load_state_dict(stale)
+
+    # Reviewer F1: resuming an old run must not silently revert the
+    # configured EMA cadence (audit T1) to the checkpoint's stale decay.
+    assert ema.decay == 0.995
+    assert ema.update_every == 1
+    assert ema.step_count == 600
+    assert "keeping configured value" in capsys.readouterr().out
+
+
+def test_load_checkpoint_rejects_ema_materialized_best_checkpoint(monkeypatch):
+    trainer = object.__new__(Trainer)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: {
+            "checkpoint_weights": "ema_materialized_as_model",
+            "config": {},
+        },
+    )
+
+    # Audit T3: best-* checkpoints carry EMA-materialized weights plus the
+    # raw optimizer state; resuming training from them must fail closed.
+    with pytest.raises(RuntimeError, match="EMA-materialized"):
+        trainer.load_checkpoint("results/run/checkpoints/ckpt_best_lesion.pt")
+
+
 def test_stratified_indices_are_deterministic_unique_and_cover_endpoints():
     indices = _stratified_indices(total=30, count=16)
 
@@ -301,6 +383,7 @@ def test_all_best_checkpoints_capture_one_atomic_monitoring_snapshot(monkeypatch
     trainer.optimizer = HasState()
     trainer.scheduler = HasState()
     trainer.ema = HasState()
+    trainer.scaler = HasState()
     metrics = {
         "val/mae": 0.1,
         "val/ssim": 0.8,

@@ -612,6 +612,17 @@ class Trainer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+        # Audit T2: fp16 AMP requires gradient scaling (bf16/fp32 do not);
+        # the scaler is a transparent passthrough when disabled.
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=(
+                self.amp
+                and self.amp_dtype == torch.float16
+                and device == "cuda"
+            ),
+        )
+
         # Model setup
         if self.channels_last and device == "cuda":
             model = model.to(memory_format=torch.channels_last)
@@ -791,11 +802,16 @@ class Trainer:
 
     def _apply_optimizer_step(self) -> None:
         """Apply one optimiser/EMA update and clear accumulated gradients."""
+        # Audit T2: unscale before clipping so grad_clip_norm sees true
+        # gradient magnitudes under fp16; no-op for bf16/fp32. Gradient
+        # diagnostics are collected after unscaling for the same reason.
+        self.scaler.unscale_(self.optimizer)
         if getattr(self, "gradient_diagnostics", False):
             self._last_gradient_logs = self._collect_spectral_gradient_logs()
         if self.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
         self.ema.update()
         self.accum_count = 0
@@ -943,8 +959,28 @@ class Trainer:
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=self.amp_dtype):
             loss, logs = self.model(batch)
 
+        if not torch.isfinite(loss):
+            # Audit T2: a non-finite loss must never enter the autograd
+            # graph — one numerical accident used to poison every later
+            # gradient (and, via the selection scores, could even save a
+            # NaN "best" checkpoint). Skip the batch; finite gradients
+            # already accumulated in this window are kept.
+            self._nonfinite_streak = getattr(self, "_nonfinite_streak", 0) + 1
+            self._nonfinite_total = getattr(self, "_nonfinite_total", 0) + 1
+            print(
+                f"  [warn] non-finite loss (streak {self._nonfinite_streak}, "
+                f"total {self._nonfinite_total}); skipping batch"
+            )
+            if self._nonfinite_streak >= 100:
+                raise RuntimeError(
+                    "100 consecutive non-finite losses — model state is "
+                    "likely corrupted; aborting instead of skipping forever."
+                )
+            return None
+        self._nonfinite_streak = 0
+
         loss = loss / self.grad_accum
-        loss.backward()
+        self.scaler.scale(loss).backward()
         self.accum_count += 1
 
         if self.accum_count == self.grad_accum:
@@ -1695,11 +1731,14 @@ class Trainer:
         """
         def _g(k):
             v = metrics.get(k, float("nan"))
-            return v if v == v else 0.0  # NaN→0
+            return v if v == v else float("nan")
 
         peak = _g("val/lesion_peak_error_norm")
-        topq = metrics.get("val/lesion_topq_peak_error_norm", peak)
-        topq = topq if topq == topq else peak
+        topq = metrics.get("val/lesion_topq_peak_error_norm")
+        if topq is None:
+            topq = peak
+        # A present-but-NaN topq must fail closed (audit E1), not silently
+        # fall back to peak.
         centroid = _g("val/lesion_centroid_distance")
         fail = _g("val/failure_rate")
         mae = _g("val/mae")
@@ -1708,11 +1747,22 @@ class Trainer:
 
         lesion_score = -(topq + 0.5 * peak + 0.02 * centroid + 0.5 * fail)
         image_score = ssim - mae - 0.1 * max(stripe - 1.0, 0.0)
+        # Audit E1: missing or non-finite inputs fail closed. The old NaN→0
+        # coercion made a lesion-free (or numerically broken) evaluation
+        # score a perfect 0 — the best achievable lesion score — so a
+        # degenerate evaluation could win best-* selection. -inf can never
+        # improve.
+        if not math.isfinite(lesion_score):
+            lesion_score = float("-inf")
+        if not math.isfinite(image_score):
+            image_score = float("-inf")
         combined = (
             self.best_combined_alpha * lesion_score
             + (1.0 - self.best_combined_alpha) * image_score
             - self.best_stripe_penalty * max(stripe - 1.0, 0.0)
         )
+        if not math.isfinite(combined):
+            combined = float("-inf")
         return lesion_score, image_score, combined
 
     def _monitoring_state_dict(self) -> Dict[str, Any]:
@@ -1733,6 +1783,10 @@ class Trainer:
                 if getattr(self, "start_time", None) is not None
                 else 0.0
             ),
+            # Audit T2: persist skip-batch counters so a skip-loop straddling
+            # resumes still trips the 100-consecutive abort.
+            "nonfinite_streak": int(getattr(self, "_nonfinite_streak", 0)),
+            "nonfinite_total": int(getattr(self, "_nonfinite_total", 0)),
         }
 
     def _rng_state_dict(self) -> Dict[str, Any]:
@@ -1942,6 +1996,8 @@ class Trainer:
         self._last_combined_improvement_epoch = (
             int(last_epoch) if last_epoch is not None else None
         )
+        self._nonfinite_streak = int(state.get("nonfinite_streak", 0))
+        self._nonfinite_total = int(state.get("nonfinite_total", 0))
         resumed_elapsed = state.get("resumed_elapsed")
         self._resumed_elapsed = (
             float(resumed_elapsed) if resumed_elapsed is not None else 0.0
@@ -1949,6 +2005,19 @@ class Trainer:
 
     def _save_best_checkpoints(self, metrics: Dict[str, float]) -> bool:
         lesion, image, combined = self._model_selection_scores(metrics)
+        if not (
+            math.isfinite(lesion)
+            and math.isfinite(image)
+            and math.isfinite(combined)
+        ):
+            # Audit E1 (reviewer F3): fail-closed scores must be visible —
+            # they freeze best_* selection and disarm early stopping until
+            # the missing/non-finite validation metrics come back.
+            print(
+                "  [warn] selection scores fail-closed (missing or "
+                "non-finite validation metrics); best_* not updated and "
+                "early stopping stays disarmed until they recover"
+            )
         background_mae = float(
             metrics.get("val/body_nonlesion_lowpass_mae", float("nan"))
         )
@@ -2048,6 +2117,7 @@ class Trainer:
                     "optimizer": self.optimizer.state_dict(),
                     "scheduler": self.scheduler.state_dict(),
                     "ema": self.ema.state_dict(),
+                    "scaler": self.scaler.state_dict(),
                 })
             _atomic_torch_save(
                 attach_data_lineage(
@@ -2098,6 +2168,7 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "ema": self.ema.state_dict(),
+            "scaler": self.scaler.state_dict(),
             "epoch": self.epoch_count,
             "step": self.step_count,
             "config": self.config,
@@ -2156,13 +2227,34 @@ class Trainer:
         plt.close(fig)
         print(f"  Sample grid → {out_path}")
 
-    def load_checkpoint(self, path: str):
+    def load_checkpoint(
+        self,
+        path: str,
+        *,
+        allow_ema_materialized_model: bool = False,
+    ):
         # Load on CPU so CPU RNG tensors are never remapped to CUDA.  Module and
         # optimizer loaders copy/cast their tensors to the live parameter
         # devices below.
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(checkpoint, Mapping):
             raise RuntimeError("Resume checkpoint payload is not a mapping")
+        if (
+            checkpoint.get("checkpoint_weights") == "ema_materialized_as_model"
+            and not allow_ema_materialized_model
+        ):
+            # Audit T3: best-* checkpoints store EMA weights materialized as
+            # the model state together with the *raw* optimizer/scheduler
+            # state. Resuming training from them silently mixes the two
+            # weight populations (EMA-as-raw weights + stale momentum).
+            # Fail closed; inference/evaluation use is unaffected.
+            raise RuntimeError(
+                f"{path} stores EMA-materialized weights (best-checkpoint "
+                "format). Resuming training from it would treat EMA weights "
+                "as raw training weights while restoring optimizer momentum "
+                "computed against the raw weights. Pass "
+                "allow_ema_materialized_model=True to override deliberately."
+            )
         _validate_prior_anchored_resume_identity(
             current_config=self.config,
             checkpoint_config=checkpoint.get("config"),
@@ -2180,6 +2272,10 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scheduler.load_state_dict(checkpoint["scheduler"])
         self.ema.load_state_dict(checkpoint["ema"])
+        # Audit T2 (reviewer F2): restore the fp16 loss scale when present;
+        # older checkpoints without it keep the fresh-scale default.
+        if isinstance(checkpoint.get("scaler"), dict):
+            self.scaler.load_state_dict(checkpoint["scaler"])
         parameter_devices = {
             name: parameter.device
             for name, parameter in self.model.named_parameters()
