@@ -37,6 +37,7 @@ from .head import (
 from .ablations import (
     A3_VARIANTS,
     ABLATION_ARMS,
+    BAND_SNR_LOSS_ARMS,
     CLOCK_SPECIALIST_ARMS,
     CONTRACT_TRANSFORMS,
     ablation_config_hash,
@@ -70,6 +71,7 @@ __all__ = [
     "A3_VARIANTS",
     "ABLATION_ARMS",
     "CLOCK_SPECIALIST_ARMS",
+    "BAND_SNR_LOSS_ARMS",
     "CONTRACT_TRANSFORMS",
     "ablation_config_hash",
     "apply_contract_transform",

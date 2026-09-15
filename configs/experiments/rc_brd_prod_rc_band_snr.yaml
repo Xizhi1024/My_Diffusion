@@ -153,8 +153,11 @@ modules:
     contract_path: artifacts/rc_brd/fold_0/contract_band_snr.json   # v2 合同（含 band_powers）
     sampling_mode: endpoint_ddim
     allow_unverified_tokens: false
-    # A8 逐带 Min-SNR：权重 = min{SNR_g(t), gamma}，SNR_g=exp(lambda_g)
-    # 取自 clock_query_log_snr 单源轴（真实频带 SNR，非 alphahat 代理）。
+    # A8 逐带 Min-SNR：L_t = Σ_b s_b·min{SNR_g(t),γ}·MSE_b / C，C 为全
+    # schedule 固定参考均值（clock math review 修正 #4：不再逐 t 除
+    # Σ_b s_b·w_b —— 那会退化成普通 MSE 并丢失高噪声时间步整体降权）。
+    # SNR_g=exp(lambda_g) 取自 clock_query_log_snr 单源轴（真实频带 SNR，
+    # 非 alphahat 代理）。
     loss_weighting: per_band_min_snr
     min_snr_gamma: 5.0
     specialist:

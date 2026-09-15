@@ -1443,6 +1443,9 @@ class SLMFBBDM(nn.Module):
         self.rc_brd_density_match = False     # A3b logSNR density matching
         self.rc_brd_loss_weighting = "uniform"  # A8 per-band Min-SNR-γ
         self.rc_brd_min_snr_gamma = 5.0
+        # Fixed Min-SNR schedule reference (clock math review correction #4):
+        # per-Haar-layout cache of the schedule-mean Σ_b share_b·min{SNR_b(t), γ}.
+        self._rc_brd_min_snr_ref: Dict[tuple, float] = {}
         self._rc_brd_density_contract: Optional[Any] = None  # pre-transform
         self._rc_brd_density_draws = 0
         if not self.rc_brd_enabled:
@@ -1695,6 +1698,43 @@ class SLMFBBDM(nn.Module):
                                  replacement=True, generator=generator)
         return draw.to(device=device, dtype=torch.long)
 
+    def _rc_brd_min_snr_schedule_ref(self, band_to_group: Dict[str, str],
+                                      shares: Dict[str, float]) -> float:
+        """Fixed Min-SNR reference: schedule-mean of Σ_b s_b·min{SNR_b(t), γ}.
+
+        True Min-SNR-γ weighting (clock math review correction #4) must
+        normalize by a constant FIXED over the whole training schedule —
+        dividing by the per-sample Σ_b s_b·w_b(t) instead would cancel the
+        weights completely whenever band SNRs are equal (degenerating to
+        plain MSE) and would never globally down-weight high-noise
+        timesteps; it would only re-distribute weight between bands inside
+        one timestep ("relative band-SNR reweighting", NOT Min-SNR).
+
+        With the schedule-mean reference the average timestep weight is 1
+        while w(t)/ref drops below 1 in the high-noise (low-SNR) region —
+        the real Min-SNR semantics.  Cached per Haar layout: the Parseval
+        shares s_b are fully determined by the (H, W) band grids.
+        """
+        cache_key = tuple(sorted((b, round(float(s), 12)) for b, s in shares.items()))
+        cached = self._rc_brd_min_snr_ref.get(cache_key)
+        if cached is not None:
+            return cached
+        num_t = int(self.rc_brd_schedule.config.num_timesteps)
+        t_grid = torch.arange(num_t, dtype=torch.int64)
+        gamma = torch.tensor(self.rc_brd_min_snr_gamma, dtype=torch.float64)
+        weight_sum = torch.zeros(num_t, dtype=torch.float64)
+        for band, share in shares.items():
+            log_snr = self.rc_brd_schedule.clock_query_log_snr(
+                band_to_group[band], t_grid).to(dtype=torch.float64)
+            weight_sum = weight_sum + share * torch.minimum(log_snr.exp(), gamma)
+        ref = float(weight_sum.mean())
+        if not math.isfinite(ref) or ref <= 0.0:
+            raise ValueError(
+                f"per_band_min_snr schedule reference is not finite/positive "
+                f"(got {ref}); the clock SNR axis looks degenerate")
+        self._rc_brd_min_snr_ref[cache_key] = ref
+        return ref
+
     def _rc_brd_base_loss(self, pred: torch.Tensor, target: torch.Tensor,
                           timesteps: torch.Tensor,
                           tau: torch.Tensor) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -1710,6 +1750,15 @@ class SLMFBBDM(nn.Module):
         consume, so the loss weighting cannot drift from the clock.  The
         retired ᾱ_b/(1−ᾱ_b) proxy (ᾱ=1−m from schedule.alpha_hat, a
         documented diagnostic) carried no P_g and no ν² scaling.
+        L_t = Σ_b s_b·min{SNR_b(t), γ}·MSE_b(t) / C, with the FIXED schedule
+        reference C = mean_t Σ_b s_b·min{SNR_b(t), γ} (clock math review
+        correction #4).  A per-sample Σ_b s_b·w_b(t) normalization would
+        cancel the weights when band SNRs are equal (plain MSE) and never
+        down-weight high-noise timesteps — this fixed-C form keeps the
+        schedule-average timestep weight at 1 while w(t)/C < 1 in the
+        high-noise region, i.e. the true Min-SNR semantics (it is a real
+        timestep Min-SNR, not only relative band reweighting).
+
         The MSE term is computed per Haar band and size-weighted (orthonormal
         Parseval: Σ_b (n_b/N)·mse_b == image MSE; uniform weights therefore
         reproduce the unweighted MSE exactly).  L1/gradient terms and the
@@ -1725,8 +1774,15 @@ class SLMFBBDM(nn.Module):
         gamma = torch.tensor(self.rc_brd_min_snr_gamma, dtype=torch.float64)
         n_total = float(pred.shape[-1] * pred.shape[-2])
         reduce_dims = tuple(range(1, pred.dim()))
+        shares: Dict[str, float] = {
+            band: float(pred_bands[band][0].numel()) / n_total for band in BAND_NAMES}
+        # Fixed schedule reference C (see docstring): schedule-mean of
+        # Σ_b s_b·min{SNR_b(t), γ}, cached per Haar layout.  The per-sample
+        # weight sum is kept UNNORMALIZED (rel_weight) so the logged
+        # loss/min_snr_weight shows the true relative timestep weight.
+        schedule_ref = self._rc_brd_min_snr_schedule_ref(band_to_group, shares)
         weighted = torch.zeros(pred.shape[0], dtype=torch.float64, device=pred.device)
-        weight_norm = torch.zeros(pred.shape[0], dtype=torch.float64, device=pred.device)
+        rel_weight = torch.zeros(pred.shape[0], dtype=torch.float64, device=pred.device)
         mse_sum = torch.zeros(pred.shape[0], dtype=torch.float64, device=pred.device)
         band_logs: Dict[str, torch.Tensor] = {}
         for band in BAND_NAMES:
@@ -1743,12 +1799,16 @@ class SLMFBBDM(nn.Module):
             w_b = torch.minimum(snr, gamma)              # min{SNR_g(t), γ}
             mse_b = (pred_bands[band].double() - target_bands[band].double()).square()
             mse_b = mse_b.mean(dim=reduce_dims)
-            share = float(pred_bands[band][0].numel()) / n_total  # n_b/N (Parseval)
+            share = shares[band]                          # n_b/N (Parseval)
             weighted = weighted + share * w_b * mse_b
-            weight_norm = weight_norm + share * w_b
+            rel_weight = rel_weight + share * w_b
             mse_sum = mse_sum + share * mse_b
             band_logs[f"loss/rc_brd_band_weight_{band}"] = w_b.mean().to(pred.dtype).detach()
-        mse = (weighted / weight_norm.clamp_min(1e-8)).to(pred.dtype)  # mean-weight 1
+        # True Min-SNR: divide by the FIXED schedule reference, never by the
+        # per-t Σ_b s_b·w_b(t) (that would cancel equal-SNR band weights and
+        # leave high-noise timesteps un-downweighted — relative band-SNR
+        # reweighting, not Min-SNR; clock math review correction #4).
+        mse = (weighted / schedule_ref).to(pred.dtype)
         l1 = (pred - target).abs().mean(dim=reduce_dims)
         grad = _image_gradient_l1_per_sample(pred, target)
         tau_f = tau.float()
@@ -1762,7 +1822,9 @@ class SLMFBBDM(nn.Module):
             "loss/base_mse": mse.mean().detach(),
             "loss/base_l1": l1.mean().detach(),
             "loss/base_gradient": grad.mean().detach(),
-            "loss/min_snr_weight": (weight_norm / 1.0).mean().detach().to(pred.dtype),
+            # Relative timestep weight Σ_b s_b·w_b(t)/C: ≈1 at the schedule
+            # mean, <1 in the high-noise region (the Min-SNR down-weighting).
+            "loss/min_snr_weight": (rel_weight / schedule_ref).mean().detach().to(pred.dtype),
             "loss/tau_mse_weight": w_mse.mean().detach(),
             "loss/tau_grad_weight": w_grad.mean().detach(),
             **band_logs,
@@ -2811,7 +2873,7 @@ class SLMFBBDM(nn.Module):
         return result
 
     # ------------------------------------------------------------------
-    # MC sampling (epistemic uncertainty)
+    # MC sampling (sampling variability across stochastic reverse passes)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -2825,16 +2887,25 @@ class SLMFBBDM(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Monte Carlo sampling: n_samples independent forward passes.
 
+        Concept note (uncertainty naming fix, conceptual): the variance
+        across these MC samples is measured with the network weights HELD
+        FIXED and only the sampling seeds varying, so it quantifies the
+        stochastic-sampling (aleatoric-type) variability of the reverse
+        process — NOT epistemic/model uncertainty, which would require
+        parameter uncertainty (deep ensembles, weight posteriors, ...).
+        The key is therefore named 'sampling_var'.
+
         Returns:
             synthetic_pet       [B, 1, H, W]  configured mean/median point estimate
-            epistemic_var       [B, 1, H, W]  variance across MC samples
-            total_var           [B, 1, H, W]  epistemic (+ aleatoric when the
+            sampling_var        [B, 1, H, W]  variance across MC samples
+                                               (fixed weights, varying seeds)
+            total_var           [B, 1, H, W]  sampling (+ aleatoric when the
                                                heteroscedastic head is enabled)
             confidence_map      [B, 1, H, W]  combined confidence (0=low, 1=high)
             aleatoric_logvar    [B, 1, H, W]  heteroscedastic log-variance (if enabled)
             samples             [n, B, 1, H, W]  all individual samples
 
-        total_var/confidence_map are always present (epistemic-only
+        total_var/confidence_map are always present (sampling-only
         fallback); only the aleatoric_* keys are conditional on
         enable_heteroscedastic.
         """
@@ -2865,20 +2936,22 @@ class SLMFBBDM(nn.Module):
             if aggregate == "mean"
             else torch.quantile(samples.float(), 0.5, dim=0).to(samples.dtype)
         )
-        epistemic_var = samples.var(dim=0)          # [B, 1, H, W]
+        sampling_var = samples.var(dim=0)          # [B, 1, H, W]
 
         output: Dict[str, torch.Tensor] = {
             "synthetic_pet": point_estimate,
-            "epistemic_var": epistemic_var,
+            "sampling_var": sampling_var,
             "samples": samples,
         }
 
-        # Combine aleatoric + epistemic for total confidence.  Naming
-        # contract (uncertainty naming fix): 'total_var' and
+        # Combine aleatoric + sampling variability for total confidence.
+        # Naming contract (uncertainty naming fix, conceptual): the MC
+        # spread with FIXED weights is sampling variability, not epistemic
+        # uncertainty — the key is 'sampling_var'.  'total_var' and
         # 'confidence_map' are ALWAYS emitted - with the heteroscedastic
         # head disabled (every RC-BRD prod config sets
         # model.enable_heteroscedastic=false) they fall back to the
-        # epistemic-only form, so evaluate.py's Uncertainty metric names
+        # sampling-only form, so evaluate.py's Uncertainty metric names
         # (uncertainty_ratio / confidence_lesion_mean) cannot silently
         # vanish for those arms.
         aleatoric_var = None
@@ -2888,8 +2961,8 @@ class SLMFBBDM(nn.Module):
             output["aleatoric_logvar"] = aleatoric_logvar
             output["aleatoric_var"] = aleatoric_var
 
-        total_var = (epistemic_var if aleatoric_var is None
-                     else epistemic_var + aleatoric_var)
+        total_var = (sampling_var if aleatoric_var is None
+                     else sampling_var + aleatoric_var)
 
         # Confidence map: inverse of normalised total uncertainty
         var_max = total_var.amax(dim=(2, 3), keepdim=True).clamp_min(1e-8)

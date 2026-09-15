@@ -731,6 +731,39 @@ class TestPerBandMinSnr:
             torch.testing.assert_close(logged, manual.mean().to(logged.dtype),
                                        rtol=1e-5, atol=1e-6)
 
+    def test_schedule_fixed_reference_true_min_snr(self):
+        """Clock math review correction #4: the normalization is the FIXED
+        schedule mean, not the per-t weight sum.
+
+        With no contract every band shares lambda0, so the old per-sample
+        normalization would cancel the weights exactly (plain MSE at every
+        t).  The fixed reference C keeps the schedule-average weight at 1:
+        early (high-SNR) timesteps weigh ABOVE 1, late (high-noise) ones
+        BELOW 1 — the real Min-SNR timestep down-weighting.
+        """
+        cfg = _base_config()
+        cfg["modules"]["rc_brd"] = _rc_cfg(loss_weighting="per_band_min_snr",
+                                          min_snr_gamma=3.0)
+        model = _build(cfg)
+        batch = _batch()
+        _, logs_small = model(batch, torch.tensor([1, 1]))    # u=0.01: SNR~49 -> gamma
+        _, logs_large = model(batch, torch.tensor([99, 99]))  # u=0.99: SNR~0.005
+        w_small = float(logs_small["loss/min_snr_weight"])
+        w_large = float(logs_large["loss/min_snr_weight"])
+        # w(t)/C: gamma-clamped early weight > schedule mean > late weight.
+        assert w_small > 1.0 > w_large
+        # Manual reference: C = mean_t min{SNR0(t), gamma} with shares
+        # summing to 1 (all bands share the axis, so C is band-blind).
+        t_grid = torch.arange(model.rc_brd_schedule.config.num_timesteps,
+                              dtype=torch.int64)
+        snr = model.rc_brd_schedule.clock_query_log_snr("LL2", t_grid).exp()
+        w_grid = torch.minimum(snr, torch.full_like(snr, 3.0))
+        ref = float(w_grid.mean())
+        assert w_small == pytest.approx(3.0 / ref, rel=1e-4)
+        snr_late = float(model.rc_brd_schedule.clock_query_log_snr(
+            "LL2", torch.tensor([99])).exp())
+        assert w_large == pytest.approx(min(snr_late, 3.0) / ref, rel=1e-4)
+
     def test_unknown_loss_weighting_fails_closed(self):
         cfg = _base_config()
         cfg["modules"]["rc_brd"] = _rc_cfg(loss_weighting="magic")

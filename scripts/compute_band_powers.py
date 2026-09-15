@@ -50,11 +50,16 @@ from src.model.mean_predictor import build_mean_predictor  # noqa: E402
 from src.model.rc_brd import (  # noqa: E402
     BAND_NAMES,
     band_groups,
+    compute_contract_sha256,
     haar_forward2,
     mean_weights_sha256,
 )
 
-SCHEMA_VERSION = 1
+# v1: original sealed schema.  v2 (provenance fix): adds the artifact
+# self-hash 'artifact_sha256' so freeze_recoverability_contract.py can
+# verify the payload was not edited after sealing (same canonical-JSON
+# sha256 convention as the recoverability contract itself).
+SCHEMA_VERSION = 2
 
 
 class BandPowerAccumulator:
@@ -179,7 +184,7 @@ def compute_band_powers(config: dict[str, Any], fold: str, *, split: str = "trai
         raise ValueError(f"band powers must be finite and > 0 for {bad}; "
                          "the residual looks degenerate (all-zero mean gap?)")
     patients = sorted({e.patient_id for e in dataset.entries})
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "stage": "rc_brd_band_powers",
         "fold": str(fold),
@@ -198,6 +203,11 @@ def compute_band_powers(config: dict[str, Any], fold: str, *, split: str = "trai
                         "split (DESIGN_RC_BRD_clock_v2 §2.3; pooled per group, "
                         "never the group total)"),
     }
+    # v2 provenance seal: canonical-JSON sha256 over the de-hashed payload
+    # (same convention as contract.compute_contract_sha256).  freeze
+    # verifies this hash before trusting fold/split/mean-SHA provenance.
+    payload["artifact_sha256"] = compute_contract_sha256(payload)
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:

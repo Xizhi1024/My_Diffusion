@@ -935,7 +935,9 @@ def evaluate(
                 sample_out = model.sample(batch_gpu, num_steps=mc_steps)
 
         synth_pet = sample_out["synthetic_pet"]  # [B, 1, H, W]
-        uncertainty_map = sample_out.get("total_var", sample_out.get("epistemic_var"))
+        # sampling_var: MC spread with FIXED weights = sampling variability
+        # (not epistemic); total_var adds the aleatoric head when enabled.
+        uncertainty_map = sample_out.get("total_var", sample_out.get("sampling_var"))
         confidence_map = sample_out.get("confidence_map")
         target_pet = batch_gpu["pet"]
         ct = batch_gpu["ct"]
@@ -1097,7 +1099,14 @@ def evaluate(
         for m in p_metrics:
             keys.update(m.keys())
         for k in sorted(keys):
-            vals = [m[k] for m in p_metrics if isinstance(m.get(k), (int, float)) and not np.isnan(m.get(k, float("nan")))]
+            # np.isfinite (not just ~isnan): +/-inf must be excluded too —
+            # a single inf slice would otherwise poison the patient mean
+            # (audit follow-up; the global aggregation above already used
+            # isfinite, the patient level did not).
+            vals = [m[k] for m in p_metrics
+                    if isinstance(m.get(k), (int, float))
+                    and not isinstance(m.get(k), bool)
+                    and np.isfinite(m.get(k, float("nan")))]
             if vals:
                 p_agg[f"{k}_mean"] = float(np.mean(vals))
         patient_summary[pid] = p_agg
@@ -1305,9 +1314,9 @@ def main():
               f"{int(getattr(model, 'rc_brd_mc_samples', 8))}")
     if mc_samples is not None and mc_samples <= 1:
         print(
-            "NOTE: mc_samples<=1 (single deterministic draw): epistemic "
-            "uncertainty metrics and failure_high_uncertainty are disabled "
-            "(audit P1-19)."
+            "NOTE: mc_samples<=1 (single deterministic draw): sampling-"
+            "variability uncertainty metrics and failure_high_uncertainty "
+            "are disabled (audit P1-19)."
         )
     expected_data_lineage = load_checkpoint_data_lineage(config)
 

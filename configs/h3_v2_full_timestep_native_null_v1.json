@@ -239,7 +239,7 @@
     },
     "cached_dataset": {
       "path": "src/data/dataset.py",
-      "file_sha256": "ded42c301478c5d2293562321ba0365972906ffb2b74405f092b675c37923878"
+      "file_sha256": "d4417ed4c5d4197e7a1d83309e15a591043605d751db60ec2bb119bc26e7083b"
     },
     "data_lineage": {
       "path": "src/data/lineage.py",
@@ -263,11 +263,11 @@
     },
     "spectral_router": {
       "path": "src/model/frequency/spectral_router.py",
-      "file_sha256": "d95d09246b6a3b60a0c72e1374095c89e6dade6719a85d719a56e5f5e918b634"
+      "file_sha256": "1e9cef55cea3039aaf7f4de478929b83bc9c59eebdadcc0d660413dc3ea0d623"
     },
     "slmf_bbdm": {
       "path": "src/model/slmf_bbdm.py",
-      "file_sha256": "464e8f4e8af169b7976094096cc465487554d14bcd1dba9017acae2bf682bb1e"
+      "file_sha256": "07b48d92e5d68609ee118f3c65845c83edf58a24f4d0a129631492b646373978"
     },
     "experiment_builder": {
       "path": "scripts/build_h3_v2_experiment_configs.py",
@@ -279,23 +279,23 @@
     },
     "training_entry": {
       "path": "scripts/train_v2.py",
-      "file_sha256": "86125f12f0d0645a364c6c6308fb3acc2eaf889a9ebac66ed4bb34a43b92df4a"
+      "file_sha256": "e83ac491a5137c71dca6b0a4555390bdf8c4dbf5ceab4725346e9da00301777f"
     },
     "trainer": {
       "path": "src/model/trainer.py",
-      "file_sha256": "e8feecf5ea6cca6ef125738143fce5d967c027e00e994629479d600658d6cae6"
+      "file_sha256": "36cfc2b7272f8c0c0bd6e08f2dd50b555eab51922eaa0b4f679646df86476371"
     },
     "config_resolution": {
       "path": "src/model/config_utils.py",
-      "file_sha256": "6314570e05a92c16183eb7e918a4ad5aee042e51bc326eefccf5c105756fbdda"
+      "file_sha256": "acf6cae9291a467ac79865667b44b7feeb288ca0f622b832fc40703d9a0cc1e9"
     },
     "evaluation_entry": {
       "path": "scripts/evaluate.py",
-      "file_sha256": "e929405c0ce3670da1286875bec30d77f4a100d4dc0e43b403646af290ec98e6"
+      "file_sha256": "e0f93abab648e89cb2f3db5371bacfe4f5040d8067e51a661c7f7c232dc2b453"
     },
     "base_experiment_config": {
       "path": "configs/experiments/slmf_png_spectral_router_v5.yaml",
-      "file_sha256": "42f77c7c9460ecba596ac3ca16bc3d234af8d437611fa68febf5d99d1e74f59d"
+      "file_sha256": "145626c131e107d81e883a22dbdc9ea51b4e9583b7830db744ec71d0f61faae9"
     },
     "freeze_integrity_audit": {
       "path": "scripts/audit_v2_freeze_integrity.py",
@@ -310,5 +310,5 @@
       "file_sha256": "f5338c29d0bbf9389e1ba707227ea68adddc758013b88adf5792a5473d904fd7"
     }
   },
-  "config_sha256": "82e418129be15cbcb2914cd99ebf5ba2783c74e3084f2396a5d90f464c5cbb39"
+  "config_sha256": "0f22309eab40309f08ade89321355423c0025579fc60bfddced303b177eb3169"
 }

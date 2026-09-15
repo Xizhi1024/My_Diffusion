@@ -502,7 +502,19 @@ class CachedDataset(Dataset):
                 if meta_path.exists():
                     try:
                         meta = json.loads(open(meta_path, encoding="utf-8").read())
-                        entry_split = meta.get("split", split)
+                        # Split-fallback leak fix: a VALID _meta.json that
+                        # merely lacks the 'split' key used to default to the
+                        # REQUESTED split (meta.get("split", split)), which
+                        # silently admitted foreign-split samples into this
+                        # dataset.  The key must be present AND a known split
+                        # name; anything else counts as unlabelled and is
+                        # skipped fail-safe below (same as unreadable meta).
+                        candidate = meta.get("split")
+                        entry_split = (
+                            str(candidate)
+                            if candidate in {"train", "val", "test"}
+                            else None
+                        )
                     except (json.JSONDecodeError, OSError):
                         entry_split = None
                 if entry_split is None:

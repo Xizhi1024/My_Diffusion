@@ -1148,7 +1148,7 @@ class TestModelIntegration:
         batch = _fake_batch(B=1)
         result = model.sample_mc(batch, n_samples=3, num_steps=3)
         assert "synthetic_pet" in result
-        assert "epistemic_var" in result
+        assert "sampling_var" in result
 
     def test_metadata_disabled_produces_no_film_log(self):
         """When metadata FiLM is off, log shows 0."""
@@ -1782,7 +1782,7 @@ class TestMCSampling:
     """Verify MC sampling produces uncertainty estimates."""
 
     def test_sample_mc_basic(self):
-        """sample_mc returns mean, epistemic variance, confidence map."""
+        """sample_mc returns mean, sampling variance, confidence map."""
         # Use baseline config (no modules) for fast smoke test
         slmf = SLMFBBDM(
             image_size=32,
@@ -1802,11 +1802,11 @@ class TestMCSampling:
 
         result = slmf.sample_mc(batch, n_samples=3, num_steps=3)
         assert "synthetic_pet" in result
-        assert "epistemic_var" in result
+        assert "sampling_var" in result
         assert "total_var" in result
         assert "samples" in result
         assert result["synthetic_pet"].shape == (1, 1, 32, 32)
-        assert result["epistemic_var"].shape == (1, 1, 32, 32)
+        assert result["sampling_var"].shape == (1, 1, 32, 32)
         assert result["samples"].shape == (3, 1, 1, 32, 32)
         # With heteroscedastic: should have confidence
         assert "confidence_map" in result
@@ -1816,14 +1816,16 @@ class TestMCSampling:
     def test_sample_mc_no_heteroscedastic(self):
         """sample_mc without heteroscedastic head keeps the uncertainty names.
 
-        Naming contract (uncertainty naming fix): total_var and
-        confidence_map are ALWAYS emitted; with the heteroscedastic head
-        disabled they fall back to the epistemic-only form
-        (total_var == epistemic_var), so evaluate.py's Uncertainty metric
-        names (uncertainty_ratio / confidence_lesion_mean) cannot silently
-        vanish for arms that set model.enable_heteroscedastic=false (every
-        RC-BRD prod config).  Only the aleatoric_* keys stay conditional on
-        the head.
+        Naming contract (uncertainty naming fix, conceptual): the MC spread
+        with FIXED weights and varying sampling seeds is SAMPLING
+        variability (aleatoric-type), not epistemic/model uncertainty — the
+        key is 'sampling_var'.  total_var and confidence_map are ALWAYS
+        emitted; with the heteroscedastic head disabled they fall back to
+        the sampling-only form (total_var == sampling_var), so evaluate.py's
+        Uncertainty metric names (uncertainty_ratio / confidence_lesion_mean)
+        cannot silently vanish for arms that set
+        model.enable_heteroscedastic=false (every RC-BRD prod config).  Only
+        the aleatoric_* keys stay conditional on the head.
         """
         slmf = SLMFBBDM(
             image_size=32,
@@ -1840,12 +1842,12 @@ class TestMCSampling:
 
         result = slmf.sample_mc(batch, n_samples=2, num_steps=3)
         assert "synthetic_pet" in result
-        assert "epistemic_var" in result
-        # Epistemic-only fallback: no aleatoric component anywhere.
+        assert "sampling_var" in result
+        # Sampling-only fallback: no aleatoric component anywhere.
         assert "aleatoric_var" not in result
         assert "aleatoric_logvar" not in result
         assert "total_var" in result
-        torch.testing.assert_close(result["total_var"], result["epistemic_var"])
+        torch.testing.assert_close(result["total_var"], result["sampling_var"])
         assert "confidence_map" in result
         assert result["confidence_map"].shape == (1, 1, 32, 32)
         assert (result["confidence_map"] >= 0).all() and (result["confidence_map"] <= 1).all()

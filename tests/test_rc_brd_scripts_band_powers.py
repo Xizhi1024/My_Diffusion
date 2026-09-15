@@ -294,7 +294,7 @@ def _reference_powers(mini: MiniCache, n_groups: int = 3):
 def test_compute_band_powers_end_to_end_matches_manual_recompute(mini):
     expected, by_band = _reference_powers(mini)
     payload = BP.compute_band_powers(mini.config, "fold_0")
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["stage"] == "rc_brd_band_powers"
     assert payload["fold"] == "fold_0"
     assert payload["split"] == "train"
@@ -312,6 +312,11 @@ def test_compute_band_powers_end_to_end_matches_manual_recompute(mini):
     assert payload["mean_checkpoint"] == str(mini.ckpt)
     assert payload["mean_checkpoint_sha256"] == mean_weights_sha256(mini.state)
     assert "per-coefficient" in payload["definition"]
+    # v2 provenance seal: canonical-JSON self hash over the de-hashed
+    # payload (freeze verifies it before trusting fold/split/MeanNet SHA).
+    from src.model.rc_brd import compute_contract_sha256
+    dehashed = {k: v for k, v in payload.items() if k != "artifact_sha256"}
+    assert payload["artifact_sha256"] == compute_contract_sha256(dehashed)
 
 
 def test_compute_band_powers_seven_groups_matches_by_band(mini):
@@ -364,7 +369,12 @@ def test_cli_writes_json_matching_direct_call(t_dir, mini):
     cfg_path = t_dir / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(mini.config), encoding="utf-8")
     out = t_dir / "band_powers.json"
-    rc = BP.main(["--config", str(cfg_path), "--fold", "fold_0", "--out", str(out)])
+    # --device cpu: the CLI default is auto (cuda when available), whose
+    # float reduction order differs from the CPU direct call below by
+    # ~1e-9 relative — beyond this test's rel=1e-9 determinism pin
+    # (flaky on GPU machines; CI never reached this file before).
+    rc = BP.main(["--config", str(cfg_path), "--fold", "fold_0",
+                  "--device", "cpu", "--out", str(out)])
     assert rc == 0
     sealed = json.loads(out.read_text(encoding="utf-8"))
     assert sealed["split_label"] == "outer_train_fold_0"

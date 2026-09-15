@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.model.rc_brd.ablations import (
     A3_VARIANTS,
     ABLATION_ARMS,
+    BAND_SNR_LOSS_ARMS,
     CLOCK_SPECIALIST_ARMS,
     ablation_config_hash,
     apply_contract_transform,
@@ -147,6 +148,26 @@ EXPECTED_FOUR_ARM_OVERRIDES = {
     "clock_on_specialist_on": {
         "modules.rc_brd.enabled": True,
         "modules.rc_brd.specialist.enabled": True,
+    },
+}
+
+
+# Expected dotlist overrides per band-SNR clock × loss arm on
+# make_base_config() (no clock_mode/loss_weighting/min_snr_gamma keys in the
+# base rc_brd block, so every override shows up in the observed diff).  Both
+# arms keep the base κ (0.25) and specialist (True) verbatim — the loss axis
+# is the ONLY difference between the two arms.
+EXPECTED_BAND_SNR_LOSS_OVERRIDES = {
+    "band_snr_clock_uniform_loss": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.clock_mode": "band_snr",
+        "modules.rc_brd.loss_weighting": "uniform",
+    },
+    "band_snr_clock_band_snr_loss": {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.clock_mode": "band_snr",
+        "modules.rc_brd.loss_weighting": "per_band_min_snr",
+        "modules.rc_brd.min_snr_gamma": 5.0,
     },
 }
 
@@ -406,6 +427,71 @@ def test_clock_specialist_arms_exported_from_package_top_level():
     assert "CLOCK_SPECIALIST_ARMS" in rc_brd_package.__all__
     assert from_module == ("clock_off_specialist_off", "clock_off_specialist_on",
                            "clock_on_specialist_off", "clock_on_specialist_on")
+
+
+# ---------------------------------------------------------------------------
+# band-SNR clock × loss-weighting arms (BAND_SNR_LOSS_ARMS)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("arm", list(BAND_SNR_LOSS_ARMS))
+def test_band_snr_loss_arm_generates_and_diff_is_exactly_expected_keys(base_config, arm):
+    """Each arm builds and differs from base by exactly its expected keys."""
+    expected = EXPECTED_BAND_SNR_LOSS_OVERRIDES[arm]
+    cfg = build_ablation_config(base_config, arm)
+    for dotted, value in expected.items():
+        assert get_dotted(cfg, dotted) == value, dotted
+    # κ and specialist follow the base config verbatim (orthogonal to the
+    # κ × specialist factorial, which stays on the base clock_mode)
+    assert cfg["modules"]["rc_brd"]["kappa"] == 0.25
+    assert cfg["modules"]["rc_brd"]["specialist"]["enabled"] is True
+    touched = diff_keys(base_config, cfg)
+    assert touched <= set(expected), (arm, touched - set(expected))
+    changed = {
+        k for k, v in expected.items() if get_dotted(cfg, k) != get_dotted(base_config, k)
+    }
+    assert changed <= touched, (arm, changed - touched)
+    assert touched == changed
+
+
+def test_band_snr_loss_arms_differ_only_in_the_loss_axis(base_config):
+    """The pair isolates the loss factor: their mutual diff is exactly the
+    loss_weighting/min_snr_gamma leaves (clock, κ and specialist identical)."""
+    uniform = build_ablation_config(base_config, "band_snr_clock_uniform_loss")
+    snr_loss = build_ablation_config(base_config, "band_snr_clock_band_snr_loss")
+    mutual = diff_keys(uniform, snr_loss)
+    assert mutual == {"modules.rc_brd.loss_weighting", "modules.rc_brd.min_snr_gamma"}
+    assert uniform["modules"]["rc_brd"]["clock_mode"] == \
+        snr_loss["modules"]["rc_brd"]["clock_mode"] == "band_snr"
+
+
+def test_band_snr_loss_arm_hashes_distinct(base_config):
+    hashes = {arm: ablation_config_hash(build_ablation_config(base_config, arm))
+              for arm in BAND_SNR_LOSS_ARMS}
+    assert len(set(hashes.values())) == len(BAND_SNR_LOSS_ARMS)
+    assert ablation_config_hash(base_config) not in set(hashes.values())
+
+
+@pytest.mark.parametrize("arm", list(BAND_SNR_LOSS_ARMS))
+def test_band_snr_loss_arm_rejects_foreign_a3_variant(base_config, arm):
+    with pytest.raises(ValueError):
+        build_ablation_config(base_config, arm, a3_variant="budget_matched")
+
+
+@pytest.mark.parametrize("arm", ["band_snr_clock", "band_snr_loss", "band_snr_clock_magic_loss",
+                 "uniform_clock_band_snr_loss"])
+def test_band_snr_loss_near_miss_names_raise(base_config, arm):
+    with pytest.raises(ValueError):
+        build_ablation_config(base_config, arm)
+
+
+def test_band_snr_loss_arms_exported_from_package_top_level():
+    """BAND_SNR_LOSS_ARMS is importable from src.model.rc_brd itself."""
+    import src.model.rc_brd as rc_brd_package
+    from src.model.rc_brd.ablations import BAND_SNR_LOSS_ARMS as from_module
+    assert rc_brd_package.BAND_SNR_LOSS_ARMS is from_module
+    assert "BAND_SNR_LOSS_ARMS" in rc_brd_package.__all__
+    assert from_module == ("band_snr_clock_uniform_loss",
+                           "band_snr_clock_band_snr_loss")
 
 
 # ---------------------------------------------------------------------------

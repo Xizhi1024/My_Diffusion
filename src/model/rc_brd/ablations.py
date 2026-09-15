@@ -77,6 +77,24 @@ CLOCK_SPECIALIST_ARMS: tuple[str, ...] = (
     "clock_on_specialist_off",
     "clock_on_specialist_on",
 )
+# band-SNR clock × loss-weighting pair (mechanism-attribution directive,
+# provenance audit follow-up): the band_snr production config changes
+# THREE things at once vs base RC — clock_mode, contract/P_g and
+# loss_weighting — so a band_snr win over base-RC is not attributable to
+# the clock alone.  These two arms hold the band-SNR clock fixed and
+# toggle ONLY the loss, making the third mechanism measurable:
+#   band_snr_clock_uniform_loss    — band_snr clock, uniform loss (isolates
+#                                    the clock change vs base-RC)
+#   band_snr_clock_band_snr_loss   — band_snr clock + per-band Min-SNR loss
+#                                    (the full v2 stack; equals the
+#                                    rc_brd_prod_rc_band_snr mainline cell)
+# Both keep the base config's kappa and specialist settings verbatim —
+# they decompose the clock_mode/loss factors, orthogonal to the κ ×
+# specialist 2×2 above (which stays on the base clock_mode).
+BAND_SNR_LOSS_ARMS: tuple[str, ...] = (
+    "band_snr_clock_uniform_loss",
+    "band_snr_clock_band_snr_loss",
+)
 # C8（PRD §3）：A3 sham 强度的两个变体。
 A3_VARIANTS: tuple[str, ...] = ("budget_matched", "density_matched")
 DEFAULT_A3_VARIANT: str = "density_matched"  # C8 默认（PRD §3）
@@ -301,9 +319,31 @@ def _four_arm_overrides(base_config: Mapping[str, Any], arm: str) -> dict[str, A
     return overrides
 
 
+def _band_snr_loss_overrides(base_config: Mapping[str, Any], arm: str) -> dict[str, Any]:
+    """Dotlist overrides of one band-SNR-clock × loss-weighting arm.
+
+    Both arms pin clock_mode='band_snr' (requires a v2 contract with
+    band_powers at model-build time — the schedule guard raises otherwise);
+    the specialist flag and kappa follow the base config verbatim so these
+    arms never confound the κ × specialist factorial.  The loss axis is the
+    ONLY difference between the two arms (uniform vs per_band_min_snr).
+    """
+    overrides: dict[str, Any] = {
+        "modules.rc_brd.enabled": True,
+        "modules.rc_brd.clock_mode": "band_snr",
+    }
+    if arm == "band_snr_clock_uniform_loss":
+        # Explicit (not merely inherited): the diff must show the loss axis.
+        overrides["modules.rc_brd.loss_weighting"] = "uniform"
+    else:  # band_snr_clock_band_snr_loss
+        overrides["modules.rc_brd.loss_weighting"] = _LOSS_WEIGHTING_MIN_SNR
+        overrides["modules.rc_brd.min_snr_gamma"] = _MIN_SNR_GAMMA
+    return overrides
+
+
 def _check_arm_and_variant(arm: str, a3_variant: str) -> None:
     """Validate arm identity and the C8 a3_variant pairing (fail-closed)."""
-    known_arms = ABLATION_ARMS + CLOCK_SPECIALIST_ARMS
+    known_arms = ABLATION_ARMS + CLOCK_SPECIALIST_ARMS + BAND_SNR_LOSS_ARMS
     if arm not in known_arms:
         raise ValueError(
             f"unknown ablation arm {arm!r}; expected one of {known_arms}")
@@ -402,10 +442,19 @@ def build_ablation_config(base_config: dict, arm: str, *,
 
     clock_on cells require a base config with modules.rc_brd.kappa != 0
     (fail-closed ValueError otherwise).
+
+    Additionally accepts the band-SNR clock × loss-weighting arms
+    BAND_SNR_LOSS_ARMS (band_snr_clock_{uniform,band_snr}_loss): both pin
+    clock_mode='band_snr'; the loss axis (uniform vs per_band_min_snr) is
+    the only difference.  kappa and specialist follow the base config so
+    these arms stay orthogonal to the κ × specialist factorial (which
+    itself stays on the base clock_mode).
     """
     _check_arm_and_variant(arm, a3_variant)
     if arm in CLOCK_SPECIALIST_ARMS:
         overrides = _four_arm_overrides(base_config, arm)
+    elif arm in BAND_SNR_LOSS_ARMS:
+        overrides = _band_snr_loss_overrides(base_config, arm)
     else:
         overrides = _arm_overrides(base_config, arm)
     return apply_dotlist_overrides(dict(base_config), overrides)
