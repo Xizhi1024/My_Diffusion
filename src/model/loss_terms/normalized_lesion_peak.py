@@ -140,7 +140,9 @@ class NormalizedLesionPeakLoss(LossTerm):
                 f"{self.name}/enabled": pred.new_tensor(1.0),
             }
 
-        loss = torch.stack(losses).mean()
+        # Audit L2: gate-mass normalization — divide by max(sum(gate), 1),
+        # not the appended-sample count (see lesion_roi_l1 / topk_lesion).
+        loss = torch.stack(losses).sum() / torch.stack(valid_gates).sum().clamp_min(1.0)
         return loss * self.weight, {
             f"{self.name}/loss": loss.detach(),
             f"{self.name}/pred_peak": torch.stack(pred_peaks).mean().detach(),

@@ -56,6 +56,7 @@ class TopKLesionLoss(LossTerm):
         ).reshape(-1)
 
         losses: list[torch.Tensor] = []
+        gates: list[torch.Tensor] = []
         selected_counts: list[torch.Tensor] = []
 
         for index in range(pred.shape[0]):
@@ -80,6 +81,7 @@ class TopKLesionLoss(LossTerm):
             focal_weight = (1.0 - torch.exp(-error)).pow(self.focal_gamma)
             sample_loss = (focal_weight * error).mean()
             losses.append(sample_loss * gate[index])
+            gates.append(gate[index])
             selected_counts.append(pred.new_tensor(float(k)))
 
         if not losses:
@@ -88,7 +90,9 @@ class TopKLesionLoss(LossTerm):
                 f"{self.name}/enabled": pred.new_tensor(1.0),
             }
 
-        raw_loss = torch.stack(losses).mean()
+        # Audit L2: gate-mass normalization — divide by max(sum(gate), 1),
+        # not the appended-sample count (see lesion_roi_l1).
+        raw_loss = torch.stack(losses).sum() / torch.stack(gates).sum().clamp_min(1.0)
         weighted_loss = raw_loss * self.weight
 
         return weighted_loss, {

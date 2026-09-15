@@ -49,8 +49,12 @@ training:
   weight_decay: 0.01
   lr_min: 1e-6
   ema:
-    decay: 0.999
-    update_every: 10
+    # Audit T1: 0.999 x update_every 10 gives a 10k-step time constant, but
+    # this run is only ~6k optimizer steps (epoch-10 eval still carried
+    # 0.999^120 = 88.7% initial weights; end of run 55%). 0.995/1 matches the
+    # 300e configurations and washes out initialization within ~2k steps.
+    decay: 0.995
+    update_every: 1
 
 model:
   objective: pred_x0
@@ -78,6 +82,10 @@ modules:
 
   residual_bridge:
     enabled: true
+    # Audit B5: synthetic PET = mean + residual was unbounded (clip_output
+    # defaults to False), allowing >1 pseudo-peaks to inflate lesion metrics.
+    # Clamp to the [-1, 1] training data range.
+    clip_output: true
 
   wavelet_unet:
     enabled: false
@@ -171,7 +179,10 @@ losses:
     cold_weight: 1.0
     cold_tolerance: 0.02
   outside_peak_ranking:
-    enabled: false
+    # Audit L3: re-enabled as the lightweight counter-constraint to the
+    # one-sided cold penalty in normalized_lesion_peak (overshoot / false
+    # hotspots previously had no gradient-path penalty at all).
+    enabled: true
     weight: 0.1
     margin: 0.05
     inside_radius: 3
