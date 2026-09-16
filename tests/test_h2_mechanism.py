@@ -4,6 +4,8 @@ from pathlib import Path
 
 import torch
 
+import pytest
+
 from scripts.validate_h2_pathology_excluded_residual import (
     _decision_from_metrics,
     pathology_excluded_mean_loss,
@@ -16,6 +18,15 @@ from src.mechanism_validation.common import (
 )
 
 
+@pytest.mark.skipif(
+    not (
+        Path(__file__).resolve().parents[1] / "main_data" / "split_manifest.csv"
+    ).is_file(),
+    reason=(
+        "requires main_data/split_manifest.csv, which is data and not part "
+        "of the git checkout"
+    ),
+)
 def test_formal_partition_reproduces_h1_patient_counts() -> None:
     root = Path(__file__).resolve().parents[1]
     rows = read_manifest(root / "main_data" / "split_manifest.csv")

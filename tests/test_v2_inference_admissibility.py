@@ -1,12 +1,46 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.audit_v2_inference_admissibility import (
     PIPELINE_ID,
     ROOT,
     build_decision,
     build_missing_artifact_decision,
     inspect_h4_generator,
+)
+
+# The frozen V2 calibration artifacts are research outputs stored under
+# results/, which is not part of the git tree.  Skip (not fail) on code-only
+# checkouts; full local/cloud checkouts still run these contracts.
+_V2_BUNDLE = (
+    ROOT
+    / "results"
+    / "mechanism_validation_v2"
+    / "04_main_integration_freeze"
+    / "production_calibration_bundle.json"
+)
+_V2_CONTRACT = (
+    ROOT
+    / "results"
+    / "mechanism_validation_v2"
+    / "04_main_integration_freeze"
+    / "resolved_integration_contract.json"
+)
+_V1_H4_DECISION = (
+    ROOT / "results" / "mechanism_validation" / "03_h4_noise_calibration" / "decision.json"
+)
+requires_v2_frozen_artifacts = pytest.mark.skipif(
+    not (_V2_BUNDLE.is_file() and _V2_CONTRACT.is_file()),
+    reason=(
+        "frozen calibration bundle/contract not in this checkout: "
+        f"{_V2_BUNDLE} / {_V2_CONTRACT}"
+    ),
+)
+requires_v1_h4_decision = pytest.mark.skipif(
+    not _V1_H4_DECISION.is_file(),
+    reason=f"sealed H4-v1 decision not in this checkout: {_V1_H4_DECISION}",
 )
 
 
@@ -23,6 +57,7 @@ def test_h4_generator_semantics_expose_forbidden_inputs():
     assert semantics["uses_masked_band_alignment"] is True
 
 
+@requires_v2_frozen_artifacts
 def test_frozen_bundle_fails_production_inference_admissibility():
     decision = build_decision(
         bundle_path=(
@@ -54,6 +89,8 @@ def test_frozen_bundle_fails_production_inference_admissibility():
     assert decision["next_stage_allowed"] is False
 
 
+@requires_v2_frozen_artifacts
+@requires_v1_h4_decision
 def test_admissibility_decision_is_new_and_does_not_overwrite_v1(tmp_path):
     v1_path = (
         ROOT

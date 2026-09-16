@@ -12,6 +12,19 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+# The v4 preset tests build the full production model whose frozen
+# conditional-mean checkpoint is a local/cloud research artifact that is
+# deliberately not part of the git tree.  Skip (not fail) on code-only
+# checkouts; machines that do have the checkpoint still verify the presets.
+_V4_MEAN_CHECKPOINT = Path("checkpoints/freq_mean_pretrain_v2/mean_best.pt")
+requires_v4_mean_checkpoint = pytest.mark.skipif(
+    not _V4_MEAN_CHECKPOINT.is_file(),
+    reason=(
+        "requires the pretrained conditional-mean checkpoint "
+        f"({_V4_MEAN_CHECKPOINT}), which is not part of the git checkout"
+    ),
+)
+
 GATES = {
     "failure_any_mean": {"direction": "lower", "max_delta": 0.0625},
     "false_hotspot_density_mean": {
@@ -442,6 +455,7 @@ def test_v4_plan_has_two_fixed_64_sample_stages_and_exact_promotions():
     assert plan["stage_b"]["top_k"] == 2
 
 
+@requires_v4_mean_checkpoint
 @pytest.mark.parametrize(
     ("preset", "peak", "floor_l2", "floor_l1"),
     [
@@ -1185,7 +1199,11 @@ def test_frequency_runner_can_evaluate_exact_final_checkpoint(tmp_path):
         phase="screen",
     )
 
-    assert entry["checkpoint"].endswith("exact_ctrl\\ckpt_epoch0030.pt")
+    # Path separators differ between Windows and POSIX checkouts; compare
+    # normalised so the contract holds on both.
+    assert str(entry["checkpoint"]).replace("\\", "/").endswith(
+        "exact_ctrl/ckpt_epoch0030.pt"
+    )
     checkpoint_arg = entry["eval_command"].index("--checkpoint") + 1
     assert entry["eval_command"][checkpoint_arg] == entry["checkpoint"]
 

@@ -23,6 +23,22 @@ SEALED_DECISION_FILE_SHA256 = (
     "756acd11a6ffde9aedba6885ac302552d19d511c7afb151e087e88307d283564"
 )
 
+# The sealed decision and the frozen calibration bundle/contract are research
+# outputs that live on full local/cloud checkouts, not in git.  Skip (not
+# fail) when absent so a code-only CI run stays green; machines that have the
+# artifacts still verify every SHA-256 pin above.
+requires_sealed_decision = pytest.mark.skipif(
+    not SEALED_DECISION_PATH.is_file(),
+    reason=f"sealed decision artifact not in this checkout: {SEALED_DECISION_PATH}",
+)
+requires_frozen_bundle = pytest.mark.skipif(
+    not (DEFAULT_BUNDLE.is_file() and DEFAULT_CONTRACT.is_file()),
+    reason=(
+        "frozen calibration bundle/contract not in this checkout: "
+        f"{DEFAULT_BUNDLE} / {DEFAULT_CONTRACT}"
+    ),
+)
+
 
 def _sealed_decision():
     assert file_sha256(SEALED_DECISION_PATH) == SEALED_DECISION_FILE_SHA256
@@ -70,6 +86,7 @@ def _mock_sealed_runtime_integrity(monkeypatch):
     )
 
 
+@requires_sealed_decision
 def test_formal_gate_splits_grid_pass_from_two_independent_failures():
     decision = _sealed_decision()
 
@@ -100,6 +117,7 @@ def test_formal_gate_splits_grid_pass_from_two_independent_failures():
     assert decision["production_timestep_consumption_defined"] is False
 
 
+@requires_sealed_decision
 def test_nineteen_of_twenty_production_eval_steps_are_off_grid():
     decision = _sealed_decision()
     gate = decision["gates"]["production_timestep_consumption"]
@@ -113,6 +131,7 @@ def test_nineteen_of_twenty_production_eval_steps_are_off_grid():
     )
 
 
+@requires_sealed_decision
 def test_h3_source_and_h4_nested_partition_lineage_are_distinct():
     partition_gate = _sealed_decision()["gates"]["frozen_input_integrity"][
         "frozen_partitions"
@@ -133,6 +152,7 @@ def test_h3_source_and_h4_nested_partition_lineage_are_distinct():
     )
 
 
+@requires_sealed_decision
 @pytest.mark.parametrize(
     ("inspector_name", "proof_field"),
     [
@@ -227,6 +247,7 @@ def test_missing_bundle_fails_closed(tmp_path):
     assert decision["production_activation_allowed"] is False
 
 
+@requires_frozen_bundle
 def test_tampered_bundle_and_contract_fail_closed(tmp_path):
     bundle = json.loads(DEFAULT_BUNDLE.read_text(encoding="utf-8"))
     bundle["models"]["h3_fixed_schedule"]["schedule"]["l1_hh|50"] = 0.25
@@ -255,6 +276,7 @@ def test_tampered_bundle_and_contract_fail_closed(tmp_path):
         assert decision["production_activation_allowed"] is False
 
 
+@requires_frozen_bundle
 def test_tampered_runtime_source_fails_closed_but_mapping_stays_independent(
     tmp_path,
 ):
@@ -276,6 +298,7 @@ def test_tampered_runtime_source_fails_closed_but_mapping_stays_independent(
     assert decision["next_stage_allowed"] is False
 
 
+@requires_sealed_decision
 def test_hashes_and_decision_fields_are_self_consistent():
     config = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     declared_config_hash = config.pop("config_sha256")
@@ -291,6 +314,7 @@ def test_hashes_and_decision_fields_are_self_consistent():
     assert decision["existing_model_modified"] is False
 
 
+@requires_sealed_decision
 def test_all_downstream_actions_remain_disabled():
     decision = _sealed_decision()
 

@@ -40,9 +40,7 @@ roots:
 groups:
   common:
     - "src/__init__.py"
-    - "src/data/__init__.py"
-    - "src/data/dataset.py"
-    - "src/data/lineage.py"
+    - "src/data/**"
     - "src/model/__init__.py"
     - "src/model/slmf_bbdm.py"
     - "src/model/config_utils.py"

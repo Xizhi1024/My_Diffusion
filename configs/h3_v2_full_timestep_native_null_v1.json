@@ -239,7 +239,7 @@
     },
     "cached_dataset": {
       "path": "src/data/dataset.py",
-      "file_sha256": "d4417ed4c5d4197e7a1d83309e15a591043605d751db60ec2bb119bc26e7083b"
+      "file_sha256": "1ffefd100ee898a6cd9641b35a5742de55067478cfb7d8694e44c7be920a6d94"
     },
     "data_lineage": {
       "path": "src/data/lineage.py",
@@ -255,19 +255,19 @@
     },
     "haar_transform": {
       "path": "src/model/frequency/haar.py",
-      "file_sha256": "872ffd9057a8cffa3d8e8252fff41d276cceb982285e9730673a5539a2c5ff9d"
+      "file_sha256": "afb10638def31f2ce8edc48cadedcf093d18c6f42233d84151a55c6f6243248f"
     },
     "boundary_reliable_router_base": {
       "path": "src/model/frequency/boundary_reliable.py",
-      "file_sha256": "5ab23dbe8f51d2fec2021f6e648d5b7cbd6f01766bf48fb88fcfca93625ab912"
+      "file_sha256": "fb4e2443f96c2e3c4f51717742d2eaf52fe11a528a5ee63f732ece9d248ece18"
     },
     "spectral_router": {
       "path": "src/model/frequency/spectral_router.py",
-      "file_sha256": "1e9cef55cea3039aaf7f4de478929b83bc9c59eebdadcc0d660413dc3ea0d623"
+      "file_sha256": "1badf351889f7749d5361adce17a3b64dcc8db097dfe174d2e990bb3b342beda"
     },
     "slmf_bbdm": {
       "path": "src/model/slmf_bbdm.py",
-      "file_sha256": "07b48d92e5d68609ee118f3c65845c83edf58a24f4d0a129631492b646373978"
+      "file_sha256": "3e39ee64ae48b80d3ed7378c224770b12079497b34056fe9b2ac616768b94719"
     },
     "experiment_builder": {
       "path": "scripts/build_h3_v2_experiment_configs.py",
@@ -279,23 +279,23 @@
     },
     "training_entry": {
       "path": "scripts/train_v2.py",
-      "file_sha256": "e83ac491a5137c71dca6b0a4555390bdf8c4dbf5ceab4725346e9da00301777f"
+      "file_sha256": "25bcb7b33ce60c19c34b2bf8a5dc53ea30d3ed53bd0e5a1577e73d7c60635ed7"
     },
     "trainer": {
       "path": "src/model/trainer.py",
-      "file_sha256": "36cfc2b7272f8c0c0bd6e08f2dd50b555eab51922eaa0b4f679646df86476371"
+      "file_sha256": "bf8b10faef10faf6d131ae958e7a887880e02b2338122e3dbd51e5dbcd613f7f"
     },
     "config_resolution": {
       "path": "src/model/config_utils.py",
-      "file_sha256": "acf6cae9291a467ac79865667b44b7feeb288ca0f622b832fc40703d9a0cc1e9"
+      "file_sha256": "8881ff9fd25f8b60c6b763d250073caddabf68abcfe71c5fa5830eeaea69aa4f"
     },
     "evaluation_entry": {
       "path": "scripts/evaluate.py",
-      "file_sha256": "e0f93abab648e89cb2f3db5371bacfe4f5040d8067e51a661c7f7c232dc2b453"
+      "file_sha256": "1565749bb6ac505a60acec3fdb9b877455b1717459d0720309243167add96d72"
     },
     "base_experiment_config": {
       "path": "configs/experiments/slmf_png_spectral_router_v5.yaml",
-      "file_sha256": "145626c131e107d81e883a22dbdc9ea51b4e9583b7830db744ec71d0f61faae9"
+      "file_sha256": "588fbddb889ef8e0deb82391afe0de70ee360fedbe3978ee68e1bc33d8fd8c16"
     },
     "freeze_integrity_audit": {
       "path": "scripts/audit_v2_freeze_integrity.py",
@@ -310,5 +310,5 @@
       "file_sha256": "f5338c29d0bbf9389e1ba707227ea68adddc758013b88adf5792a5473d904fd7"
     }
   },
-  "config_sha256": "0f22309eab40309f08ade89321355423c0025579fc60bfddced303b177eb3169"
+  "config_sha256": "3edc4e04e48ebd150b55039a43b7034845f49d359ebea57fc3338abd0a2afb0a"
 }
